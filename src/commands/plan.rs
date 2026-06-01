@@ -5,29 +5,54 @@ use rusqlite::Connection;
 
 use crate::hook_library::{self, Lifecycle};
 use crate::output::{self, OutputContext, OutputFormat};
-use crate::plan::{PlanStatus, RetryStrategy};
+use crate::plan::PlanStatus;
 use crate::storage;
 
 // ---------------------------------------------------------------------------
 // Plan commands
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
-pub fn plan_create(
-    conn: &Connection,
-    slug: &str,
-    project: &str,
-    description: Option<&str>,
-    branch: Option<&str>,
-    harness: Option<&str>,
-    agent: Option<&str>,
-    retry_strategy: Option<RetryStrategy>,
-    tests: &[String],
-    depends_on: &[String],
-    out: &OutputContext,
-) -> Result<()> {
+/// The user-supplied inputs to [`plan_create`]: the new plan's `slug` /
+/// `project`, optional `description` / `branch` / default `harness` / `agent`,
+/// the optional review recursion cap, the deterministic `tests`, and the
+/// `depends_on` plan slugs. `conn` and the `out` sink stay separate.
+pub struct PlanCreateArgs<'a> {
+    pub slug: &'a str,
+    pub project: &'a str,
+    pub description: Option<&'a str>,
+    pub branch: Option<&'a str>,
+    pub harness: Option<&'a str>,
+    pub agent: Option<&'a str>,
+    pub max_review_corrections: Option<i32>,
+    pub tests: &'a [String],
+    pub depends_on: &'a [String],
+}
+
+pub fn plan_create(conn: &Connection, args: PlanCreateArgs<'_>, out: &OutputContext) -> Result<()> {
+    let PlanCreateArgs {
+        slug,
+        project,
+        description,
+        branch,
+        harness,
+        agent,
+        max_review_corrections,
+        tests,
+        depends_on,
+    } = args;
     let desc = description.unwrap_or(slug);
     let branch_name = branch.unwrap_or(slug);
+
+    // Validate inputs BEFORE any DB write so an invalid slug/branch fails
+    // fast with nothing persisted (previously the bad branch was only
+    // discovered later, at `runner::setup_branch`, after a junk plan row
+    // already existed). Slug rules stay deliberately simple — reject only
+    // empty/blank; we do NOT impose git-ref syntax on slugs, only on the
+    // resolved branch name.
+    if slug.trim().is_empty() {
+        bail!("invalid plan slug: slug is empty or whitespace-only");
+    }
+    crate::git::check_ref_format(branch_name)?;
 
     // Resolve dependency slugs to plan IDs BEFORE creating the plan so we
     // fail fast if any are missing. We must look them up in the same
@@ -39,32 +64,45 @@ pub fn plan_create(
         resolved_deps.push((dep_slug.clone(), dep.id));
     }
 
-    let plan = storage::create_plan(
-        conn,
-        slug,
-        project,
-        branch_name,
-        desc,
-        harness,
-        agent,
-        tests,
-    )?;
+    // Create the plan and apply every config setter + dependency wiring
+    // atomically (mirrors `step_add` / `step_add_bulk`). If any setter or a
+    // late dependency error fails, the whole transaction rolls back so no
+    // partially-configured plan row is left persisted. All storage functions
+    // below take the tx connection directly and open no nested transaction of
+    // their own, so this is safe.
+    let plan = crate::db::with_tx(conn, |conn| {
+        let plan = storage::create_plan(
+            conn,
+            storage::NewPlan {
+                slug,
+                project,
+                branch_name,
+                description: desc,
+                harness,
+                agent,
+                deterministic_tests: tests,
+            },
+        )?;
 
-    // Persist a plan-level retry-strategy override when the user supplied
-    // one. `None` is the column default (no override) so we skip the write
-    // entirely in that case, mirroring how `plan_harness` is only set when
-    // present.
-    if let Some(rs) = retry_strategy {
-        storage::set_plan_retry_strategy(conn, &plan.id, Some(rs))?;
-    }
+        // Persist the per-plan review recursion cap only when explicitly given.
+        // `None` is the column default (NULL → built-in
+        // `review::DEFAULT_MAX_REVIEW_CORRECTIONS`), so skipping the write keeps
+        // the common case identical (mirrors how `plan_harness` is only set
+        // when present).
+        if let Some(cap) = max_review_corrections {
+            storage::set_plan_max_review_corrections(conn, &plan.id, Some(cap))?;
+        }
 
-    // Attach each resolved dependency. Self-references and cycles are
-    // rejected by the storage layer (the new plan has no deps yet, so a
-    // cycle is impossible, but self-reference is guarded anyway).
-    for (dep_slug, dep_id) in &resolved_deps {
-        storage::add_plan_dependency(conn, &plan.id, dep_id)
-            .with_context(|| format!("Failed to add dependency on '{dep_slug}'"))?;
-    }
+        // Attach each resolved dependency. Self-references and cycles are
+        // rejected by the storage layer (the new plan has no deps yet, so a
+        // cycle is impossible, but self-reference is guarded anyway).
+        for (dep_slug, dep_id) in &resolved_deps {
+            storage::add_plan_dependency(conn, &plan.id, dep_id)
+                .with_context(|| format!("Failed to add dependency on '{dep_slug}'"))?;
+        }
+
+        Ok(plan)
+    })?;
 
     eprintln!(
         "{} Created plan: {}",
@@ -297,10 +335,6 @@ pub fn plan_show(conn: &Connection, slug: &str, project: &str, out: &OutputConte
     if let Some(ref a) = plan.agent {
         println!("  Agent:       {a}");
     }
-    match plan.retry_strategy {
-        Some(rs) => println!("  Retry strategy: {rs}"),
-        None => println!("  Retry strategy: <unset — default keep>"),
-    }
     if !plan.deterministic_tests.is_empty() {
         println!("  Tests:");
         for t in &plan.deterministic_tests {
@@ -436,9 +470,22 @@ pub fn plan_delete(
 // Plan hook attachment commands
 // ---------------------------------------------------------------------------
 
-/// Toggle `plans.questions_enabled` for `slug`. Mirrors the `Q` keybinding
-/// in the TUI plan list (TUI-plan.md §17).
-pub fn cmd_plan_questions(
+/// Set the plan-level `review_enabled` override (docs/dag-redesign.md
+/// §6/§7). `enabled` writes `Some(true)`/`Some(false)` to the nullable
+/// `plans.review_enabled` column — an explicit per-plan on/off that wins
+/// over the global `config.review.enabled` and is itself overridden by a
+/// per-step `--review` (precedence step > plan > config > false, resolved
+/// by [`crate::config::effective_review_enabled`]).
+///
+/// Intentional asymmetry with `ralph step edit --review on|off|inherit`:
+/// the plan-level command only takes `on`/`off` (`OnOffState`), so there is
+/// no value that clears the override back to NULL (inherit-from-global). This
+/// is deliberate — the documented surface is `ralph plan review <on|off>`,
+/// and adding an `inherit` arm would mean a new tri-state value enum + a
+/// `bool` → `Option<bool>` signature change here, expanding the CLI surface.
+/// The underlying `set_plan_review_enabled` already accepts `None`, so a
+/// future `inherit` is a small follow-up if the asymmetry proves annoying.
+pub fn cmd_plan_review(
     conn: &Connection,
     plan_slug: &str,
     project: &str,
@@ -447,17 +494,17 @@ pub fn cmd_plan_questions(
 ) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
-    storage::set_plan_questions_enabled(conn, &plan.id, enabled)?;
+    storage::set_plan_review_enabled(conn, &plan.id, Some(enabled))?;
 
     if out.format == OutputFormat::Json {
         let json = serde_json::json!({
             "plan": plan_slug,
-            "questions_enabled": enabled,
+            "review_enabled": enabled,
         });
         println!("{}", serde_json::to_string(&json)?);
     } else {
         let verb = if enabled { "enabled" } else { "disabled" };
-        println!("Questions {verb} for plan '{plan_slug}'.");
+        println!("Review {verb} for plan '{plan_slug}'.");
     }
     Ok(())
 }
@@ -674,40 +721,312 @@ mod tests {
     }
 
     // ----------------------------------------------------------------------
-    // `ralph plan questions on|off` tests
+    // `ralph plan review on|off` tests (STEP 42 / docs/dag-redesign.md §7)
     // ----------------------------------------------------------------------
 
     #[test]
-    fn test_cmd_plan_questions_toggles_on_then_off() {
+    fn test_cmd_plan_review_toggles_on_then_off_persists() {
         let conn = crate::db::open_memory().expect("open_memory");
-        let project = "/tmp/q-toggle";
-        let plan =
-            storage::create_plan(&conn, "qp", project, "br", "desc", None, None, &[]).unwrap();
-        // New plans default to questions_enabled = true; force it off so the
-        // on→off toggle round-trip below is meaningful.
-        storage::set_plan_questions_enabled(&conn, &plan.id, false).unwrap();
-        let plan = storage::get_plan_by_id(&conn, &plan.id).unwrap();
-        assert!(!plan.questions_enabled, "forced off for the round-trip");
+        let project = "/tmp/r-toggle";
+        let plan = storage::create_plan(
+            &conn,
+            storage::NewPlan {
+                slug: "rp",
+                project,
+                branch_name: "br",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        // New plans default to review_enabled = NULL (inherit global).
+        assert_eq!(plan.review_enabled, None, "default is inherit (NULL)");
 
-        cmd_plan_questions(&conn, "qp", project, true, &quiet_out()).unwrap();
-        let on = storage::get_plan_by_slug(&conn, "qp", project)
+        cmd_plan_review(&conn, "rp", project, true, &quiet_out()).unwrap();
+        let on = storage::get_plan_by_slug(&conn, "rp", project)
             .unwrap()
             .unwrap();
-        assert!(on.questions_enabled, "after `on`, column must be true");
+        assert_eq!(
+            on.review_enabled,
+            Some(true),
+            "after `on`, the plan-scope override is Some(true)"
+        );
 
-        cmd_plan_questions(&conn, "qp", project, false, &quiet_out()).unwrap();
-        let off = storage::get_plan_by_slug(&conn, "qp", project)
+        cmd_plan_review(&conn, "rp", project, false, &quiet_out()).unwrap();
+        let off = storage::get_plan_by_slug(&conn, "rp", project)
             .unwrap()
             .unwrap();
-        assert!(!off.questions_enabled, "after `off`, column must be false");
+        assert_eq!(
+            off.review_enabled,
+            Some(false),
+            "after `off`, the plan-scope override is Some(false)"
+        );
     }
 
     #[test]
-    fn test_cmd_plan_questions_unknown_slug_errors() {
+    fn test_cmd_plan_review_unknown_slug_errors() {
         let conn = crate::db::open_memory().expect("open_memory");
-        // No plans created — the slug lookup must fail with a clear error.
-        let err = cmd_plan_questions(&conn, "nope", "/tmp/q-noplan", true, &quiet_out())
+        let err = cmd_plan_review(&conn, "nope", "/tmp/r-noplan", true, &quiet_out())
             .expect_err("missing plan must error");
         assert!(err.to_string().contains("Plan not found: nope"));
+    }
+
+    /// End-to-end precedence resolution through the actual scope setters:
+    /// step ?? plan ?? config ?? false (docs/dag-redesign.md §6).
+    #[test]
+    fn test_review_scope_precedence_end_to_end() {
+        use crate::config::{Config, effective_review_enabled};
+        let conn = crate::db::open_memory().expect("open_memory");
+        let project = "/tmp/r-prec";
+        let plan = storage::create_plan(
+            &conn,
+            storage::NewPlan {
+                slug: "pp",
+                project,
+                branch_name: "br",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            crate::storage::NewStep {
+                title: "S",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+
+        let cfg_on = {
+            let mut c = Config::default();
+            c.review.enabled = Some(true);
+            c
+        };
+        let cfg_off = Config::default(); // review.enabled = None
+
+        // All inherit + config None ⇒ false.
+        let p = storage::get_plan_by_slug(&conn, "pp", project)
+            .unwrap()
+            .unwrap();
+        let s = storage::get_step(&conn, &step.id).unwrap();
+        assert!(!effective_review_enabled(&s, &p, &cfg_off));
+
+        // config ON, plan/step inherit ⇒ true (falls through to config).
+        assert!(effective_review_enabled(&s, &p, &cfg_on));
+
+        // plan OFF beats config ON.
+        cmd_plan_review(&conn, "pp", project, false, &quiet_out()).unwrap();
+        let p = storage::get_plan_by_slug(&conn, "pp", project)
+            .unwrap()
+            .unwrap();
+        let s = storage::get_step(&conn, &step.id).unwrap();
+        assert!(!effective_review_enabled(&s, &p, &cfg_on));
+
+        // step ON beats plan OFF (and config).
+        storage::set_step_review_enabled(&conn, &step.id, Some(true)).unwrap();
+        let s = storage::get_step(&conn, &step.id).unwrap();
+        assert!(effective_review_enabled(&s, &p, &cfg_on));
+        assert!(
+            effective_review_enabled(&s, &p, &cfg_off),
+            "step ON wins even when config is unset"
+        );
+
+        // step cleared back to inherit ⇒ falls to plan OFF.
+        storage::set_step_review_enabled(&conn, &step.id, None).unwrap();
+        let s = storage::get_step(&conn, &step.id).unwrap();
+        assert!(!effective_review_enabled(&s, &p, &cfg_on));
+    }
+
+    // ----------------------------------------------------------------------
+    // FINDING 5: branch/slug validated up front, before any DB write.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn test_plan_create_invalid_branch_errors_and_writes_no_plan() {
+        let conn = crate::db::open_memory().expect("open_memory");
+        let project = "/tmp/pc-badbranch";
+
+        let err = plan_create(
+            &conn,
+            PlanCreateArgs {
+                slug: "myslug",
+                project,
+                description: None,
+                branch: Some("feat/bad..branch"),
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
+            &quiet_out(),
+        )
+        .expect_err("an invalid branch name must fail fast");
+        assert!(
+            err.to_string().contains("invalid branch name"),
+            "error must cite the branch rule: {err}"
+        );
+
+        // Nothing was persisted: no plan row exists for the slug.
+        assert!(
+            storage::get_plan_by_slug(&conn, "myslug", project)
+                .unwrap()
+                .is_none(),
+            "no plan row may be written when the branch is invalid"
+        );
+    }
+
+    #[test]
+    fn test_plan_create_blank_slug_errors_and_writes_no_plan() {
+        let conn = crate::db::open_memory().expect("open_memory");
+        let project = "/tmp/pc-blankslug";
+
+        let err = plan_create(
+            &conn,
+            PlanCreateArgs {
+                slug: "   ",
+                project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
+            &quiet_out(),
+        )
+        .expect_err("a blank slug must fail fast");
+        assert!(
+            err.to_string().contains("invalid plan slug"),
+            "error must cite the slug rule: {err}"
+        );
+        // The (blank) slug branch defaults from slug, so creation aborts
+        // before any write — verify the plan list stayed empty.
+        let plans = storage::list_plans(&conn, project, false).unwrap();
+        assert!(plans.is_empty(), "no plan row may be written: {plans:?}");
+    }
+
+    #[test]
+    fn test_plan_create_valid_branch_succeeds() {
+        let conn = crate::db::open_memory().expect("open_memory");
+        let project = "/tmp/pc-okbranch";
+        plan_create(
+            &conn,
+            PlanCreateArgs {
+                slug: "good-slug",
+                project,
+                description: Some("a description"),
+                branch: Some("feat/ok"),
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
+            &quiet_out(),
+        )
+        .expect("a valid branch must create the plan");
+        let plan = storage::get_plan_by_slug(&conn, "good-slug", project)
+            .unwrap()
+            .expect("plan row must exist");
+        assert_eq!(plan.branch_name, "feat/ok");
+    }
+
+    // ----------------------------------------------------------------------
+    // Transactional `plan_create`: a failure raised *after* the plan row is
+    // inserted (inside the `db::with_tx` block) must roll the whole thing
+    // back so no partially-configured plan row survives.
+    //
+    // The injectable late failure used here: passing the *same* dependency
+    // slug twice. `plan_create` resolves each dep slug independently (no
+    // dedup), so both copies clear the pre-tx existence check. Inside the
+    // tx, `create_plan` inserts the plan row and the first
+    // `add_plan_dependency` succeeds; the second INSERT then violates
+    // `plan_dependencies`'s `PRIMARY KEY (plan_id, depends_on_plan_id)`. That
+    // error propagates out of the `with_tx` closure, the transaction is
+    // dropped without commit, and the plan row must NOT persist.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn test_plan_create_rolls_back_plan_row_on_late_dependency_failure() {
+        let conn = crate::db::open_memory().expect("open_memory");
+        let project = "/tmp/pc-rollback";
+
+        // A pre-existing dependency plan that the new plan will depend on.
+        storage::create_plan(
+            &conn,
+            storage::NewPlan {
+                slug: "dep-a",
+                project,
+                branch_name: "dep-a",
+                description: "dep",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+
+        // Trigger a late failure by listing the same dependency twice: the
+        // second `add_plan_dependency` INSERT hits the PRIMARY KEY constraint
+        // *after* the plan row has already been inserted in the same tx.
+        let err = plan_create(
+            &conn,
+            PlanCreateArgs {
+                slug: "rolled-back",
+                project,
+                description: Some("desc"),
+                branch: Some("feat/rb"),
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &["dep-a".to_string(), "dep-a".to_string()],
+            },
+            &quiet_out(),
+        )
+        .expect_err("a duplicate dependency must fail inside the transaction");
+        // The failure must come from the dependency-wiring step, not the
+        // pre-tx validation (which would not exercise the rollback path).
+        assert!(
+            err.to_string()
+                .contains("Failed to add dependency on 'dep-a'"),
+            "failure must originate from the in-tx dependency wiring: {err}"
+        );
+
+        // Full rollback: the plan row inserted earlier in the same tx must
+        // NOT have persisted.
+        assert!(
+            storage::get_plan_by_slug(&conn, "rolled-back", project)
+                .unwrap()
+                .is_none(),
+            "the plan row must be rolled back when a later in-tx step fails"
+        );
+
+        // And only the original dependency plan remains.
+        let slugs: Vec<String> = storage::list_plans(&conn, project, true)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.slug)
+            .collect();
+        assert_eq!(
+            slugs,
+            vec!["dep-a".to_string()],
+            "no partial plan should leak: {slugs:?}"
+        );
     }
 }

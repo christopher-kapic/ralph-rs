@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::task::JoinHandle;
@@ -67,7 +68,6 @@ pub struct ChunkEmitter {
 /// disable emission, or a configured emitter to also stream chunk events);
 /// this no-emitter convenience wrapper is preserved for any future caller
 /// that doesn't need streaming.
-#[allow(dead_code)]
 pub fn drain_bounded<R>(reader: Option<R>, cap: usize) -> JoinHandle<Vec<u8>>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -197,6 +197,197 @@ pub async fn join_drain(handle: JoinHandle<Vec<u8>>) -> Vec<u8> {
 pub async fn join_drain_string(handle: JoinHandle<Vec<u8>>) -> String {
     let bytes = join_drain(handle).await;
     String::from_utf8_lossy(&bytes).to_string()
+}
+
+// ---------------------------------------------------------------------------
+// wait_capped — shared "drain bounded + wait with optional timeout + kill the
+// whole process group on timeout + reap" policy.
+// ---------------------------------------------------------------------------
+
+/// Result of [`wait_capped`].
+///
+/// Carries everything both the hook path and the review path need:
+/// success/exit-code, the bounded stdout/stderr tails, and whether the wait
+/// hit the timeout (in which case the process group was SIGKILL'd and the
+/// child reaped before returning, so there is no lingering zombie or orphan
+/// grandchild).
+#[derive(Debug)]
+pub struct WaitCappedResult {
+    /// `true` iff the child exited with a success status. Always `false` when
+    /// `timed_out` is set (the child was killed) or when `wait()` errored.
+    pub success: bool,
+    /// The child's exit code, if it exited normally with one. `None` on a
+    /// signal death, a `wait()` error, or a timeout kill.
+    pub code: Option<i32>,
+    /// Bounded tail (last `cap` bytes) of the child's stdout, lossily decoded.
+    pub stdout: String,
+    /// Bounded tail (last `cap` bytes) of the child's stderr, lossily decoded.
+    pub stderr: String,
+    /// `true` iff the optional timeout fired before the child exited. On a
+    /// timeout the process group is SIGKILL'd (unix) / the leader killed
+    /// (non-unix) and the child reaped before this returns.
+    pub timed_out: bool,
+}
+
+/// Spawn-is-done helper: concurrently bounded-drain `child`'s stdout/stderr,
+/// wait for it to exit (optionally bounded by `timeout`), and on a timeout
+/// SIGKILL the *whole process group* (so grandchildren the child spawned die
+/// too) and reap the child so it can't linger as a zombie.
+///
+/// This is the single home for the process-group-kill-on-timeout +
+/// bounded-drain policy shared by the lifecycle-hook path
+/// ([`crate::hooks`]) and the review path ([`crate::review`]). The reference
+/// implementation of the same pattern lives in
+/// `executor::wait_with_timeout_and_abort` / `test_runner::run_single_test`;
+/// those are deliberately *not* routed through here (they additionally race
+/// an abort `watch` channel and emit chunk events — out of scope for this
+/// helper, which has exactly two callers).
+///
+/// Preconditions:
+/// - `child` was spawned with `.stdout(piped())` / `.stderr(piped())` so the
+///   handles can be taken and drained (a `None` handle drains to empty).
+/// - On unix the child is its own process-group leader (`process_group(0)`),
+///   so `kill(-pid, SIGKILL)` on a timeout reaches the whole descendant tree
+///   (not just the direct child). This is **not** a documentation-only
+///   contract: it is machine-checked by a `debug_assert!` below
+///   (`getpgid(pid) == pid`), so any future caller that forgets
+///   `.process_group(0)` fails loudly in the test suite / CI rather than
+///   silently leaking grandchildren on a timeout in production. Both current
+///   callers satisfy it (hooks set it explicitly; the review child is spawned
+///   via `harness::spawn_harness_with_delivery`, which sets it).
+///
+/// Behavior:
+/// - `timeout == None`: plain `child.wait()` (no timer), but stdout/stderr
+///   are *still* drained concurrently and bounded to `cap` — the
+///   unbounded-memory half of the bug is fixed regardless of the timeout.
+/// - `timeout == Some(d)`: race `child.wait()` against `sleep(d)`. If the
+///   timer wins, SIGKILL the process group (unix) / `child.kill()`
+///   (non-unix), `child.wait()` to reap, and return with `timed_out = true`.
+///
+/// On a `child.wait()` error the captured tails are still returned (so the
+/// caller keeps diagnostics) with `success = false`, `code = None`,
+/// `timed_out = false`.
+pub async fn wait_capped(
+    mut child: tokio::process::Child,
+    timeout: Option<Duration>,
+    cap: usize,
+) -> WaitCappedResult {
+    // Machine-check the process-group precondition. The child is freshly
+    // spawned and alive here, so `getpgid` is meaningful. If it is its own
+    // group leader, `pgid == pid` and the timeout's `kill(-pid)` tears down
+    // the whole tree; if not, a timeout would leak grandchildren. This is a
+    // programming error at the call site (a missing `.process_group(0)`), so
+    // we trip it loudly in debug/test builds rather than shipping a silent
+    // leak. Release builds keep the existing safe behavior (the timeout still
+    // signals `-pid` and `child.kill()`s the leader; only a *misused*
+    // non-leader child's grandchildren would survive — and this assert
+    // guarantees that misuse never reaches a release build untested).
+    #[cfg(all(unix, debug_assertions))]
+    {
+        if let Some(pid) = child.id().and_then(|id| i32::try_from(id).ok()) {
+            // SAFETY: `getpgid` is a pure syscall wrapper; `pid` is a valid
+            // i32 naming our just-spawned, still-live child.
+            let pgid = unsafe { libc::getpgid(pid) };
+            debug_assert_eq!(
+                pgid, pid,
+                "wait_capped precondition violated: child pid {pid} is not its \
+                 own process-group leader (pgid {pgid}); a timeout kill could \
+                 not reach its grandchildren. Spawn it with \
+                 Command::process_group(0)."
+            );
+        }
+    }
+
+    // Take the pipe handles and start draining *immediately* — before the
+    // wait — so a child that writes more than the kernel pipe buffer
+    // (~64 KiB) doesn't block on write(2) while we block on wait(),
+    // deadlocking. Same rationale as `drain_bounded`'s module doc.
+    let stdout_task = drain_bounded(child.stdout.take(), cap);
+    let stderr_task = drain_bounded(child.stderr.take(), cap);
+
+    // Reap the child after a timeout kill (or just collect on normal exit),
+    // fanning the kill to the whole process group on unix.
+    async fn kill_group_and_reap(child: &mut tokio::process::Child) {
+        #[cfg(unix)]
+        {
+            if let Some(pid) = child.id().and_then(|id| i32::try_from(id).ok()) {
+                crate::executor::signal_process_group(pid, libc::SIGKILL);
+            }
+        }
+        let _ = child.kill().await;
+        // Reap so the child doesn't linger as a zombie. After wait()
+        // returns the pipes are definitively closed and the drain tasks
+        // exit promptly.
+        let _ = child.wait().await;
+    }
+
+    match timeout {
+        Some(dur) => {
+            tokio::select! {
+                status = child.wait() => match status {
+                    Ok(es) => {
+                        let stdout = join_drain_string(stdout_task).await;
+                        let stderr = join_drain_string(stderr_task).await;
+                        WaitCappedResult {
+                            success: es.success(),
+                            code: es.code(),
+                            stdout,
+                            stderr,
+                            timed_out: false,
+                        }
+                    }
+                    Err(_) => {
+                        // Still collect whatever the drainers captured.
+                        let stdout = join_drain_string(stdout_task).await;
+                        let stderr = join_drain_string(stderr_task).await;
+                        WaitCappedResult {
+                            success: false,
+                            code: None,
+                            stdout,
+                            stderr,
+                            timed_out: false,
+                        }
+                    }
+                },
+                _ = tokio::time::sleep(dur) => {
+                    kill_group_and_reap(&mut child).await;
+                    let stdout = join_drain_string(stdout_task).await;
+                    let stderr = join_drain_string(stderr_task).await;
+                    WaitCappedResult {
+                        success: false,
+                        code: None,
+                        stdout,
+                        stderr,
+                        timed_out: true,
+                    }
+                }
+            }
+        }
+        None => match child.wait().await {
+            Ok(es) => {
+                let stdout = join_drain_string(stdout_task).await;
+                let stderr = join_drain_string(stderr_task).await;
+                WaitCappedResult {
+                    success: es.success(),
+                    code: es.code(),
+                    stdout,
+                    stderr,
+                    timed_out: false,
+                }
+            }
+            Err(_) => {
+                let stdout = join_drain_string(stdout_task).await;
+                let stderr = join_drain_string(stderr_task).await;
+                WaitCappedResult {
+                    success: false,
+                    code: None,
+                    stdout,
+                    stderr,
+                    timed_out: false,
+                }
+            }
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -449,6 +640,105 @@ mod tests {
         drop(w);
         let out = join_drain_string(handle).await;
         assert_eq!(out, "a\nb\nc\n");
+    }
+
+    // -- wait_capped --------------------------------------------------------
+
+    /// Spawn `sh -c <body>` in its own process group (mirroring the two
+    /// production callers) with piped stdout/stderr.
+    fn spawn_sh(body: &str) -> tokio::process::Child {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(body)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        {
+            cmd.process_group(0);
+        }
+        cmd.spawn().expect("spawn sh")
+    }
+
+    /// Normal exit: success/code/stdout are reported and `timed_out` is false.
+    #[tokio::test]
+    async fn test_wait_capped_normal_exit() {
+        let child = spawn_sh("printf out; printf err 1>&2; exit 0");
+        let r = wait_capped(child, Some(Duration::from_secs(10)), 64 * 1024).await;
+        assert!(r.success);
+        assert_eq!(r.code, Some(0));
+        assert!(!r.timed_out);
+        assert_eq!(r.stdout, "out");
+        assert_eq!(r.stderr, "err");
+
+        // Non-zero exit is reported faithfully.
+        let child = spawn_sh("printf boom 1>&2; exit 3");
+        let r = wait_capped(child, Some(Duration::from_secs(10)), 64 * 1024).await;
+        assert!(!r.success);
+        assert_eq!(r.code, Some(3));
+        assert!(!r.timed_out);
+        assert_eq!(r.stderr, "boom");
+    }
+
+    /// No-timeout path still drains (and bounds) output rather than blocking.
+    #[tokio::test]
+    async fn test_wait_capped_no_timeout_still_bounds() {
+        // ~200 KiB of stdout with a 4 KiB cap → must be capped, and the call
+        // must still complete (proving the concurrent drain prevented a
+        // pipe-buffer deadlock even with no timer).
+        let child = spawn_sh("yes ABCDEFGH | head -c 200000; exit 0");
+        let cap = 4 * 1024;
+        let r = wait_capped(child, None, cap).await;
+        assert!(r.success);
+        assert!(!r.timed_out);
+        assert!(
+            r.stdout.len() <= cap + truncation_marker(cap).len(),
+            "stdout not bounded: {} bytes",
+            r.stdout.len()
+        );
+        assert!(r.stdout.contains(TRUNCATION_MARKER_PREFIX));
+    }
+
+    /// Timeout path: a sleeping child is killed, `timed_out` is true, and the
+    /// call returns promptly (well under the child's sleep).
+    #[tokio::test]
+    async fn test_wait_capped_timeout_kills_and_reaps() {
+        let start = std::time::Instant::now();
+        // A backgrounded grandchild that would outlive a leader-only kill.
+        let child = spawn_sh("(sleep 30 &) ; echo started; sleep 30");
+        let r = wait_capped(child, Some(Duration::from_secs(1)), 64 * 1024).await;
+        let elapsed = start.elapsed();
+        assert!(r.timed_out, "expected a timeout");
+        assert!(!r.success);
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "timeout should fire promptly, elapsed = {elapsed:?}"
+        );
+    }
+
+    /// The process-group precondition is machine-checked, not doc-only: a
+    /// child spawned WITHOUT `.process_group(0)` (so it is not its own group
+    /// leader — a timeout kill could not reach its grandchildren) must trip
+    /// the `debug_assert!` in `wait_capped`. This is the test that guarantees
+    /// any future caller forgetting the precondition fails loudly in CI
+    /// instead of silently leaking grandchildren in production.
+    #[cfg(all(unix, debug_assertions))]
+    #[tokio::test]
+    #[should_panic(expected = "wait_capped precondition violated")]
+    async fn test_wait_capped_rejects_non_process_group_leader() {
+        // Deliberately NO cmd.process_group(0): the child stays in the test
+        // runner's process group, so getpgid(pid) != pid.
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg("sleep 5")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let child = cmd.spawn().expect("spawn sh");
+        // Must panic on the precondition before doing any waiting.
+        let _ = wait_capped(child, Some(Duration::from_secs(1)), 64 * 1024).await;
     }
 
     /// Truncation marker format uses MiB for exact MiB multiples and falls

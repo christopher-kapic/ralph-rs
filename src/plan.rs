@@ -11,12 +11,19 @@ use std::fmt;
 
 /// Status of a plan throughout its lifecycle.
 ///
-/// Note: [`PlanStatus::Question`] is a *derived* status — it is never written
-/// to `plans.status`. A plan is reported as `Question` whenever any unanswered
-/// `step_questions` row exists for one of its steps; the underlying lifecycle
+/// Note: [`PlanStatus::Interrupted`] is a *derived* status — it is never
+/// written to `plans.status`. A plan is reported as `Interrupted` whenever any
+/// **open interruption** (a question *or* a blocker — docs/dag-redesign.md
+/// §3.4/§6) exists for one of its steps; the underlying lifecycle
 /// (in_progress/ready/etc.) stays in the column and un-shadows automatically
-/// when the user answers. The variant exists in the enum so consumers
-/// (TUI/JSON output) can render the derived state uniformly with the rest.
+/// when the human resolves the last open interruption. The variant exists in
+/// the enum so consumers (TUI/JSON output) can render the derived state
+/// uniformly with the rest.
+///
+/// This is the post-Phase-2 rename of the old `Question` variant. For one
+/// release the legacy `"question"` string is still **accepted on parse** (a
+/// back-compat alias) but it always **serializes** / `as_str`es as
+/// `"interrupted"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 #[value(rename_all = "snake_case")]
@@ -28,7 +35,7 @@ pub enum PlanStatus {
     Failed,
     Aborted,
     Archived,
-    Question,
+    Interrupted,
 }
 
 impl PlanStatus {
@@ -42,7 +49,7 @@ impl PlanStatus {
             Self::Failed => "failed",
             Self::Aborted => "aborted",
             Self::Archived => "archived",
-            Self::Question => "question",
+            Self::Interrupted => "interrupted",
         }
     }
 }
@@ -77,7 +84,12 @@ impl std::str::FromStr for PlanStatus {
             "failed" => Ok(Self::Failed),
             "aborted" => Ok(Self::Aborted),
             "archived" => Ok(Self::Archived),
-            "question" => Ok(Self::Question),
+            "interrupted" => Ok(Self::Interrupted),
+            // One-release back-compat alias: the pre-Phase-2 derived status
+            // was spelled "question". It is never written to the DB (derived
+            // only), but accept it on parse so a value materialized by an
+            // older binary still round-trips.
+            "question" => Ok(Self::Interrupted),
             other => Err(ParseStatusError(other.to_string())),
         }
     }
@@ -88,6 +100,17 @@ impl std::str::FromStr for PlanStatus {
 // ---------------------------------------------------------------------------
 
 /// Status of an individual step.
+///
+/// Note: [`StepStatus::Blocked`] is an *orthogonal derived overlay*, not a
+/// stored lifecycle state (docs/dag-redesign.md §3.3). It is **never written
+/// to `steps.status`** — exactly like [`PlanStatus::Interrupted`]. A step
+/// *presents* as `Blocked` whenever it has an open interruption (question or
+/// blocker); its underlying stored status (`pending`/`in_progress`/…) is
+/// preserved underneath and un-shadows automatically the moment the
+/// interruption is resolved. The variant only exists in the enum so the
+/// derivation helper [`effective_step_status`] can hand callers a single
+/// status to render. `as_str`/`FromStr`/serde still support it (round-trip
+/// safe), but storage code must never persist it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StepStatus {
@@ -97,6 +120,7 @@ pub enum StepStatus {
     Failed,
     Skipped,
     Aborted,
+    Blocked,
 }
 
 impl StepStatus {
@@ -108,7 +132,39 @@ impl StepStatus {
             Self::Failed => "failed",
             Self::Skipped => "skipped",
             Self::Aborted => "aborted",
+            Self::Blocked => "blocked",
         }
+    }
+}
+
+/// Derive a step's *effective* (presentation) status.
+///
+/// `Blocked` is an overlay (docs/dag-redesign.md §3.3): when the step has an
+/// open interruption it *presents* as [`StepStatus::Blocked`] while its
+/// stored lifecycle is preserved underneath. The instant the interruption is
+/// resolved (`has_open_interruption == false`) the underlying status
+/// un-shadows — this helper simply returns it, so the overlay is fully
+/// reversible and never needs a DB write.
+///
+/// Terminal stored states are *not* overlaid: a `Complete`/`Failed`/`Skipped`
+/// /`Aborted` step is done with respect to its branch and a lingering
+/// (typically already-resolved-but-stale-flagged) interruption must not make
+/// a finished step look re-blocked. Only the active lifecycle states
+/// (`Pending`/`InProgress`) take the overlay. This mirrors how
+/// `plan_effective_status` upgrades a still-running plan but leaves a
+/// completed one alone.
+pub fn effective_step_status(stored: StepStatus, has_open_interruption: bool) -> StepStatus {
+    if !has_open_interruption {
+        return stored;
+    }
+    match stored {
+        StepStatus::Pending | StepStatus::InProgress => StepStatus::Blocked,
+        // Terminal states are not re-shadowed.
+        StepStatus::Complete
+        | StepStatus::Failed
+        | StepStatus::Skipped
+        | StepStatus::Aborted
+        | StepStatus::Blocked => stored,
     }
 }
 
@@ -129,6 +185,7 @@ impl std::str::FromStr for StepStatus {
             "failed" => Ok(Self::Failed),
             "skipped" => Ok(Self::Skipped),
             "aborted" => Ok(Self::Aborted),
+            "blocked" => Ok(Self::Blocked),
             other => Err(ParseStatusError(other.to_string())),
         }
     }
@@ -187,54 +244,295 @@ impl std::str::FromStr for ChangePolicy {
 }
 
 // ---------------------------------------------------------------------------
-// RetryStrategy enum
+// Interruption domain model (questions + blockers, unified)
 // ---------------------------------------------------------------------------
 
-/// How a step's working tree is treated between failed attempts.
+/// What kind of branch-pausing interruption this is
+/// (docs/dag-redesign.md §3.4).
 ///
-/// Resolved per-step via [`Step::effective_retry_strategy`] with the
-/// precedence step > plan > default ([`RetryStrategy::Keep`]).
+/// Questions and blockers are *one* entity — a branch-pausing interrupt that
+/// needs a human and may carry text forward into the next prompt. A
+/// [`InterruptionKind::Question`] carries proposed [`InterruptionOption`]s
+/// with a priority (1 = the agent's best guess); a
+/// [`InterruptionKind::Blocker`] is either one the harness raised mid-step
+/// OR an **auto-raised retry-exhausted blocker** (Phase B): a harness-raised
+/// blocker carries an empty option list (the agent explains what it cannot
+/// do and the human resolves it freeform); the auto-raised retry-exhausted
+/// variant carries two ranked options ("Retry step with parked changes" /
+/// "Mark step Failed") so a human can keep the audit trail and pick a
+/// recovery without typing.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
-#[value(rename_all = "kebab-case")]
-pub enum RetryStrategy {
-    /// Failed attempts leave the working tree as-is; the next attempt sees
-    /// the prior work directly via `git diff`. The retry context therefore
-    /// omits the diff (the changes are already on disk for the agent to
-    /// inspect and build on).
+#[value(rename_all = "snake_case")]
+pub enum InterruptionKind {
     #[default]
-    Keep,
-    /// Failed attempts roll back the working tree before retrying; the prior
-    /// attempt's diff is fed into the next attempt's prompt via the retry
-    /// context so the agent can learn from — but doesn't inherit — the
-    /// rolled-back work.
-    Rollback,
+    Question,
+    Blocker,
 }
 
-impl RetryStrategy {
+impl InterruptionKind {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Keep => "keep",
-            Self::Rollback => "rollback",
+            Self::Question => "question",
+            Self::Blocker => "blocker",
         }
     }
 }
 
-impl std::fmt::Display for RetryStrategy {
+impl std::fmt::Display for InterruptionKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
 }
 
-impl std::str::FromStr for RetryStrategy {
+impl std::str::FromStr for InterruptionKind {
     type Err = ParseStatusError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "keep" => Ok(Self::Keep),
-            "rollback" => Ok(Self::Rollback),
+            "question" => Ok(Self::Question),
+            "blocker" => Ok(Self::Blocker),
             other => Err(ParseStatusError(other.to_string())),
         }
+    }
+}
+
+/// Lifecycle state of an [`Interruption`] (docs/dag-redesign.md §3.4).
+///
+/// A fresh interruption is [`InterruptionState::Open`]: its step's branch is
+/// `Blocked`, **no retry budget is consumed**, and the scheduler moves on to
+/// another runnable step. Once a human resolves it the state becomes
+/// [`InterruptionState::Resolved`] and the resolution/comment are injected
+/// (bounded) into the step's next prompt (§8).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+#[value(rename_all = "snake_case")]
+pub enum InterruptionState {
+    #[default]
+    Open,
+    Resolved,
+}
+
+impl InterruptionState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Resolved => "resolved",
+        }
+    }
+}
+
+impl std::fmt::Display for InterruptionState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for InterruptionState {
+    type Err = ParseStatusError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "open" => Ok(Self::Open),
+            "resolved" => Ok(Self::Resolved),
+            other => Err(ParseStatusError(other.to_string())),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ReviewStatus enum
+// ---------------------------------------------------------------------------
+
+/// Per-step nondeterministic-review verdict (docs/dag-redesign.md §3.3).
+///
+/// Orthogonal to [`StepStatus`] exactly as [`TestStatus`] is orthogonal to
+/// the termination reason today: a step reaches `Complete` only after its
+/// review has *returned* (any verdict). Stored in the nullable
+/// `steps.review_status` TEXT column (V27); a NULL on disk means
+/// [`ReviewStatus::Pending`] (not yet reviewed), so the variant set mirrors
+/// the §3.3 list verbatim.
+///
+/// - [`ReviewStatus::Pending`] — review has not started (the on-disk NULL).
+/// - [`ReviewStatus::InFlight`] — a read-only reviewer is running against
+///   the step's commit SHA.
+/// - [`ReviewStatus::Passed`] — reviewer found no defect; the step is
+///   `Complete`.
+/// - [`ReviewStatus::Failed`] — reviewer rejected; a corrective step is
+///   inserted and dependents are re-parented (§10). The step itself still
+///   becomes `Complete` (the fix lives in the corrective step).
+/// - [`ReviewStatus::Skipped`] — review was skipped for this run.
+/// - [`ReviewStatus::Disabled`] — review is off at some scope (step / plan
+///   / global, §6); the step is `Complete` straight from passing tests.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+#[value(rename_all = "snake_case")]
+pub enum ReviewStatus {
+    #[default]
+    Pending,
+    InFlight,
+    Passed,
+    Failed,
+    Skipped,
+    Disabled,
+}
+
+impl ReviewStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::InFlight => "in_flight",
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
+impl std::fmt::Display for ReviewStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ReviewStatus {
+    type Err = ParseStatusError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pending" => Ok(Self::Pending),
+            "in_flight" => Ok(Self::InFlight),
+            "passed" => Ok(Self::Passed),
+            "failed" => Ok(Self::Failed),
+            "skipped" => Ok(Self::Skipped),
+            "disabled" => Ok(Self::Disabled),
+            other => Err(ParseStatusError(other.to_string())),
+        }
+    }
+}
+
+/// Ranked resolution options carried by an [`Interruption`].
+///
+/// `priority` ranks the proposals (1 = the agent's best guess, or — for
+/// Phase B's auto-raised retry-exhausted blocker — the recommended default).
+/// Always empty for harness-raised blockers and for freeform-only questions;
+/// populated for Questions and for the **auto-raised retry-exhausted
+/// blocker** (`executor::raise_retry_exhausted_blocker`) which always
+/// inserts the two ranked recovery options
+/// ([`crate::executor::RETRY_EXHAUSTED_OPTION_RETRY`] /
+/// [`crate::executor::RETRY_EXHAUSTED_OPTION_FAIL`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InterruptionOption {
+    pub text: String,
+    pub priority: i32,
+}
+
+/// A unified branch-pausing interruption — a question or a blocker
+/// (docs/dag-redesign.md §3.4).
+///
+/// One entity, one state machine: a [`InterruptionKind::Question`] carries
+/// proposed [`options`](Interruption::options) with priority (1 = agent
+/// best); a harness-raised [`InterruptionKind::Blocker`] has no options,
+/// while the Phase B auto-raised retry-exhausted blocker carries the two
+/// ranked recovery options. Resolving an interruption records
+/// `resolution`/`comment` and flips `state` to
+/// [`InterruptionState::Resolved`]; while it is
+/// [`InterruptionState::Open`] the step's branch is `Blocked` and the
+/// scheduler works elsewhere (no retry budget consumed by the *interruption*
+/// itself — the auto-raised exhausted-budget variant is raised *after* the
+/// budget is already spent). The resolution/comment are later injected,
+/// bounded, into the step's next prompt (§8).
+///
+/// Native storage/model wiring lands with the Phase 2 interruption CRUD
+/// (`storage::insert_interruption` and friends); the `interruption` CLI and
+/// TUI inbox land in later DAG-redesign steps.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Interruption {
+    pub id: String,
+    pub step_id: String,
+    pub attempt: i32,
+    pub kind: InterruptionKind,
+    /// The question text, or the blocker explanation.
+    pub body: String,
+    /// Ranked options (priority 1 = best). Populated for Questions and for
+    /// the Phase B auto-raised retry-exhausted blocker; empty for
+    /// harness-raised blockers and freeform-only questions.
+    #[serde(default)]
+    pub options: Vec<InterruptionOption>,
+    /// The chosen option text or freeform answer; `None` while `Open`.
+    #[serde(default)]
+    pub resolution: Option<String>,
+    /// Extra human note, always injectable alongside the resolution.
+    #[serde(default)]
+    pub comment: Option<String>,
+    pub state: InterruptionState,
+    pub asked_at: DateTime<Utc>,
+    /// Set when `state` becomes [`InterruptionState::Resolved`]; `None`
+    /// while `Open`.
+    #[serde(default)]
+    pub resolved_at: Option<DateTime<Utc>>,
+}
+
+impl Interruption {
+    /// Read an [`Interruption`] from a SQLite row.
+    ///
+    /// Expected column order (the native `interruptions` table, V26):
+    /// id, step_id, attempt, kind, body, options, resolution, comment,
+    /// state, asked_at, resolved_at
+    pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+        use std::str::FromStr;
+
+        let kind_str: String = row.get(3)?;
+        let kind = InterruptionKind::from_str(&kind_str).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e))
+        })?;
+
+        let options_json: String = row.get(5)?;
+        let options: Vec<InterruptionOption> =
+            serde_json::from_str(&options_json).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    5,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+
+        let state_str: String = row.get(8)?;
+        let state = InterruptionState::from_str(&state_str).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(e))
+        })?;
+
+        let asked_str: String = row.get(9)?;
+        let asked_at = parse_datetime(&asked_str).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(9, rusqlite::types::Type::Text, Box::new(e))
+        })?;
+
+        let resolved_str: Option<String> = row.get(10)?;
+        let resolved_at = match resolved_str {
+            Some(s) => Some(parse_datetime(&s).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    10,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?),
+            None => None,
+        };
+
+        Ok(Interruption {
+            id: row.get(0)?,
+            step_id: row.get(1)?,
+            attempt: row.get(2)?,
+            kind,
+            body: row.get(4)?,
+            options,
+            resolution: row.get(6)?,
+            comment: row.get(7)?,
+            state,
+            asked_at,
+            resolved_at,
+        })
     }
 }
 
@@ -332,11 +630,13 @@ pub enum TerminationReason {
     /// can tell the difference between "the agent crashed" and "we never
     /// even started it because the FS was about to fill".
     InsufficientDiskSpace,
-    /// Harness exited cleanly but recorded one or more unanswered
-    /// `step_questions` rows during the attempt. The runner skips tests +
-    /// commit, rolls back any diff, and pauses the plan until the user
-    /// answers. Distinct from `HarnessFailed` so paused-for-clarification
-    /// history doesn't pollute real-failure metrics.
+    /// Harness exited cleanly but raised one or more open interruptions
+    /// (`ralph question ask` / `ralph block` — native `interruptions` rows)
+    /// during the attempt. The runner skips tests + commit, rolls back any
+    /// diff, marks the branch `Blocked`, and — per docs/dag-redesign.md
+    /// §3.4 / §9 invariant 4 — consumes no retry budget. Distinct from
+    /// `HarnessFailed` so paused-for-clarification history doesn't pollute
+    /// real-failure metrics.
     PausedForQuestion,
     /// Operator pressed `P` (or ran `ralph pause`) to request a graceful
     /// stop after the current step. The runner observed `pause_requested`
@@ -466,16 +766,17 @@ impl std::str::FromStr for TestStatus {
 ///
 /// Matches the physical table layout after all migrations: V1 defined every
 /// column through `updated_at`, V5 appended `plan_harness`,
-/// V16 appended `questions_enabled`, V18 appended `pause_requested`,
+/// V18 appended `pause_requested`,
 /// V19 appended `last_run_branch`, V20 appended `last_run_started_at`,
-/// V23 appended `skip_requested_step_id` + `skip_changes`, and V24
-/// appended `retry_strategy` via `ALTER TABLE ... ADD COLUMN`. V10's
+/// V23 appended `skip_requested_step_id` + `skip_changes`, V24
+/// appended `retry_strategy`, and V27 appended `review_enabled` via
+/// `ALTER TABLE ... ADD COLUMN`. V10's
 /// `prompt_prefix`/`prompt_suffix` and V14's `context_prepend` were
-/// dropped again by V21 (preserving the physical order of the remaining
-/// columns). Every `Plan`-returning query MUST use this list so
-/// [`Plan::from_row`]'s indices line up — a raw `SELECT *` would
-/// otherwise swap columns.
-pub const PLAN_COLUMNS: &str = "id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, created_at, updated_at, plan_harness, questions_enabled, pause_requested, last_run_branch, last_run_started_at, skip_requested_step_id, skip_changes, retry_strategy";
+/// dropped again by V21, and V16's `questions_enabled` was dropped by V36
+/// (preserving the physical order of the remaining columns). Every
+/// `Plan`-returning query MUST use this list so [`Plan::from_row`]'s indices
+/// line up — a raw `SELECT *` would otherwise swap columns.
+pub const PLAN_COLUMNS: &str = "id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, created_at, updated_at, plan_harness, pause_requested, last_run_branch, last_run_started_at, skip_requested_step_id, skip_changes, review_enabled, max_review_corrections";
 
 /// A plan represents a high-level task broken into ordered steps.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -492,15 +793,6 @@ pub struct Plan {
     pub plan_harness: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    /// Per-plan opt-in for the pause-for-question feature. When `false`
-    /// (default), `ralph question ask` invocations from a harness against a
-    /// step in this plan are rejected and no `step_questions` rows are
-    /// written. When `true`, the runner inspects unanswered questions
-    /// after each attempt and may pause the plan. Toggled via
-    /// `ralph plan questions on|off` and the `Q` keybinding in the TUI
-    /// plan list.
-    #[serde(default)]
-    pub questions_enabled: bool,
     /// Operator-requested graceful pause flag. When `true`, the runner
     /// finishes the currently-executing step, then exits with
     /// `TerminationReason::PausedByUser` between steps and clears the flag
@@ -522,7 +814,7 @@ pub struct Plan {
     /// (written by the runner alongside `last_run_branch`). Provides the
     /// resume resolver with a stable "last actually ran" anchor, so its
     /// `ORDER BY` can ignore unrelated bumps to `updated_at` (e.g. toggling
-    /// `questions_enabled` or `pause_requested`). `None` for never-run plans.
+    /// `pause_requested`). `None` for never-run plans.
     #[serde(default)]
     pub last_run_started_at: Option<String>,
     /// Step UUID of a pending cross-process skip request, or `None` when no
@@ -541,12 +833,27 @@ pub struct Plan {
     /// never silently destroys work.
     #[serde(default)]
     pub skip_changes: Option<String>,
-    /// Plan-level default retry strategy. `None` means "no plan-level
-    /// override" — the effective value falls through to the global default
-    /// ([`RetryStrategy::Keep`]) unless a step overrides it. Resolved via
-    /// [`Step::effective_retry_strategy`].
+    /// Plan-level review on/off override (V27). `None` means "no plan-level
+    /// override" — the effective value falls through to the global
+    /// `config.review.enabled` (then `false`) unless a step overrides it.
+    /// Resolved via [`crate::config::effective_review_enabled`] with the
+    /// precedence step > plan > global > false. Stored as a nullable INTEGER
+    /// (tri-state bool) on disk; wired but not yet consumed by the runner in
+    /// this batch.
     #[serde(default)]
-    pub retry_strategy: Option<RetryStrategy>,
+    pub review_enabled: Option<bool>,
+    /// Per-plan cap on the review→correction→review recursion depth (V30,
+    /// docs/dag-redesign.md §10 item 4 / §14.5). `None` means "no plan-level
+    /// override" — the runner uses the built-in default
+    /// ([`crate::review::DEFAULT_MAX_REVIEW_CORRECTIONS`]). When a corrective
+    /// step's own review fails and the chain length would exceed this cap,
+    /// the orchestrator raises a `kind=blocker` interruption
+    /// ("review loop — needs human") instead of spawning another correction.
+    /// Stored as a nullable INTEGER; sibling concept to `max_retries` (set
+    /// per-plan, alongside the plan's review posture). `#[serde(default)]`
+    /// so pre-V30 exported plan JSON still deserializes.
+    #[serde(default)]
+    pub max_review_corrections: Option<i32>,
 }
 
 impl Plan {
@@ -555,9 +862,9 @@ impl Plan {
     /// Expected column order matches [`PLAN_COLUMNS`]:
     /// id, slug, project, branch_name, description, status, harness, agent,
     /// deterministic_tests, created_at, updated_at, plan_harness,
-    /// questions_enabled, pause_requested, last_run_branch,
-    /// last_run_started_at, skip_requested_step_id, skip_changes,
-    /// retry_strategy
+    /// pause_requested, last_run_branch, last_run_started_at,
+    /// skip_requested_step_id, skip_changes, review_enabled,
+    /// max_review_corrections
     pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         let status_str: String = row.get(5)?;
         let status: PlanStatus = status_str.parse().map_err(|e| {
@@ -579,26 +886,26 @@ impl Plan {
             rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, Box::new(e))
         })?;
 
-        // `questions_enabled` and `pause_requested` are INTEGER NOT NULL
-        // DEFAULT 0 on disk; SQLite has no native bool, so read as i64 and
-        // coerce.
-        let questions_enabled_int: i64 = row.get(12)?;
-        let pause_requested_int: i64 = row.get(13)?;
+        // `pause_requested` is INTEGER NOT NULL DEFAULT 0 on disk; SQLite has
+        // no native bool, so read as i64 and coerce.
+        let pause_requested_int: i64 = row.get(12)?;
 
-        // `retry_strategy` is a nullable TEXT column (V24). NULL means "no
-        // plan-level override" — resolution falls through to the global
-        // default. A non-null value must parse to a known variant.
-        let retry_strategy_str: Option<String> = row.get(18)?;
-        let retry_strategy = match retry_strategy_str {
-            Some(s) => Some(s.parse::<RetryStrategy>().map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    18,
-                    rusqlite::types::Type::Text,
-                    Box::new(e),
-                )
-            })?),
-            None => None,
-        };
+        // `review_enabled` is a nullable INTEGER column (V27) at index 17.
+        // NULL means "no plan-level override" — resolution falls through to
+        // the global `config.review.enabled` (then `false`). SQLite has no
+        // native bool, so read as `Option<i64>` and coerce non-null to a
+        // bool (any non-zero = true).
+        let review_enabled: Option<bool> = row.get::<_, Option<i64>>(17)?.map(|v| v != 0);
+
+        // `max_review_corrections` is a nullable INTEGER column (V30) at
+        // index 18. NULL (pre-V30 / never-set) stays `None` — the runner
+        // then uses the built-in default. `.ok()`-tolerant for raw test
+        // inserts / SELECTs that predate the column.
+        let max_review_corrections: Option<i32> = row
+            .get::<_, Option<i64>>(18)
+            .ok()
+            .flatten()
+            .map(|v| v as i32);
 
         Ok(Plan {
             id: row.get(0)?,
@@ -613,13 +920,13 @@ impl Plan {
             plan_harness: row.get(11)?,
             created_at,
             updated_at,
-            questions_enabled: questions_enabled_int != 0,
             pause_requested: pause_requested_int != 0,
-            last_run_branch: row.get(14)?,
-            last_run_started_at: row.get(15)?,
-            skip_requested_step_id: row.get(16)?,
-            skip_changes: row.get(17)?,
-            retry_strategy,
+            last_run_branch: row.get(13)?,
+            last_run_started_at: row.get(14)?,
+            skip_requested_step_id: row.get(15)?,
+            skip_changes: row.get(16)?,
+            review_enabled,
+            max_review_corrections,
         })
     }
 }
@@ -632,6 +939,14 @@ impl Plan {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Step {
     pub id: String,
+    /// Plan-unique, lifetime-stable short handle (V25). Replaces the
+    /// positional step number as the user-facing selector
+    /// (docs/dag-redesign.md §3.1); the internal UUID [`Step::id`] is
+    /// unchanged. `#[serde(default)]` so pre-V25 exported plan JSON (which
+    /// lacks the field) still deserializes — minting happens at step
+    /// creation / import-backfill, not here.
+    #[serde(default)]
+    pub short_id: String,
     pub plan_id: String,
     pub sort_key: String,
     pub title: String,
@@ -665,12 +980,25 @@ pub struct Step {
     /// exported plan JSON that lacks the field.
     #[serde(default)]
     pub tags: Vec<String>,
-    /// Step-level retry-strategy override. `None` means "no step-level
+    /// Step-level review on/off override (V27). `None` means "no step-level
     /// override" — resolution falls through to the plan's value and then
-    /// the global default ([`RetryStrategy::Keep`]). Resolved via
-    /// [`Step::effective_retry_strategy`].
+    /// the global `config.review.enabled` (then `false`). Resolved via
+    /// [`crate::config::effective_review_enabled`] with the precedence
+    /// step then plan then global then false. Stored as a nullable INTEGER
+    /// tri-state bool; wired but not yet consumed in this batch.
     #[serde(default)]
-    pub retry_strategy: Option<RetryStrategy>,
+    pub review_enabled: Option<bool>,
+    /// Per-step nondeterministic-review verdict (V27). `None` (the on-disk
+    /// NULL) means [`ReviewStatus::Pending`] — not yet reviewed. Orthogonal
+    /// to [`Step::status`] exactly as `TestStatus` is orthogonal to the
+    /// termination reason. Wired but not yet consumed in this batch.
+    #[serde(default)]
+    pub review_status: Option<ReviewStatus>,
+    /// For a reviewer-inserted corrective step (§10), the `steps.id` of the
+    /// step it corrects. `None` for ordinary, non-corrective steps. Wired
+    /// but not yet consumed in this batch.
+    #[serde(default)]
+    pub corrects_step_id: Option<String>,
 }
 
 impl Step {
@@ -680,7 +1008,7 @@ impl Step {
     /// id, plan_id, sort_key, title, description, agent, harness,
     /// acceptance_criteria, status, attempts, max_retries, created_at,
     /// updated_at, model, skipped_reason, change_policy, tags,
-    /// retry_strategy
+    /// short_id, review_enabled, review_status, corrects_step_id
     pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         let criteria_json: String = row.get(7)?;
         let acceptance_criteria: Vec<String> =
@@ -729,23 +1057,42 @@ impl Step {
             })?,
         };
 
-        // `retry_strategy` is a nullable TEXT column (V24) at index 17. NULL
-        // means "no step-level override"; a non-null value must parse to a
-        // known variant.
-        let retry_strategy_str: Option<String> = row.get(17)?;
-        let retry_strategy = match retry_strategy_str {
-            Some(s) => Some(s.parse::<RetryStrategy>().map_err(|e| {
+        // `short_id` is the V25 plan-unique handle on column 17. SELECTs
+        // that predate V25 omit the column and raw test inserts may leave
+        // it NULL; either case is defensively mapped to an empty string so
+        // legacy rows keep round-tripping (mirrors the `tags` handling).
+        let short_id: String = row.get::<_, String>(17).ok().unwrap_or_default();
+
+        // V27 review columns at indices 18/19/20. SELECTs that predate V27
+        // omit them and raw test inserts may leave them NULL; `.get(..).ok()`
+        // + the `Option` mapping defensively treats either case as the
+        // inherit / pending default so legacy rows keep round-tripping
+        // (mirrors the `short_id` / `tags` handling above).
+        //
+        // - `review_enabled` (18): nullable INTEGER tri-state bool; non-null
+        //   coerces to a bool (any non-zero = true), like `review_enabled`
+        //   on `Plan`.
+        // - `review_status` (19): nullable TEXT; a non-null value must parse
+        //   to a known `ReviewStatus` variant (NULL = pending).
+        // - `corrects_step_id` (20): nullable TEXT step-id pointer.
+        let review_enabled: Option<bool> =
+            row.get::<_, Option<i64>>(18).ok().flatten().map(|v| v != 0);
+        let review_status_str: Option<String> = row.get::<_, Option<String>>(19).ok().flatten();
+        let review_status = match review_status_str {
+            Some(s) => Some(s.parse::<ReviewStatus>().map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    17,
+                    19,
                     rusqlite::types::Type::Text,
                     Box::new(e),
                 )
             })?),
             None => None,
         };
+        let corrects_step_id: Option<String> = row.get::<_, Option<String>>(20).ok().flatten();
 
         Ok(Step {
             id: row.get(0)?,
+            short_id,
             plan_id: row.get(1)?,
             sort_key: row.get(2)?,
             title: row.get(3)?,
@@ -762,38 +1109,17 @@ impl Step {
             skipped_reason: row.get(14)?,
             change_policy,
             tags,
-            retry_strategy,
+            review_enabled,
+            review_status,
+            corrects_step_id,
         })
     }
-
-    /// Resolve the effective retry strategy for this step.
-    ///
-    /// Precedence is **step > plan > default**: a step-level override wins
-    /// over a plan-level default, which in turn wins over the built-in
-    /// default ([`RetryStrategy::Keep`]). `None` at a level means "defer to
-    /// the next level down".
-    #[allow(dead_code)] // consumed by the executor retry loop in a later step
-    pub fn effective_retry_strategy(&self, plan: &Plan) -> RetryStrategy {
-        self.retry_strategy
-            .or(plan.retry_strategy)
-            .unwrap_or(RetryStrategy::Keep)
-    }
 }
 
-// ---------------------------------------------------------------------------
-// AnsweredQuestion struct
-// ---------------------------------------------------------------------------
-
-/// A question that the harness asked via `ralph question ask` and the user
-/// has since answered. Returned by
-/// [`crate::storage::list_answered_questions_for_step`] in chronological order
-/// and rendered into the prompt's "Previously answered questions" section on
-/// the next attempt of the step (TUI-plan.md §17).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AnsweredQuestion {
-    pub question: String,
-    pub answer: String,
-}
+// The pre-Phase-2 `AnsweredQuestion` struct was removed in the §8/§4 cutover.
+// Prompt assembly now consumes the bounded, interruption-native
+// `Interruption` model (see `Interruption` above and
+// `storage::list_resolved_interruptions_for_step`).
 
 // ---------------------------------------------------------------------------
 // ExecutionLog struct
@@ -823,6 +1149,15 @@ pub struct ExecutionLog {
     pub termination_reason: Option<TerminationReason>,
     #[serde(default)]
     pub test_status: Option<TestStatus>,
+    /// V33 per-step retry-from-scratch cycle pointer. `0` for ordinary
+    /// runs; bumps every time the step's `attempts` is reset from >0 to 0
+    /// (the "Retry step with parked changes" auto-blocker resolver). Lets
+    /// `ralph log` and the rendered-prompt picker group attempts by cycle
+    /// when logical attempt numbers repeat (V32 dropped the
+    /// `UNIQUE(step_id, attempt)` constraint so they can).
+    /// `#[serde(default)]` so pre-V33 exported logs keep round-tripping.
+    #[serde(default)]
+    pub cycle_index: i32,
 }
 
 impl ExecutionLog {
@@ -832,7 +1167,12 @@ impl ExecutionLog {
     /// id, step_id, attempt, started_at, duration_secs, prompt_text, diff,
     /// test_results, rolled_back, committed, commit_hash,
     /// harness_stdout, harness_stderr, cost_usd, input_tokens, output_tokens,
-    /// session_id, termination_reason, test_status
+    /// session_id, termination_reason, test_status, cycle_index
+    ///
+    /// `cycle_index` (column 19) is the V33 per-step retry-from-scratch
+    /// pointer. SELECTs that predate V33 may omit the column; `.get(19).ok()`
+    /// defensively maps a missing or NULL value to 0 (mirrors the
+    /// `short_id` / `tags` handling on [`Step`]).
     pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         let started_str: String = row.get(3)?;
         let started_at = parse_datetime(&started_str).map_err(|e| {
@@ -871,6 +1211,8 @@ impl ExecutionLog {
             None => None,
         };
 
+        let cycle_index: i32 = row.get::<_, Option<i32>>(19).ok().flatten().unwrap_or(0);
+
         Ok(ExecutionLog {
             id: row.get(0)?,
             step_id: row.get(1)?,
@@ -891,6 +1233,7 @@ impl ExecutionLog {
             session_id: row.get(16)?,
             termination_reason,
             test_status,
+            cycle_index,
         })
     }
 }
@@ -920,7 +1263,7 @@ mod tests {
             PlanStatus::Failed,
             PlanStatus::Aborted,
             PlanStatus::Archived,
-            PlanStatus::Question,
+            PlanStatus::Interrupted,
         ];
         for status in &statuses {
             let s = status.as_str();
@@ -930,18 +1273,28 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_status_question_serde_and_display() {
-        // The derived `Question` status must serialize as snake_case
+    fn test_plan_status_interrupted_serde_and_display() {
+        // The derived `Interrupted` status must serialize as snake_case
         // (matches every other variant) so the TUI/JSON output renders it
         // uniformly without a special case.
-        assert_eq!(PlanStatus::Question.as_str(), "question");
-        assert_eq!(PlanStatus::Question.to_string(), "question");
+        assert_eq!(PlanStatus::Interrupted.as_str(), "interrupted");
+        assert_eq!(PlanStatus::Interrupted.to_string(), "interrupted");
         assert_eq!(
-            serde_json::to_string(&PlanStatus::Question).unwrap(),
-            r#""question""#,
+            serde_json::to_string(&PlanStatus::Interrupted).unwrap(),
+            r#""interrupted""#,
         );
-        let parsed: PlanStatus = "question".parse().unwrap();
-        assert_eq!(parsed, PlanStatus::Question);
+        let parsed: PlanStatus = "interrupted".parse().unwrap();
+        assert_eq!(parsed, PlanStatus::Interrupted);
+
+        // One-release back-compat: the legacy "question" spelling still
+        // parses (to the renamed variant) but never serializes back out.
+        let legacy: PlanStatus = "question".parse().unwrap();
+        assert_eq!(legacy, PlanStatus::Interrupted);
+        assert_eq!(
+            serde_json::to_string(&legacy).unwrap(),
+            r#""interrupted""#,
+            "legacy alias must serialize forward as `interrupted`",
+        );
     }
 
     #[test]
@@ -953,12 +1306,142 @@ mod tests {
             StepStatus::Failed,
             StepStatus::Skipped,
             StepStatus::Aborted,
+            StepStatus::Blocked,
         ];
         for status in &statuses {
             let s = status.as_str();
             let parsed: StepStatus = s.parse().unwrap();
             assert_eq!(*status, parsed);
+            // serde must agree with the FromStr/as_str pair.
+            assert_eq!(
+                serde_json::to_string(status).unwrap(),
+                format!(r#""{s}""#),
+                "{status:?} must serialize as its snake_case as_str()"
+            );
         }
+    }
+
+    #[test]
+    fn test_effective_step_status_blocked_is_derived_and_reversible() {
+        // No open interruption: identity for every stored state.
+        for stored in [
+            StepStatus::Pending,
+            StepStatus::InProgress,
+            StepStatus::Complete,
+            StepStatus::Failed,
+            StepStatus::Skipped,
+            StepStatus::Aborted,
+        ] {
+            assert_eq!(
+                effective_step_status(stored, false),
+                stored,
+                "no open interruption ⇒ stored status passes through unchanged"
+            );
+        }
+
+        // Open interruption shadows only the *active* lifecycle states.
+        assert_eq!(
+            effective_step_status(StepStatus::Pending, true),
+            StepStatus::Blocked
+        );
+        assert_eq!(
+            effective_step_status(StepStatus::InProgress, true),
+            StepStatus::Blocked
+        );
+
+        // Terminal states are NOT re-shadowed by a (stale) open flag.
+        for terminal in [
+            StepStatus::Complete,
+            StepStatus::Failed,
+            StepStatus::Skipped,
+            StepStatus::Aborted,
+        ] {
+            assert_eq!(
+                effective_step_status(terminal, true),
+                terminal,
+                "terminal {terminal:?} must not present as Blocked"
+            );
+        }
+
+        // Reversible: the same stored status un-shadows the instant the
+        // interruption resolves (overlay carries no state of its own).
+        let stored = StepStatus::InProgress;
+        assert_eq!(effective_step_status(stored, true), StepStatus::Blocked);
+        assert_eq!(
+            effective_step_status(stored, false),
+            StepStatus::InProgress,
+            "resolving the interruption restores the underlying status"
+        );
+    }
+
+    #[test]
+    fn test_blocked_overlay_is_never_persisted_by_storage() {
+        // The overlay is presentation-only: prove no storage write path can
+        // land `blocked` in `steps.status`. We round-trip a step through the
+        // DB and assert the column never holds 'blocked' even after deriving
+        // a Blocked presentation from an open interruption.
+        let conn = db::open_memory().unwrap();
+        let plan = crate::storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "ov",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let (step, _) = crate::storage::create_step(
+            &conn,
+            &plan.id,
+            crate::storage::NewStep {
+                title: "S",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+
+        // Raise an open interruption, then derive the presentation status.
+        crate::storage::insert_interruption(
+            &conn,
+            &step.id,
+            1,
+            InterruptionKind::Blocker,
+            "blocked on access",
+            &[],
+        )
+        .unwrap();
+        let reloaded = crate::storage::get_step(&conn, &step.id).unwrap();
+        let has_open = !crate::storage::list_open_interruptions_for_plan(&conn, &plan.id)
+            .unwrap()
+            .is_empty();
+        assert_eq!(
+            effective_step_status(reloaded.status, has_open),
+            StepStatus::Blocked,
+            "derived presentation is Blocked while the interruption is open"
+        );
+
+        // The *stored* column is still the underlying lifecycle, never
+        // 'blocked'.
+        let raw: String = conn
+            .query_row(
+                "SELECT status FROM steps WHERE id = ?1",
+                rusqlite::params![step.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_ne!(raw, "blocked", "Blocked must never be written to the DB");
+        assert_eq!(reloaded.status, StepStatus::Pending);
     }
 
     #[test]
@@ -1087,8 +1570,8 @@ mod tests {
         .expect("insert plan");
 
         conn.execute(
-            "INSERT INTO steps (id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO steps (id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, short_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             rusqlite::params![
                 "s1",
                 "p1",
@@ -1101,19 +1584,21 @@ mod tests {
                 "in_progress",
                 2,
                 3,
+                "abcd1234",
             ],
         )
         .expect("insert step");
 
         let step = conn
             .query_row(
-                "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason, change_policy, tags, retry_strategy FROM steps WHERE id = ?1",
+                "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason, change_policy, tags, short_id FROM steps WHERE id = ?1",
                 ["s1"],
                 Step::from_row,
             )
             .expect("query step");
 
         assert_eq!(step.id, "s1");
+        assert_eq!(step.short_id, "abcd1234");
         assert_eq!(step.plan_id, "p1");
         assert_eq!(step.sort_key, "a0");
         assert_eq!(step.title, "Step 1");
@@ -1443,114 +1928,236 @@ mod tests {
     }
 
     #[test]
-    fn test_retry_strategy_roundtrip() {
-        let strategies = [RetryStrategy::Keep, RetryStrategy::Rollback];
-        for s in &strategies {
+    fn test_review_status_roundtrip() {
+        let statuses = [
+            ReviewStatus::Pending,
+            ReviewStatus::InFlight,
+            ReviewStatus::Passed,
+            ReviewStatus::Failed,
+            ReviewStatus::Skipped,
+            ReviewStatus::Disabled,
+        ];
+        for s in &statuses {
             let token = s.as_str();
-            let parsed: RetryStrategy = token.parse().unwrap();
+            let parsed: ReviewStatus = token.parse().unwrap();
             assert_eq!(*s, parsed);
+            // serde round-trips through the same snake_case token.
+            let json = serde_json::to_string(s).unwrap();
+            assert_eq!(json, format!("\"{token}\""));
+            let de: ReviewStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(*s, de);
         }
     }
 
     #[test]
-    fn test_retry_strategy_default_is_keep() {
-        assert_eq!(RetryStrategy::default(), RetryStrategy::Keep);
+    fn test_review_status_default_is_pending() {
+        assert_eq!(ReviewStatus::default(), ReviewStatus::Pending);
     }
 
     #[test]
-    fn test_retry_strategy_display() {
-        assert_eq!(RetryStrategy::Keep.to_string(), "keep");
-        assert_eq!(RetryStrategy::Rollback.to_string(), "rollback");
+    fn test_review_status_display() {
+        assert_eq!(ReviewStatus::Pending.to_string(), "pending");
+        assert_eq!(ReviewStatus::InFlight.to_string(), "in_flight");
+        assert_eq!(ReviewStatus::Passed.to_string(), "passed");
+        assert_eq!(ReviewStatus::Failed.to_string(), "failed");
+        assert_eq!(ReviewStatus::Skipped.to_string(), "skipped");
+        assert_eq!(ReviewStatus::Disabled.to_string(), "disabled");
     }
 
     #[test]
-    fn test_retry_strategy_serialize_snake_case() {
+    fn test_review_status_serialize_snake_case() {
         assert_eq!(
-            serde_json::to_string(&RetryStrategy::Keep).unwrap(),
-            r#""keep""#,
+            serde_json::to_string(&ReviewStatus::InFlight).unwrap(),
+            r#""in_flight""#,
         );
         assert_eq!(
-            serde_json::to_string(&RetryStrategy::Rollback).unwrap(),
-            r#""rollback""#,
+            serde_json::to_string(&ReviewStatus::Disabled).unwrap(),
+            r#""disabled""#,
         );
     }
 
     #[test]
-    fn test_invalid_retry_strategy() {
-        let result: Result<RetryStrategy, _> = "discard".parse();
+    fn test_invalid_review_status() {
+        let result: Result<ReviewStatus, _> = "approved".parse();
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_effective_retry_strategy_precedence() {
-        // Build a minimal Plan/Step pair and vary only the two
-        // retry_strategy fields across all four combinations.
-        fn make_plan(rs: Option<RetryStrategy>) -> Plan {
-            Plan {
-                id: "p1".into(),
-                slug: "s".into(),
-                project: "/p".into(),
-                branch_name: "b".into(),
-                description: "d".into(),
-                status: PlanStatus::Planning,
-                harness: None,
-                agent: None,
-                deterministic_tests: vec![],
-                plan_harness: None,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-                questions_enabled: false,
-                pause_requested: false,
-                last_run_branch: None,
-                last_run_started_at: None,
-                skip_requested_step_id: None,
-                skip_changes: None,
-                retry_strategy: rs,
-            }
-        }
-        fn make_step(rs: Option<RetryStrategy>) -> Step {
-            Step {
-                id: "st1".into(),
-                plan_id: "p1".into(),
-                sort_key: "a0".into(),
-                title: "t".into(),
-                description: "d".into(),
-                agent: None,
-                harness: None,
-                acceptance_criteria: vec![],
-                status: StepStatus::Pending,
-                attempts: 0,
-                max_retries: None,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-                model: None,
-                skipped_reason: None,
-                change_policy: ChangePolicy::Required,
-                tags: vec![],
-                retry_strategy: rs,
-            }
-        }
+    fn test_step_serde_defaults_review_fields_when_missing() {
+        // Pre-V27 exported plan JSON lacks the review fields. The
+        // `#[serde(default)]` attributes must backfill them to the
+        // inherit / pending defaults (all `None`) so round-tripping a
+        // legacy bundle doesn't change effective review behavior.
+        let json = r#"{
+            "id": "s1",
+            "plan_id": "p1",
+            "sort_key": "a0",
+            "title": "T",
+            "description": "",
+            "agent": null,
+            "harness": null,
+            "acceptance_criteria": [],
+            "status": "pending",
+            "attempts": 0,
+            "max_retries": null,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let step: Step = serde_json::from_str(json).unwrap();
+        assert_eq!(step.review_enabled, None);
+        assert_eq!(step.review_status, None);
+        assert_eq!(step.corrects_step_id, None);
+    }
 
-        // (step None, plan None) -> default Keep
+    #[test]
+    fn test_plan_serde_defaults_review_enabled_when_missing() {
+        // Pre-V27 exported plan JSON lacks `review_enabled`; serde(default)
+        // must backfill it to `None` (inherit global).
+        let json = r#"{
+            "id": "p1",
+            "slug": "s",
+            "project": "/p",
+            "branch_name": "b",
+            "description": "d",
+            "status": "planning",
+            "harness": null,
+            "agent": null,
+            "deterministic_tests": [],
+            "plan_harness": null,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let plan: Plan = serde_json::from_str(json).unwrap();
+        assert_eq!(plan.review_enabled, None);
+    }
+
+    #[test]
+    fn test_interruption_kind_roundtrip() {
+        for k in [InterruptionKind::Question, InterruptionKind::Blocker] {
+            let parsed: InterruptionKind = k.as_str().parse().unwrap();
+            assert_eq!(k, parsed);
+        }
+    }
+
+    #[test]
+    fn test_interruption_kind_default_is_question() {
+        assert_eq!(InterruptionKind::default(), InterruptionKind::Question);
+    }
+
+    #[test]
+    fn test_interruption_kind_display() {
+        assert_eq!(InterruptionKind::Question.to_string(), "question");
+        assert_eq!(InterruptionKind::Blocker.to_string(), "blocker");
+    }
+
+    #[test]
+    fn test_interruption_kind_serialize_snake_case() {
         assert_eq!(
-            make_step(None).effective_retry_strategy(&make_plan(None)),
-            RetryStrategy::Keep,
+            serde_json::to_string(&InterruptionKind::Question).unwrap(),
+            r#""question""#,
         );
-        // (step Some, plan None) -> step
         assert_eq!(
-            make_step(Some(RetryStrategy::Rollback)).effective_retry_strategy(&make_plan(None)),
-            RetryStrategy::Rollback,
+            serde_json::to_string(&InterruptionKind::Blocker).unwrap(),
+            r#""blocker""#,
         );
-        // (step None, plan Some) -> plan
+    }
+
+    #[test]
+    fn test_invalid_interruption_kind() {
+        let result: Result<InterruptionKind, _> = "answer".parse();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_interruption_state_roundtrip() {
+        for s in [InterruptionState::Open, InterruptionState::Resolved] {
+            let parsed: InterruptionState = s.as_str().parse().unwrap();
+            assert_eq!(s, parsed);
+        }
+    }
+
+    #[test]
+    fn test_interruption_state_default_is_open() {
+        assert_eq!(InterruptionState::default(), InterruptionState::Open);
+    }
+
+    #[test]
+    fn test_interruption_state_display() {
+        assert_eq!(InterruptionState::Open.to_string(), "open");
+        assert_eq!(InterruptionState::Resolved.to_string(), "resolved");
+    }
+
+    #[test]
+    fn test_interruption_state_serialize_snake_case() {
         assert_eq!(
-            make_step(None).effective_retry_strategy(&make_plan(Some(RetryStrategy::Rollback))),
-            RetryStrategy::Rollback,
+            serde_json::to_string(&InterruptionState::Open).unwrap(),
+            r#""open""#,
         );
-        // (step Some, plan Some) -> step wins
         assert_eq!(
-            make_step(Some(RetryStrategy::Keep))
-                .effective_retry_strategy(&make_plan(Some(RetryStrategy::Rollback))),
-            RetryStrategy::Keep,
+            serde_json::to_string(&InterruptionState::Resolved).unwrap(),
+            r#""resolved""#,
         );
+    }
+
+    #[test]
+    fn test_invalid_interruption_state() {
+        let result: Result<InterruptionState, _> = "closed".parse();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_interruption_serde_round_trip_snake_case() {
+        let interruption = Interruption {
+            id: "i1".into(),
+            step_id: "s1".into(),
+            attempt: 2,
+            kind: InterruptionKind::Question,
+            body: "Which database driver?".into(),
+            options: vec![
+                InterruptionOption {
+                    text: "rusqlite (bundled)".into(),
+                    priority: 1,
+                },
+                InterruptionOption {
+                    text: "sqlx".into(),
+                    priority: 2,
+                },
+            ],
+            resolution: Some("rusqlite (bundled)".into()),
+            comment: Some("matches the zero-system-deps goal".into()),
+            state: InterruptionState::Resolved,
+            asked_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            resolved_at: Some("2026-01-02T00:00:00Z".parse().unwrap()),
+        };
+
+        let json = serde_json::to_string(&interruption).unwrap();
+        // kind/state must serialize as snake_case tokens.
+        assert!(json.contains(r#""kind":"question""#));
+        assert!(json.contains(r#""state":"resolved""#));
+
+        let back: Interruption = serde_json::from_str(&json).unwrap();
+        assert_eq!(interruption, back);
+    }
+
+    #[test]
+    fn test_interruption_blocker_serde_defaults_empty_options() {
+        // A blocker omits options/resolution/comment/resolved_at; the
+        // serde(default) attributes must backfill them.
+        let json = r#"{
+            "id": "i2",
+            "step_id": "s2",
+            "attempt": 1,
+            "kind": "blocker",
+            "body": "needs sudo to install package",
+            "state": "open",
+            "asked_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let blocker: Interruption = serde_json::from_str(json).unwrap();
+        assert_eq!(blocker.kind, InterruptionKind::Blocker);
+        assert_eq!(blocker.state, InterruptionState::Open);
+        assert!(blocker.options.is_empty());
+        assert_eq!(blocker.resolution, None);
+        assert_eq!(blocker.comment, None);
+        assert_eq!(blocker.resolved_at, None);
     }
 }

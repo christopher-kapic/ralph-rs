@@ -6,5 +6,6 @@
 // reusable from both plan-list (read-only previews) and plan-detail
 // (interactive primary view).
 
+pub mod outline_list;
 pub mod palette_bar;
 pub mod step_list;

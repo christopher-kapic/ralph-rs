@@ -1,6 +1,33 @@
 # Post-Step Review with Agent Harnesses
 
-Ralph has no built-in review agent. Instead, it ships a **lifecycle hook system** that lets you invoke any external agent harness (Claude Code, Codex, Goose, etc.) — or any shell command — at well-defined points during plan execution. The `post-step` lifecycle is the natural integration point for review.
+> **⚠️ Superseded for review: ralph now has a built-in review pipeline.**
+> As of the DAG redesign, ralph ships a **first-class, built-in
+> nondeterministic review pipeline** — a separate harness reviews each
+> step's commit read-only, and a failed review automatically inserts a
+> corrective step and re-parents dependents. For step review, **prefer the
+> built-in pipeline over the manual post-step-hook pattern described
+> below.** See `docs/dag-redesign.md` §8–§10 for the model, and the
+> review surface:
+>
+> - `ralph plan review <on|off> <slug>` — per-plan toggle
+> - `ralph step edit <sel> --review <on|off|inherit>` — per-step override
+> - `ralph config review set [--harness <h>] [--model <m>] [--enabled <bool>]`
+>   — the global review harness/model/default
+>
+> Effective review = `step.review_enabled ?? plan.review_enabled ??
+> config.review.enabled ?? false` (off by default; precedence step > plan
+> > global, mirroring `RetryStrategy`).
+>
+> **The hook system itself is not deprecated.** Only the *review-specific*
+> recommendation in this document is superseded — `pre-step` / `post-step`
+> / `pre-test` / `post-test` hooks remain fully supported and are still the
+> right tool for other lifecycle needs (linters, notifications, project
+> setup/teardown, custom checks). If you only want review, reach for the
+> built-in pipeline; keep using hooks for everything else.
+
+---
+
+Ralph ships a **lifecycle hook system** that lets you invoke any external agent harness (Claude Code, Codex, Goose, etc.) — or any shell command — at well-defined points during plan execution. Historically the `post-step` lifecycle was the natural integration point for review (see the banner above for the built-in replacement).
 
 Unlike traditional filesystem hooks, ralph stores hooks in two places:
 

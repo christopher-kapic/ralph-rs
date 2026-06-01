@@ -121,17 +121,110 @@ pub enum RunEvent {
         attempt: i32,
         at: DateTime<Utc>,
     },
+    /// Emitted the moment a read-only reviewer is spawned against a
+    /// committed iteration (docs/dag-redesign.md §3.2/§9-inv-2). Lets the
+    /// TUI show a "reviewing" badge without polling. The review runs
+    /// concurrently with the next unrelated implementation; it is read-only
+    /// w.r.t. the working tree (fixed `commit_sha`).
+    ReviewStarted {
+        step_id: String,
+        step_num: usize,
+        commit_sha: String,
+        iteration: i32,
+    },
+    /// Emitted when a reviewer returns a verdict. `passed = true` ⇒
+    /// `REVIEW PASS` (the step is `Complete`/`Passed`); `false` ⇒
+    /// `REVIEW FAIL` (a corrective step is requested — see
+    /// `corrective_step_requested`). The matching `Ralph-Review` commit
+    /// trailer is annotated `passed`/`failed` alongside this event.
+    ReviewFinished {
+        step_id: String,
+        step_num: usize,
+        commit_sha: String,
+        iteration: i32,
+        passed: bool,
+    },
+    /// The reviewer-side half of the §9-inv-3 structured channel: a failed
+    /// review *requests* (never performs) a corrective-step insertion. The
+    /// orchestrator — the SOLE DAG writer — consumes the matching
+    /// `corrective_step_requests` bridge row at a scheduler tick and performs
+    /// the §10 insert + re-parent. A reviewer subprocess never writes step
+    /// rows/edges; this event + the DB bridge row ARE the request.
+    CorrectiveStepRequested {
+        reviewed_step_id: String,
+        reviewed_step_num: usize,
+        commit_sha: String,
+        iteration: i32,
+        issues: i32,
+    },
+    /// Emitted when the orchestrator (sole writer) has inserted corrective
+    /// step `A′` and re-parented every former dependent of `A` onto it
+    /// (§10). `corrects_step_id` is the reviewed step `A`.
+    CorrectiveStepInserted {
+        corrective_step_id: String,
+        corrective_short_id: String,
+        corrects_step_id: String,
+    },
+    /// Emitted when the review→correction→review chain hits the per-plan
+    /// `max_review_corrections` cap (§10 item 4 / §14.5): instead of
+    /// spawning another correction, the orchestrator raises a
+    /// `kind=blocker` interruption ("review loop — needs human") on the
+    /// offending step and stops the chain.
+    ReviewLoopEscalated {
+        step_id: String,
+        step_num: usize,
+        chain_len: usize,
+        cap: usize,
+    },
     /// Emitted when the runner exits cleanly because the operator set
     /// `plans.pause_requested` (TUI `[P]` keybinding or `ralph pause`).
     /// Distinct from `plan_complete`/`summary` so the TUI can surface the
     /// "Paused. Use `ralph resume` to continue." toast and so machine
     /// consumers can distinguish a deliberate pause from completion.
     PausedByUser { plan_slug: String },
+    /// Emitted on every new interruption (question / blocker) write, no
+    /// matter who triggered it: harness-raised (`ralph question ask` /
+    /// `ralph block`), executor-raised auto-blocker on retry exhaustion,
+    /// or TUI/CLI-injected. `auto_raised` discriminates the executor's
+    /// retry-exhausted auto-blocker — Phase E reversed the pre-existing
+    /// "no NDJSON for interruptions" stance precisely because the auto-
+    /// raised one is the case a TUI / log shipper most wants to react to
+    /// without polling. Consumers that don't want auto-raised noise can
+    /// gate on `auto_raised == false`.
+    InterruptionRaised {
+        interruption_id: String,
+        step_id: String,
+        plan_slug: String,
+        kind: String,
+        // `default` so a consumer built before these fields existed (or a
+        // future stream that drops them) still deserializes the event rather
+        // than having `consume_lines` silently discard the whole line. The
+        // emitter always writes them; the defaults only ever apply on the
+        // parse side under version skew. `false`/`0` are the safe readings:
+        // "not auto-raised, attempt unknown".
+        #[serde(default)]
+        auto_raised: bool,
+        #[serde(default)]
+        attempt: i32,
+        raised_at: DateTime<Utc>,
+    },
+    /// Emitted on every interruption resolution, no matter who closed it
+    /// (CLI `ralph interruption resolve`, TUI inbox, or a programmatic
+    /// resolution from the orchestrator's auto-resolve paths). Pairs with
+    /// `interruption_raised` by `interruption_id`.
+    InterruptionResolved {
+        interruption_id: String,
+        step_id: String,
+        plan_slug: String,
+        resolution: String,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        comment: Option<String>,
+        resolved_at: DateTime<Utc>,
+    },
     /// Final event for `ralph run`, replacing the role of `plan_complete` for
     /// human-readable summary consumers. `plan_complete` is **kept** for one
     /// release as a compat shim (still emitted alongside `summary`) so
     /// meta-harnesses pinned to it don't break.
-    #[allow(dead_code)] // Emit site lands in a later step (TUI-plan §13.1).
     Summary {
         plan_status: PlanStatus,
         steps_complete: usize,
@@ -160,6 +253,79 @@ pub struct StaleStep {
 pub fn emit_ndjson<T: Serialize>(value: &T) -> Result<()> {
     let mut out = io::stdout().lock();
     emit_ndjson_to(&mut out, value)
+}
+
+/// Best-effort emit of an [`RunEvent::InterruptionRaised`]. Looks the plan
+/// slug up by `step_id` so callers (storage, the executor, the harness
+/// CLI handlers) don't have to plumb it through. Silently swallows errors
+/// — these events are advisory; failing to look up a plan slug (e.g.,
+/// orphaned step row, missing FK) must NOT break the underlying insert.
+///
+/// Gated on caller-passed `json_output` so the function is a no-op outside
+/// NDJSON mode (the existing pattern used by `runner.rs` for all other
+/// `RunEvent` variants — emitting unconditionally would corrupt the
+/// human-readable stdout).
+pub fn emit_interruption_raised(
+    conn: &rusqlite::Connection,
+    json_output: bool,
+    interruption_id: &str,
+    step_id: &str,
+    kind: &str,
+    auto_raised: bool,
+    attempt: i32,
+) {
+    if !json_output {
+        return;
+    }
+    let plan_slug = match plan_slug_for_step(conn, step_id) {
+        Some(s) => s,
+        None => return,
+    };
+    let _ = emit_ndjson(&RunEvent::InterruptionRaised {
+        interruption_id: interruption_id.to_string(),
+        step_id: step_id.to_string(),
+        plan_slug,
+        kind: kind.to_string(),
+        auto_raised,
+        attempt,
+        raised_at: chrono::Utc::now(),
+    });
+}
+
+/// Best-effort emit of an [`RunEvent::InterruptionResolved`]. Same shape /
+/// rationale as [`emit_interruption_raised`].
+pub fn emit_interruption_resolved(
+    conn: &rusqlite::Connection,
+    json_output: bool,
+    interruption_id: &str,
+    step_id: &str,
+    resolution: &str,
+    comment: Option<&str>,
+) {
+    if !json_output {
+        return;
+    }
+    let plan_slug = match plan_slug_for_step(conn, step_id) {
+        Some(s) => s,
+        None => return,
+    };
+    let _ = emit_ndjson(&RunEvent::InterruptionResolved {
+        interruption_id: interruption_id.to_string(),
+        step_id: step_id.to_string(),
+        plan_slug,
+        resolution: resolution.to_string(),
+        comment: comment.map(|s| s.to_string()),
+        resolved_at: chrono::Utc::now(),
+    });
+}
+
+fn plan_slug_for_step(conn: &rusqlite::Connection, step_id: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT p.slug FROM plans p JOIN steps s ON s.plan_id = p.id WHERE s.id = ?1",
+        rusqlite::params![step_id],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
 }
 
 /// Testable variant of [`emit_ndjson`] that writes to an arbitrary writer.
@@ -191,7 +357,6 @@ pub struct OutputContext {
     /// Whether to emit JSON or human-readable output.
     pub format: OutputFormat,
     /// Suppress progress / banner output when true.
-    #[allow(dead_code)] // Wired in a later step.
     pub quiet: bool,
     /// Whether ANSI color codes should be emitted.
     pub color: bool,
@@ -251,12 +416,17 @@ pub fn status_icon(status: StepStatus, color: bool) -> &'static str {
         (StepStatus::Failed, true) => "\x1b[31m✘\x1b[0m",
         (StepStatus::Skipped, true) => "\x1b[90m⊘\x1b[0m",
         (StepStatus::Aborted, true) => "\x1b[31m⊘\x1b[0m",
+        // Blocked is the §3.3 derived overlay (open interruption). Closest
+        // ANSI to the §12.5 orange is yellow; a distinct `?` glyph reads as
+        // "needs a human" alongside the plan-level derived status.
+        (StepStatus::Blocked, true) => "\x1b[33m?\x1b[0m",
         (StepStatus::Pending, false) => "○",
         (StepStatus::InProgress, false) => "▶",
         (StepStatus::Complete, false) => "✔",
         (StepStatus::Failed, false) => "✘",
         (StepStatus::Skipped, false) => "⊘",
         (StepStatus::Aborted, false) => "⊘",
+        (StepStatus::Blocked, false) => "?",
     }
 }
 
@@ -274,6 +444,7 @@ pub fn colored_status(status: StepStatus, color: bool) -> String {
         StepStatus::Failed => "\x1b[31m",
         StepStatus::Skipped => "\x1b[90m",
         StepStatus::Aborted => "\x1b[31m",
+        StepStatus::Blocked => "\x1b[33m",
     };
     format!("{code}{}\x1b[0m", status.as_str())
 }
@@ -290,7 +461,7 @@ pub fn plan_status_icon(status: PlanStatus, color: bool) -> &'static str {
         (PlanStatus::Failed, true) => "\x1b[31m✘\x1b[0m",
         (PlanStatus::Aborted, true) => "\x1b[31m⊘\x1b[0m",
         (PlanStatus::Archived, true) => "\x1b[90m▪\x1b[0m",
-        (PlanStatus::Question, true) => "\x1b[33m?\x1b[0m",
+        (PlanStatus::Interrupted, true) => "\x1b[33m?\x1b[0m",
         (PlanStatus::Planning, false) => "◯",
         (PlanStatus::Ready, false) => "◉",
         (PlanStatus::InProgress, false) => "▶",
@@ -298,7 +469,7 @@ pub fn plan_status_icon(status: PlanStatus, color: bool) -> &'static str {
         (PlanStatus::Failed, false) => "✘",
         (PlanStatus::Aborted, false) => "⊘",
         (PlanStatus::Archived, false) => "▪",
-        (PlanStatus::Question, false) => "?",
+        (PlanStatus::Interrupted, false) => "?",
     }
 }
 
@@ -361,7 +532,7 @@ pub fn colored_plan_status(status: PlanStatus, color: bool) -> String {
         PlanStatus::Failed => "\x1b[31m",
         PlanStatus::Aborted => "\x1b[31m",
         PlanStatus::Archived => "\x1b[90m",
-        PlanStatus::Question => "\x1b[33m",
+        PlanStatus::Interrupted => "\x1b[33m",
     };
     format!("{code}{}\x1b[0m", status.as_str())
 }
@@ -633,6 +804,12 @@ impl From<&Plan> for PlanSummary {
 #[derive(Debug, Clone, Serialize)]
 pub struct StepSummary {
     pub id: String,
+    /// The plan-unique 8-char DAG handle. Always serialized (like
+    /// `change_policy`/`tags`, matching `ExportedStep`) so a JSON consumer
+    /// authoring the DAG — e.g. parsing `step add --import-json --json`
+    /// output to wire `depends_on` — can read back the (possibly pinned)
+    /// id rather than getting no handle at all.
+    pub short_id: String,
     pub plan_id: String,
     pub sort_key: String,
     pub title: String,
@@ -661,6 +838,7 @@ impl From<&Step> for StepSummary {
     fn from(s: &Step) -> Self {
         Self {
             id: s.id.clone(),
+            short_id: s.short_id.clone(),
             plan_id: s.plan_id.clone(),
             sort_key: s.sort_key.clone(),
             title: s.title.clone(),
@@ -805,13 +983,20 @@ pub struct StatusSummary {
     /// plain text) when set, so a normal status report stays compact.
     #[serde(skip_serializing_if = "std::ops::Not::not", default)]
     pub pause_requested: bool,
+    /// Count of open interruptions (questions or blockers) for steps in this
+    /// plan. Always present (0 when none). Wired via
+    /// `storage::list_open_interruptions_for_plan` (or equivalent COUNT) so
+    /// JSON consumers can detect the derived blocked/interrupted state
+    /// without an extra query. When >0 the plan is effectively blocked for
+    /// progress.
+    pub open_interruptions: usize,
 }
 
 /// Serializable projection of a [`LiveRun`] for the `status` command.
 ///
 /// Timestamps are kept as raw strings so the struct mirrors the on-disk row;
-/// `phase_elapsed_secs` is a computed field populated at construction time
-/// when `phase_started_at` parses as a chrono timestamp.
+/// `phase_elapsed_secs` and `state` are computed fields populated at
+/// construction time (see [`LiveRunDisplay::from_live_run`]).
 #[derive(Debug, Clone, Serialize)]
 pub struct LiveRunDisplay {
     pub pid: i64,
@@ -832,6 +1017,15 @@ pub struct LiveRunDisplay {
     pub phase_started_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phase_elapsed_secs: Option<f64>,
+    /// Derived coarse-grained state string for the live run (and surfaced
+    /// in `status --json`). Values are drawn from the agent-suggested set
+    /// (harness | committing | testing | pre_test_hook | post_test_hook |
+    /// rollback | paused | blocked | crashed | idle) with closest practical
+    /// mappings for the full Phase space (pre_step_hook / post_step_hook
+    /// are emitted as-is). Computed in `from_live_run` from Phase + signals
+    /// (child_pid, updated_at staleness, elapsed) and plan context
+    /// (open_interruptions count, pause_requested).
+    pub state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_command: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -840,16 +1034,82 @@ pub struct LiveRunDisplay {
 
 impl LiveRunDisplay {
     /// Project a [`LiveRun`] into its display form, computing
-    /// `phase_elapsed_secs = now() - phase_started_at`. Parse failures on the
-    /// timestamp leave `phase_elapsed_secs` as `None` rather than erroring —
-    /// the point is to surface best-effort observability, not to refuse
-    /// output when the server clock wrote an unparseable string.
-    pub fn from_live_run(lr: &LiveRun) -> Self {
+    /// `phase_elapsed_secs = now() - phase_started_at` and a derived `state`
+    /// string. Parse failures on timestamps leave computed fields as `None`
+    /// rather than erroring — the point is to surface best-effort
+    /// observability.
+    ///
+    /// `open_interruptions` and `pause_requested` come from the plan context
+    /// at call site (in `build_status_summary`) so that `state` can prefer
+    /// "blocked" (when count > 0) or "paused".
+    pub fn from_live_run(lr: &LiveRun, open_interruptions: usize, pause_requested: bool) -> Self {
         let phase_elapsed_secs = lr.phase_started_at.as_deref().and_then(|s| {
             s.parse::<DateTime<Utc>>()
                 .ok()
                 .map(|started| (Utc::now() - started).num_milliseconds() as f64 / 1000.0)
         });
+
+        // Derive `state` with the following precedence (per full agent-suggested
+        // enum decision):
+        //   crashed (heuristic) > blocked (open_interruptions > 0) > paused (pause_requested)
+        //   > phase-derived value (remapping "commit"->"committing", "tests"->"testing";
+        //     PreStepHook/PostStepHook surface as "pre_step_hook"/"post_step_hook").
+        //
+        // Crashed heuristic (conservative, documented). BOTH arms require
+        // `child_pid` to be None: `updated_at` is only bumped on phase
+        // transitions (no intra-phase heartbeat), so a legitimately
+        // long-running harness call or slow test suite leaves it stale while
+        // a live child is still recorded. A recorded child therefore means
+        // "in progress, not crashed" regardless of staleness.
+        // - child_pid is None AND `updated_at` parses and its age is > 5 minutes, OR
+        // - child_pid is None AND phase is Harness or Commit AND
+        //   phase_elapsed_secs > 300s (catches a runner that died mid-phase
+        //   without a final updated_at bump).
+        let crashed = {
+            let mut is_crashed = false;
+            if lr.child_pid.is_none() {
+                let stale_phase_without_child = matches!(
+                    lr.phase,
+                    Some(
+                        Phase::PreStepHook
+                            | Phase::Commit
+                            | Phase::Rollback
+                            | Phase::PostStepHook
+                            | Phase::Idle
+                    )
+                );
+                if stale_phase_without_child
+                    && let Some(ref ua) = lr.updated_at
+                    && let Ok(dt) = ua.parse::<DateTime<Utc>>()
+                    && (Utc::now() - dt).num_minutes() > 5
+                {
+                    is_crashed = true;
+                }
+                if !is_crashed
+                    && matches!(lr.phase, Some(Phase::Harness) | Some(Phase::Commit))
+                    && phase_elapsed_secs.is_some_and(|e| e > 300.0)
+                {
+                    is_crashed = true;
+                }
+            }
+            is_crashed
+        };
+
+        let state = if crashed {
+            "crashed".to_string()
+        } else if open_interruptions > 0 {
+            "blocked".to_string()
+        } else if pause_requested {
+            "paused".to_string()
+        } else {
+            match lr.phase {
+                Some(Phase::Commit) => "committing".to_string(),
+                Some(Phase::Tests) => "testing".to_string(),
+                Some(p) => p.as_str().to_string(),
+                None => "idle".to_string(),
+            }
+        };
+
         LiveRunDisplay {
             pid: lr.pid,
             plan_slug: lr.plan_slug.clone(),
@@ -861,6 +1121,7 @@ impl LiveRunDisplay {
             phase: lr.phase,
             phase_started_at: lr.phase_started_at.clone(),
             phase_elapsed_secs,
+            state,
             current_command: lr.current_command.clone(),
             child_pid: lr.child_pid,
         }
@@ -909,6 +1170,15 @@ pub struct CancelSummary {
 #[derive(Debug, Clone, Serialize)]
 pub struct DependencyListSummary {
     pub slug: String,
+    pub depends_on: Vec<String>,
+    pub depended_on_by: Vec<String>,
+}
+
+/// JSON output for the `step dependency list` command. Step analogue of
+/// [`DependencyListSummary`]; identifiers are step short ids.
+#[derive(Debug, Clone, Serialize)]
+pub struct StepDependencyListSummary {
+    pub short_id: String,
     pub depends_on: Vec<String>,
     pub depended_on_by: Vec<String>,
 }
@@ -1202,6 +1472,7 @@ mod tests {
     fn test_step_summary_json_snake_case() {
         let summary = StepSummary {
             id: "s1".into(),
+            short_id: "abcd1234".into(),
             plan_id: "p1".into(),
             sort_key: "a0".into(),
             title: "Step 1".into(),
@@ -1220,6 +1491,7 @@ mod tests {
         };
         let json = serde_json::to_string(&summary).unwrap();
         assert!(json.contains("\"plan_id\""));
+        assert!(json.contains("\"short_id\":\"abcd1234\""));
         assert!(json.contains("\"sort_key\""));
         assert!(json.contains("\"acceptance_criteria\""));
         assert!(json.contains("\"max_retries\""));
@@ -1332,6 +1604,7 @@ mod tests {
             session_id: None,
             termination_reason: None,
             test_status: None,
+            cycle_index: 0,
         };
         let s = LogEntrySummary::new(&log, &LogOutputMode::Truncated(50));
         let out_lines = s.stdout.as_deref().map(|s| s.lines().count()).unwrap_or(0);
@@ -1378,7 +1651,7 @@ mod tests {
     #[test]
     fn test_live_run_display_json_includes_phase_elapsed_secs() {
         let live = sample_live_run();
-        let disp = LiveRunDisplay::from_live_run(&live);
+        let disp = LiveRunDisplay::from_live_run(&live, 0, false);
         assert!(disp.phase_elapsed_secs.is_some());
         let elapsed = disp.phase_elapsed_secs.unwrap();
         assert!(
@@ -1398,8 +1671,36 @@ mod tests {
     fn test_live_run_display_malformed_phase_started_at_yields_none() {
         let mut live = sample_live_run();
         live.phase_started_at = Some("not-a-timestamp".into());
-        let disp = LiveRunDisplay::from_live_run(&live);
+        let disp = LiveRunDisplay::from_live_run(&live, 0, false);
         assert!(disp.phase_elapsed_secs.is_none());
+    }
+
+    #[test]
+    fn test_live_run_display_does_not_mark_childless_tests_stale_as_crashed() {
+        let mut live = sample_live_run();
+        live.child_pid = None;
+        live.phase = Some(Phase::Tests);
+        live.updated_at = Some(
+            (Utc::now() - chrono::Duration::minutes(10))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        );
+
+        let disp = LiveRunDisplay::from_live_run(&live, 0, false);
+        assert_eq!(disp.state, "testing");
+    }
+
+    #[test]
+    fn test_live_run_display_marks_stale_internal_phase_without_child_as_crashed() {
+        let mut live = sample_live_run();
+        live.child_pid = None;
+        live.phase = Some(Phase::Commit);
+        live.updated_at = Some(
+            (Utc::now() - chrono::Duration::minutes(10))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        );
+
+        let disp = LiveRunDisplay::from_live_run(&live, 0, false);
+        assert_eq!(disp.state, "crashed");
     }
 
     #[test]
@@ -1418,6 +1719,7 @@ mod tests {
             },
             live: None,
             pause_requested: false,
+            open_interruptions: 0,
         };
         let json = serde_json::to_string(&summary).unwrap();
         assert!(
@@ -1440,8 +1742,9 @@ mod tests {
                 pending: 2,
                 in_progress: 1,
             },
-            live: Some(LiveRunDisplay::from_live_run(&sample_live_run())),
+            live: Some(LiveRunDisplay::from_live_run(&sample_live_run(), 0, false)),
             pause_requested: false,
+            open_interruptions: 0,
         };
         let json = serde_json::to_string(&summary).unwrap();
         assert!(json.contains("\"live\":{"));

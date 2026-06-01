@@ -19,7 +19,6 @@ use crate::plan::Phase;
 /// in `plan.rs`.
 ///
 /// Read by `ralph cancel` and `ralph status` live view.
-#[allow(dead_code)]
 pub const LIVE_RUN_COLUMNS: &str = "project, pid, pid_start_token, plan_id, plan_slug, started_at, \
      step_id, step_num, attempt, max_attempts, phase, phase_started_at, current_command, \
      execution_log_id, child_pid, child_start_token, updated_at, source_branch, stash_sha, \
@@ -75,7 +74,6 @@ impl LiveRun {
     /// value surfaces as a type-conversion error rather than a silent
     /// default — this mirrors how `ExecutionLog::from_row` validates its
     /// `termination_reason` and `test_status` columns.
-    #[allow(dead_code)]
     pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         let phase_str: Option<String> = row.get(10)?;
         let phase = match phase_str {
@@ -408,7 +406,7 @@ fn pid_is_alive(pid: i64) -> bool {
 /// read the live process's current token we conservatively assume same
 /// process, because blocking a duplicate run is strictly safer than
 /// clobbering a live one.
-fn is_same_live_process(pid: i64, stored_start_token: Option<&str>) -> bool {
+pub(crate) fn is_same_live_process(pid: i64, stored_start_token: Option<&str>) -> bool {
     if !pid_is_alive(pid) {
         return false;
     }

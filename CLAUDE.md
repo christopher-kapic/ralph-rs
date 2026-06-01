@@ -1,10 +1,49 @@
-# ralph-rs — Deterministic Execution Planner
+# ralph-rs — Deterministic Dependencies & Validation, Dynamic Scheduling, Optional Nondeterministic Review
 
-A Rust CLI that orchestrates coding agent harnesses (Claude Code, Codex, OpenCode, Copilot, Goose, Pi) through step-based plans with test validation, git integration, and retry loops.
+A Rust CLI that orchestrates coding agent harnesses (Claude Code, Codex, OpenCode, Copilot, Goose, Pi) through **dependency-DAG plans** with test validation, git integration, retry loops, and an optional built-in step-by-step review pipeline.
+
+**Determinism framing (post-DAG-redesign, §11).** ralph is no longer a flat
+"Deterministic Execution Planner." The reproducibility promise is now
+**per-step**: same inputs → same step behavior, and the scheduler's choice
+among runnable steps is a deterministic `(topological depth, sort_key,
+short_id)` tie-break — so a linear plan (and any plan, given identical human
+answers) runs in the authored order, no script regressions. *Added* on top:
+**dynamic scheduling** (when a branch blocks on a human, the order the
+remaining branches run depends on human-answer timing) and **first-class
+nondeterministic review** (a separate harness audits steps). The wall-clock
+interleave of concurrently-running reviews is explicitly **not** part of the
+reproducibility guarantee (§14.4).
 
 ## Design Spec
 
-The TUI design spec is `TUI-plan.md` at the project root. **Note:** that document was written before implementation. Its prompt-layer model (§8/§11), questions storage (§15), and build-phase list still describe the *pre-overhaul* shape (per-plan `context_prepend`, global/project prefix-suffix pairs, `questions_enabled DEFAULT 0`); the prompt-overhaul branch superseded those — see "Prompt model" and "Key Design Decisions" below for the current four-layer model, retry strategy, and skip behavior. The narrative sections that the overhaul touched have been reconciled in `TUI-plan.md`, but the older keybinding tables and ASCII mocks were left as historical design notes. This file is the authoritative reference for the project's current state.
+The DAG-redesign design document is `docs/dag-redesign.md`. It is the
+authoritative spec for the dependency-DAG model, the interruption system,
+the built-in review pipeline, the scheduler, and the TUI outline/inbox. The
+"Important deliberate deviations" below record where the shipped code
+intentionally differs from that draft. Two material deviations from §3.2 /
+§5 / §3.4 that landed post-redesign: (1) **test-then-commit + at-most-one
+commit per step** (replaces the draft's "commit per iteration, before the
+test" — with no per-iteration commits there was no `RetryStrategy::Keep`
+vs. `Rollback` distinction at runtime and nothing for
+`--squash-on-complete` to collapse, so both were removed in migration
+V37); (2) a
+**retry-exhaustion auto-blocker** (a `kind=Blocker` interruption with
+ranked Retry / Mark Failed options instead of the draft's terminal
+`StepStatus::Failed` transition on `TestFailed`/`CommitFailed`). Both are
+detailed under "DAG redesign — shipped shape" below.
+
+The pre-DAG TUI design spec is `TUI-plan.md` at the project root. **Note:**
+that document was written before implementation. Its prompt-layer model
+(§8/§11), questions storage (§15), and build-phase list still describe the
+*pre-overhaul* shape (per-plan `context_prepend`, global/project
+prefix-suffix pairs, `questions_enabled DEFAULT 0`); the prompt-overhaul
+branch superseded those, and the DAG redesign superseded the flat
+step-list/question model on top of that — see "Prompt model", "Key Design
+Decisions", and "DAG redesign — shipped shape" below for the current state.
+The narrative sections that the overhauls touched have been reconciled in
+`TUI-plan.md`, but the older keybinding tables and ASCII mocks were left as
+historical design notes. This file is the authoritative reference for the
+project's current state.
 
 ## Tech Stack
 
@@ -25,14 +64,15 @@ src/
   main.rs              — Entry point, clap CLI dispatch, resolve_plan helper
   cli.rs               — Clap command/arg definitions (ValueEnum for Lifecycle, PlanStatus)
   config.rs            — JSON config loading (~/.config/ralph-rs/config.json), harness definitions
-  db.rs                — SQLite connection, migrations (V1–V24)
-  plan.rs              — Plan/Step/ExecutionLog models, enums (incl. RetryStrategy {Keep, Rollback})
+  db.rs                — SQLite connection, migrations (V1–V34)
+  plan.rs              — Plan/Step/ExecutionLog models, enums (StepStatus incl. derived Blocked overlay; PlanStatus incl. derived Interrupted; ReviewStatus; Interruption domain model)
   frac_index.rs        — Base-62 fractional indexing for O(1) step reordering
-  storage.rs           — High-level CRUD operations (plans, steps, dependencies, hooks, locks, project prompt)
+  storage.rs           — High-level CRUD (plans, steps, step_dependencies + cycle check, short_id mint, interruptions CRUD, corrective-step request bridge, hooks, locks, project prompt)
   harness.rs           — Harness resolution, subprocess spawning, output parsing
-  prompt.rs            — Prompt construction (four-layer `Prompts`, retry context, plan context, hooks); DEFAULT_CONTEXT_PREPEND global-prompt seed
-  executor.rs          — Single-step execution (spawn harness → test → commit; retry honors RetryStrategy; skip parks WIP)
-  runner.rs            — Plan-level orchestrator (step iteration, status transitions, --all)
+  prompt.rs            — Step prompt construction (four-layer `Prompts`, bounded "Resolved interruptions" section, retry context, plan context, hooks); DEFAULT_CONTEXT_PREPEND global-prompt seed
+  review.rs            — Built-in nondeterministic review pipeline: separate O(1) read-only reviewer prompt, spawnable detached review subprocess, orchestrator-only `finalize_review`, corrective-step request drain + re-parent, recursion-cap escalation
+  executor.rs          — Single-step execution (spawn harness → test → commit-on-pass; failed attempts preserve the dirty tree and feed `previous_test_output` into the retry; pre-commit-hook failure is treated as a test failure for retry purposes; retry-budget exhaustion on test-fail or commit-hook-fail raises an auto-`Blocker` interruption instead of going terminal; skip parks WIP)
+  runner.rs            — Plan-level orchestrator: the topological **scheduler** (runnable-set + `(depth, sort_key, short_id)` tie-break), impl semaphore=1, detached-review JoinSet drained at scheduler ticks, sole DB writer, status transitions, --all
   run_lock.rs          — Per-project run lock to prevent concurrent runs
   signal.rs            — Two-stage Ctrl+C handling (graceful then forceful)
   test_runner.rs       — Deterministic test execution (shell commands)
@@ -46,18 +86,21 @@ src/
   output.rs            — Output formatting (JSON, plain, color detection, NDJSON events)
   commands/
     mod.rs             — Re-exports, shared helpers (resolve_project/step, init, doctor, confirm)
-    plan.rs            — Plan CRUD, dependency, plan-level hook, plan harness set/show, retry-strategy commands
-    step.rs            — Step CRUD, move, edit (agent/harness/criteria/max-retries/retry-strategy), step-level hooks
-    run.rs             — Status, log (incl. WIP-skip commits), skip (`--changes`) commands
+    plan.rs            — Plan CRUD, dependency, plan-level hook, plan harness set/show, review-toggle commands
+    step.rs            — Step CRUD, move, edit (agent/harness/criteria/max-retries/review), step-level hooks
+    run.rs             — Status, log (incl. WIP-skip + per-iteration commits w/ git-note verdict), skip (`--changes`) commands; TUI dispatchers (`run_inbox_tui`, …)
     prompt.rs          — `ralph prompt set/clear/show` (global/project scope; `.ralph/prompt.md`-aware)
-    question.rs        — `ralph question ask/list/answer` (per-plan pause-for-clarification)
+    question.rs        — `ralph question ask --priority` / `ralph block` (harness raises an interruption)
+    interruption.rs    — `ralph interruption list/show/resolve` (human-side resolve of questions + blockers)
+    config_cmd.rs      — `ralph config show/set-timezone`, `ralph config review set` (global review block)
     agents.rs          — Agent file CRUD commands
     hooks.rs           — Hook library CRUD, export/import commands
     harness.rs         — Read-only harness inspection (`ralph harness list/show`)
   tui/
     mod.rs             — TUI module entry
-    view.rs            — `View` enum (PlanList, ArchivedList, PlanDetail, StepDetail)
-    chrome.rs          — Persistent top breadcrumb + bottom hint/cwd/version bar
+    view.rs            — `View` enum (PlanList, ArchivedList, PlanDetail, StepDetail, **Inbox**)
+    outline.rs         — Pure DAG-outline projection (topological depth indent, join `deps:` by short_id, `↳ corrects` marker); shares the runner's `step_schedule_cmp` so outline order == execution order; `z`/`Z` focus (downstream-dependents cone) is a pure view transform
+    chrome.rs          — Persistent top breadcrumb (incl. focus path) + bottom hint/cwd/version bar
     theme.rs           — Color tokens (truecolor `Color::Rgb` constants)
     toast.rs           — Transient bottom-row message bar with TTL
     dialog.rs          — Confirm-dialog primitive (yes/no over a background view)
@@ -74,14 +117,17 @@ src/
     views/
       plan_list.rs     — Landing screen: tile per plan, sort by recency
       archived_list.rs — Same layout as plan_list but for archived plans
-      plan_detail.rs   — Plan-detail view state
+      plan_detail.rs   — Plan-detail view state (drives the DAG outline; `z`/`Z` focus, `I` to inbox)
       plan_detail_input.rs — Pure key handler returning `InputAction`s
-      plan_detail_ui.rs — Plan-detail rendering (step list + right pane)
+      plan_detail_ui.rs — Plan-detail rendering (right pane + the DAG outline via `outline_view.rs`)
+      outline_view.rs  — DAG outline render that **replaces the flat step list** in plan_detail (depth indent, `deps:`, `↳ corrects <short_id>`, derived `Blocked` overlay, review badges); pure state machine + render split; mouse path resolves through `outline.visible_rows()`
+      inbox.rs         — `View::Inbox` cross-branch interruptions inbox state (open questions + blockers; run-through auto-advance; resolved items kept dimmed)
+      inbox_ui.rs      — Inbox rendering
       step_detail.rs   — Step-detail pane stack (four layers: Global/Project/Plan/Step prompts, etc.)
       step_detail_picker.rs — Bottom-row pickers (harness/model/agent/change_policy)
       rendered_prompt.rs — Read-only fully-assembled-prompt preview (`l`/`→` from StepPrompt pane; per-attempt nav)
       create_plan.rs   — Inline create-plan modal (slug → description → tests)
-      answer_modal.rs  — `❓` answer modal + post-answer resume modal
+      answer_modal.rs  — `InterruptionModal` (ranked proposed answers with the agent's #1 pre-selected + freeform escape hatch + optional comment; blocker variant = resolve / resolve-with-comment, no options; deliberately no "let the agent decide" shortcut) — used by **both** the Inbox and step-detail's inline open-question answer flow (built from a `storage::OpenQuestion` via `InterruptionModal::from_open_question`) — plus the post-answer `ResumeModal` (the separate "resume the run?" prompt). The legacy `AnswerModal` has been removed; both surfaces now render one shared `InterruptionModal` via `inbox_ui::render_interruption_modal`
       plan_dependencies.rs — Plan-dependency sub-view (List + Picker modes)
       plan_hooks.rs    — Plan-hook attachment sub-view
       step_hooks.rs    — Step-hook attachment sub-view
@@ -91,12 +137,46 @@ src/
 ## TUI architecture
 
 The TUI is **multi-view** (plan list / archived list / plan detail /
-step detail) with sub-views pushed on top for plan dependencies, plan
-hooks, step hooks, step tags, and the rendered-prompt preview. Each view
-is a self-contained `App` struct with pure state-machine methods, plus a
-separate render function and a per-view input handler — splitting these
-three lets us unit-test state transitions without spinning up a real
-terminal.
+step detail / **inbox**) with sub-views pushed on top for plan
+dependencies, plan hooks, step hooks, step tags, and the rendered-prompt
+preview. Each view is a self-contained `App` struct with pure
+state-machine methods, plus a separate render function and a per-view
+input handler — splitting these three lets us unit-test state
+transitions without spinning up a real terminal.
+
+**DAG outline (replaces the flat step list, §12.1).** Plan-detail no
+longer renders a flat `self.steps` list; it renders the **DAG outline**
+(`src/tui/outline.rs` projection + `views/outline_view.rs` render):
+topologically ordered, indented by depth, each join step listing its
+dependencies inline (`deps: …`) by short_id, reviewer-inserted steps
+marked `↳ corrects <short_id>`. The outline shares the runner's
+`step_schedule_cmp`, so the drawn order is exactly the execution order.
+`Blocked` is a **derived overlay** (an open interruption), rendered like
+the derived `Interrupted` plan status — never persisted. Both the
+keyboard and the mouse path resolve through `outline.visible_rows()`
+(click selects / second-click enters / scroll moves the outline cursor)
+so they share one index space on a non-linear or focused DAG.
+
+**Focus / re-root (§12.2).** `z` on a step re-roots the outline at that
+step's **downstream dependents cone** (only it and what flows out of it;
+upstream context lives in the breadcrumb chrome); `Z`/`Esc` pops back
+toward the true root(s). Focus nests and is a **pure view transform** —
+no DB writes, no scheduler effect; scheduling still spans the whole DAG.
+
+**Interruptions inbox (`View::Inbox`, §12.3).** A cross-branch list of
+every open question/blocker, decoupled from DAG navigation, reachable
+from anywhere via **`I`** (Shift-i; lowercase `i` is a pre-existing
+"insert/create" binding so the inbox deliberately uses `I`) with an
+open-count badge. Submitting an answer auto-advances to the next open
+interruption (run-through; `Esc` exits); resolved items stay dimmed for
+context. The ranked-answer UI is the `InterruptionModal` in
+`answer_modal.rs`; the legacy `AnswerModal` has been removed and
+step-detail's inline open-question answer flow now drives the same
+`InterruptionModal` (built from a `storage::OpenQuestion` via
+`InterruptionModal::from_open_question`, rendered through the shared
+`inbox_ui::render_interruption_modal`). The post-answer `ResumeModal`
+(the "resume the run?" prompt) is unaffected. Palette adds `/inbox` and
+`/focus`.
 
 The step-detail screen exposes the **four user-facing prompt layers** as
 panes (`GlobalPrompt` / `ProjectPrompt` / `PlanPrompt` / `StepPrompt`) —
@@ -116,9 +196,9 @@ text selection).
 
 The dispatchers live in `src/commands/run.rs` (`run_plan_list_tui`,
 `run_archived_list_tui`, `run_plan_detail_tui`, `run_step_detail_tui`,
-`run_plan_dependencies_tui`, `run_rendered_prompt_tui`). They own the
-alternate-screen / raw-mode session, the crossterm event loop, and any
-DB/storage write-throughs.
+`run_plan_dependencies_tui`, `run_rendered_prompt_tui`, `run_inbox_tui`).
+They own the alternate-screen / raw-mode session, the crossterm event
+loop, and any DB/storage write-throughs.
 Sub-view state machines expose a pure `handle_key(KeyEvent) -> Outcome`
 method; the dispatcher executes the side effect and loops on `Pending`.
 
@@ -144,16 +224,185 @@ view bindings don't fire under the overlay.
 - **Deterministic-only:** No built-in LLM; plans created manually or via harness delegation
 - **Multi-harness:** Pluggable harness support with different integration patterns (native agent file, env var, prompt injection)
 - **Git-integrated:** All steps are git commits; branches per plan
-- **Retry strategy:** `RetryStrategy {Keep, Rollback}`, precedence step > plan > default `Keep`. `Keep` (the default) carries the dirty tree forward between failed attempts (the prior diff is on disk; the retry context omits it); `Rollback` reverts the tree before each retry and feeds the rolled-back diff into the next prompt
+- **Retry strategy:** the old `RetryStrategy {Keep, Rollback}` enum has been **removed** (migration V37 drops `plans.retry_strategy` / `steps.retry_strategy`). Failed attempts always preserve the dirty tree and there is at most one commit per step (commit-on-test-pass), so there was nothing to keep/rollback across attempts. The enum, the per-plan/per-step columns, the `--retry-strategy` / `--clear-retry-strategy` CLI flags, and the export/import fields are all gone
 - **SQLite storage** at platform-appropriate data dir (`~/.local/share/ralph-rs/ralph.db` on Linux)
 - **JSON config** at `~/.config/ralph-rs/config.json` (XDG semantics on all platforms)
 - **Signal-aware:** Two-stage Ctrl+C (graceful then forceful) via tokio watch channels
 - **Fractional indexing:** O(1) step insertion without full reindex
 - **Run locks:** SQLite-based per-project lock prevents concurrent `ralph run` invocations; `--force` to recover stale locks
 - **Hook system:** Reusable hooks in `~/.config/ralph-rs/hooks/*.md` with scope, export/import, and lifecycle attachment
-- **NDJSON output:** `--json` flag streams structured events during runs; `--quiet` suppresses progress; `--no-color` and `NO_COLOR` respected. Includes an `attempt_cancelled` event (TUI skip-dialog Esc/cancel)
+- **NDJSON output:** `--json` flag streams structured events during runs; `--quiet` suppresses progress; `--no-color` and `NO_COLOR` respected. The DAG redesign adds `review_started`, `review_finished`, `corrective_step_requested`, `corrective_step_inserted`, `review_loop_escalated`, `paused_by_user`, and `summary` (alongside the existing `attempt_cancelled`); see `docs/ndjson-events.md`. **Phase E adds `interruption_raised` and `interruption_resolved`** — both events fire on every insert / every resolve regardless of who triggered it (harness, executor, TUI, CLI), reversing the pre-Phase-E "no NDJSON for interruptions" stance. `auto_raised: bool` on `interruption_raised` discriminates the executor's retry-exhausted auto-blocker (true) from every other path (false); the derived `Blocked` overlay and the `run_locks` cross-process bridge remain the durable source of truth for full interruption state (events are advisory notifications, not payloads)
 - **Skip overhaul:** `ralph skip --changes <stash|commit|discard>` (default `stash`) and a TUI Choice<T> skip dialog (Stash/Commit/Discard; Esc-cancel restarts the attempt consuming no retry budget) decide what happens to the killed harness's in-flight work. `commit` writes a `[ralph wip]` commit carrying a `Ralph-Skipped-Step: <id>` git trailer; `ralph log` surfaces those commits and `ralph step reset` reverts them (confirm / `--force`). A cross-process **skip bridge** (`plans.skip_requested_step_id` / `plans.skip_changes`, migration V23) lets the TUI/CLI skip a step running inside a separate spawned-runner process
 - **Shell completions:** `ralph completions <shell>` generates bash/zsh/fish/elvish/powershell
+
+### DAG redesign — shipped shape (deliberate deviations from `docs/dag-redesign.md`)
+
+- **Plan = dependency DAG of steps.** Every step has a stable plan-unique
+  8-char `short_id` (the user-facing handle; the internal UUID is
+  unchanged) and `step_dependencies` edges (a structural clone of
+  `plan_dependencies`, with `would_create_step_cycle`). Roots = steps with
+  no deps. The V25 backfill turns every existing linear plan into a
+  degenerate chain DAG that executes identically. Import mirrors the same
+  backfill for legacy bundles (classification is by `short_id` presence).
+- **Topological scheduler + deterministic tie-break.** A single dynamic
+  scheduler (in `runner.rs`) replaces the linear iterator. It computes the
+  runnable set (every dep `Complete` and its review returned; not
+  `Blocked`; not terminal) and picks by `(topological depth, sort_key,
+  short_id)` (`step_schedule_cmp`). With no edges every depth is 0 and
+  this is byte-identical to the old "earliest actionable by sort_key" —
+  linear plans don't regress.
+- **Unified interruptions + `run_locks` cross-process bridge.** Questions
+  and blockers are one entity/table/state-machine (`interruptions`, V26,
+  supersedes `step_questions`). A harness raises one via `ralph question
+  ask --priority` / `ralph block`; it **binds to the live run via the
+  `run_locks` table** (`get_live_run` reads `run_locks.step_id`) — there
+  is **no `RALPH_STEP_ID` env var** for this (the `RALPH_STEP_ID` env var
+  exists only for lifecycle hooks, unrelated). An open interruption
+  consumes **no retry budget**; the scheduler moves to another branch.
+  `PlanStatus::Question` became the broader **derived** `Interrupted`;
+  `StepStatus::Blocked` is a **derived overlay** (never persisted, clears
+  on resolution).
+- **Built-in review pipeline.** Off by default; effective =
+  `step.review_enabled ?? plan.review_enabled ?? config.review.enabled ??
+  false` (V27 nullable columns; precedence step > plan > global). The
+  reviewer prompt is **separately assembled** (not
+  `build_step_prompt`), O(1): plan/step context + a **single** `git show
+  <sha>` diff (Decision 5 — no dependency diffs). Concurrency model:
+  reviews run as a **detached task** (a tokio `JoinSet`); the
+  orchestrator's single scheduler loop is the **sole DB writer** and
+  drains finished reviews at scheduler ticks; an **implementation
+  semaphore of 1** serializes implement+test+commit; the reviewer runs
+  **read-only in a throwaway, isolated `git worktree`** pinned at the
+  reviewed SHA (RAII `git::ReviewWorktree`, `Drop` cleanup) so it
+  physically cannot touch the live tree (ancestry guard kept as
+  defense-in-depth).
+- **No `StepStatus::AwaitingReview` variant.** A review-gated step stays
+  `InProgress` — gating is **structural** (the re-parented edge to the
+  corrective step / deps-not-satisfied), per §3.3/§10, not status-based.
+  A separate per-step `review_status` (`Pending | InFlight | Passed |
+  Failed | Skipped | Disabled`) tracks the verdict.
+- **Test-then-commit + at-most-one commit per step (deviates from the
+  design draft's "commit per iteration, before the test").** A commit
+  happens **only on the first attempt whose deterministic tests pass**;
+  failed attempts leave the dirty tree on disk and feed
+  `previous_test_output` (and pre-commit hook stderr, treated as a test
+  failure) into the next prompt — no commit, no rollback. Subject `ralph
+  <short_id>.<n> - <title>` + trailers `Ralph-Plan` / `Ralph-Step` /
+  `Ralph-Iteration: <n>` (n is the attempt number that finally passed —
+  with at most one commit per step, this identifies which attempt
+  succeeded rather than counting commits) / `Ralph-Review: pending`. The
+  review verdict is still recorded as a **git note on
+  `refs/notes/ralph-review`**, **not** by amending the commit
+  (`git::annotate_review_verdict`) — history/tree-safe under concurrency.
+  `ralph log` and `ralph step reset` continue to work via the trailers
+  (reset reverts the single commit). Tooling that read `Ralph-Iteration`
+  as an attempt identifier is still correct; tooling that expected
+  multiple iteration commits per step needs updating.
+- **Retry-exhaustion auto-blocker (deviates from the design draft's
+  terminal-Failed transition on `TestFailed`/`CommitFailed`).** When a
+  step exhausts its retry budget on test-fail or commit-hook-fail
+  (commit-hook stderr is treated as a test failure), the executor
+  **automatically raises a `kind=Blocker` interruption** instead of going
+  terminal. The blocker carries two ranked options — priority 1 = `"Retry
+  step with parked changes"`, priority 2 = `"Mark step Failed"` — and a body
+  of `"Step failed after N attempts."` plus the last attempt's test
+  output (and hook stderr when applicable). The step's stored status
+  stays `Pending` with `attempts == max_attempts`; the derived `Blocked`
+  overlay shadows it while the blocker is open. The scheduler moves to
+  another runnable branch (consumes no further retry budget). Resolution
+  (TUI inbox or `ralph interruption resolve`):
+  `RETRY_EXHAUSTED_OPTION_RETRY` → reset `attempts = 0` and status
+  `Pending` **while preserving the parked dirty WIP tree** (the failed
+  attempts' on-disk changes are kept, restored from the parked stash on
+  the next pick — this is *retry-with-parked-changes*, not a fresh start),
+  scheduler re-picks; `RETRY_EXHAUSTED_OPTION_FAIL` → status `Failed`
+  terminal (any surviving parked worktree state is discarded); a freeform
+  answer matching neither is treated as retry-with-hint (attempts reset,
+  parked changes preserved; the hint flows into the next prompt via the
+  bounded "Resolved interruptions" section). Other failure modes —
+  `HarnessFailed`, `Timeout`, `NoChanges` — remain terminal `Failed`.
+  Recognition contract lives in
+  `commands::interruption::apply_retry_exhausted_resolution`; the option
+  constants `RETRY_EXHAUSTED_OPTION_RETRY` /
+  `RETRY_EXHAUSTED_OPTION_FAIL` are `pub const` in `src/executor.rs` so
+  the executor (writer), Phase C resolution handler, and TUI all share
+  one source of truth. `TerminationReason::PausedForQuestion` and
+  `StepOutcome::PausedForQuestion` are reused (no new variants); the
+  insert + status-park happen in a single `unchecked_transaction` so the
+  scheduler can't observe `Pending without open interruption` mid-write.
+- **Corrective re-parenting + recursion cap (§10).** A failed review
+  *requests* (never performs) a corrective step via an NDJSON event +
+  the V29 `corrective_step_requests` bridge row. The orchestrator (sole
+  writer) drains it: inserts `A′` (`corrects_step_id = A`, `A′ depends_on
+  A`), **re-parents** every former dependent of `A` onto `A′`, then `A`
+  → `Complete` with `review_status = Failed`. The
+  review→correction→review chain is bounded by a per-plan
+  `max_review_corrections` (V30, default `DEFAULT_MAX_REVIEW_CORRECTIONS`
+  = 3); exceeding it raises a `kind=blocker` interruption ("review loop —
+  needs human") instead of spawning forever.
+- **§9 concurrency invariants** (hard): (1) one implementation slot
+  (semaphore=1); (2) reviews strictly read-only w.r.t. the working tree
+  (isolated worktree at a fixed SHA); (3) single DAG writer (only the
+  orchestrator mutates the DAG; reviewers only *request*); (4)
+  cross-process interruption bridge via `run_locks` (reviews never take
+  the run-lock).
+- **§14.1 resolved (flipped post-test-then-commit):** with at most one
+  commit per step, there are no per-iteration commits to keep or squash
+  — the **`execution_logs` rows are the audit trail** (each row carries
+  the attempt's prompt / harness stdout+stderr / test output / diff for
+  every attempt including failed ones), and the single committed SHA
+  represents only the attempt that passed. The `--squash-on-complete`
+  flag and the per-plan `squash_on_complete` column have been **removed**
+  (migration V37 drops the column; there was nothing to squash post
+  test-then-commit). **§14.4:** scheduler reproducibility is
+  timing-independent given identical human inputs; the wall-clock
+  interleave of concurrent reviews is **not** part of the guarantee.
+- **Export/import** carry the DAG: `ExportedStep` gains `short_id`
+  (always emitted) and `depends_on: Vec<short_id>`; plan+step
+  `review_enabled` and `max_review_corrections` round-trip via the
+  `skip_serializing_if` / `default` pattern.
+  Runtime state (interruptions, `review_status`, attempts, iteration
+  commits, `corrects_step_id` provenance) is not exported. Import
+  validates the imported edge set (no dangling edges, unique short_ids,
+  acyclic, ≥1 root) before any write; `--strict` rejects a review-on
+  bundle when the target machine has no review harness.
+- **Explicit step placement (post-redesign follow-up).** `ralph step add`
+  no longer has a positional `--after <N>` (list position, no edge — the
+  ambiguity that silently produced edge-less DAGs). On a **non-empty** plan
+  exactly one placement is required: `--after <S>` (new step depends on S),
+  `--before <S>` (new step takes over S's incoming edges; S then depends
+  only on it; root-S ⇒ new step is the new root), `--depends-on <S>...`
+  (the multi-parent join primitive), or `--root` (explicit independent
+  root). `--after`+`--before` together splices between them. The first step
+  of an empty plan is the implied root. `--import-json` now **carries the
+  DAG** (per-object batch-local `id` + `depends_on`, validated
+  unique/acyclic/no-dangling, whole batch atomic) instead of being
+  edge-free; it also wires `review_enabled` (previously
+  silently dropped). The hand-authored `id` is a **batch-local wiring
+  label only** (never persisted); the persisted `short_id` is minted
+  (auto, the common path) or — if explicitly supplied — validated
+  `is_short_id_shaped` (a readable/numeric `short_id` was the bug: created
+  but unselectable / shadowing a step position). The same
+  `is_short_id_shaped` guard is enforced in `validate_dag_aware_steps` for
+  full `ralph import` bundles (real exports always pass; it's a
+  tamper/hand-edit guard). Engine
+  stays a general DAG (joins via `--depends-on`); `--after`/`--before` are
+  tree-shaped authoring sugar. `ralph step list` now shows each step's
+  `short_id` + `deps:`, and `ralph plan harness generate` emits a non-fatal
+  warning when it produced an edge-less multi-step plan.
+- **Plan-local step dependencies (post-redesign follow-up, V31).** A
+  `step_dependencies` edge is only meaningful inside one plan — the
+  scheduler, import/export, outline, and corrective re-parenting all
+  operate on a single plan's step set. V25's two independent foreign keys
+  blocked dangling step IDs but not a cross-plan edge. V31 enforces the
+  invariant at the DB boundary: it drops any pre-existing cross-plan rows,
+  then installs `BEFORE INSERT` / `BEFORE UPDATE` triggers
+  (`step_dependencies_same_plan_{insert,update}`) that `RAISE(ABORT, …)`
+  on a plan mismatch. `storage::add_step_dependency` additionally
+  re-checks in-process to surface precise errors (`Step not found` vs.
+  cross-plan) on the common path — deliberate defense-in-depth that must
+  stay in sync with the triggers.
+- **Schema/version:** migrations run through **V37** (V32 drops the old `UNIQUE(step_id, attempt)` execution-log constraint, V33 adds per-step cycle indices for retry-cycle audit grouping (the parked-changes retry resets `attempts` to start a new cycle), V34 adds durable `step_parked_worktrees` stash state, V35 adds the `human_approved` one-more-cycle grant for review-loop escalation, V36 drops the per-plan `questions_enabled` opt-out (interruptions are always enabled), and **V37 drops the vestigial `plans.retry_strategy` / `steps.retry_strategy` / `plans.squash_on_complete` columns**); `Cargo.toml` is **0.1.20**.
 
 ## Prompt model
 
@@ -179,13 +428,30 @@ Four layers, assembled outermost → innermost by `prompt::build_step_prompt`
 There is no suffix concept; layers stack as prefix sections only.
 `--scope universal` is a clap alias for `--scope global`. `ralph doctor`
 emits a non-fatal warning when the global prompt lacks the ralph-CLI
-hints, pointing the user at `ralph init --restore-prompts`.
+hints, pointing the user at `ralph init --restore-prompts`; it also warns
+non-fatally when `review_enabled` is set but no/invalid review harness is
+configured.
+
+**DAG-redesign prompt deltas:**
+
+- The old unbounded **"Previously answered questions"** section became
+  **"Resolved interruptions"** and is now **bounded** (closes the §4
+  context-growth leak): the last *N* resolved interruptions for the step,
+  each body/resolution/comment run through `truncate_text`. The chosen
+  answer/resolution **and** the human comment both flow into this bounded
+  injection.
+- The **reviewer prompt** is a *separate*, independently-assembled prompt
+  (not `build_step_prompt`, `review::build_review_prompt`): plan/step
+  context + the **single** `git show <sha>` diff — **O(1) in plan size**.
+  No dependency diffs are ever injected (**Decision 5** preserved — the
+  DAG is a scheduling/eligibility construct, not a prompt-context-growth
+  construct).
 
 ## CLI Surface
 
 ```
 ralph init [--non-interactive] [--default-harness <name>] [--force] [--restore-prompts]
-ralph plan create <slug> [-d <desc>] [--test <cmd>]... [--harness <h>] [--agent <name>] [--branch <name>] [--depends-on <slug>]... [--retry-strategy <keep|rollback>]
+ralph plan create <slug> [-d <desc>] [--test <cmd>]... [--harness <h>] [--agent <name>] [--branch <name>] [--depends-on <slug>]... [--max-review-corrections <n>]
 ralph plan list [--all] [--status <status>] [--archived]
 ralph plan show <slug>
 ralph plan approve <slug>
@@ -198,23 +464,35 @@ ralph plan hooks <slug>
 ralph plan dependency add <slug> --depends-on <slug>...
 ralph plan dependency remove <slug> --depends-on <slug>...
 ralph plan dependency list <slug>
-ralph plan questions <on|off> [<slug>]
+ralph plan review <on|off> <slug>            # per-plan review toggle (precedence step > plan > config > false)
 ralph plan harness set <harness> [<slug>]
 ralph plan harness show [<slug>]
 ralph plan harness generate [<description>] [<slug>] [--use-harness <h>]
 
+# Every <num> step selector ALSO accepts an 8-char short_id (DAG handle).
 ralph step list [<slug>]
-ralph step add <title> [<slug>] [-d <desc>] [--after <num>] [--agent <name>] [--harness <h>] [--criteria <c>]... [--max-retries <n>] [--retry-strategy <keep|rollback>] [--import-json <FILE|->]
-ralph step remove <num>|--step-id <uuid> [<slug>] [--force/-y]
-ralph step edit <num>|--step-id <uuid> [<slug>] [--title <t>] [--description <d>] [--agent <name>] [--harness <h>] [--criteria <c>]... [--clear-criteria] [--max-retries <n>] [--clear-max-retries] [--retry-strategy <keep|rollback>] [--clear-retry-strategy]
-ralph step reset <num>|--step-id <uuid> [<slug>] [--force/-y]
-ralph step move <num>|--step-id <uuid> --to <n> [<slug>]
-ralph step set-hook <num>|--step-id <uuid> [<slug>] --lifecycle <lifecycle> --hook <name>
-ralph step unset-hook <num>|--step-id <uuid> [<slug>] --lifecycle <lifecycle> --hook <name>
+ralph step add <title> [<slug>] [-d <desc>] [--after <short_id|num>] [--before <short_id|num>] [--root] [--depends-on <short_id|num>]... [--agent <name>] [--harness <h>] [--criteria <c>]... [--max-retries <n>] [--import-json <FILE|->]   # non-empty plan requires exactly one placement: --after | --before | --depends-on | --root (empty plan: implied root)
+ralph step remove <num|short_id>|--step-id <uuid> [<slug>] [--force/-y]
+ralph step edit <num|short_id>|--step-id <uuid> [<slug>] [--title <t>] [--description <d>] [--agent <name>] [--harness <h>] [--criteria <c>]... [--clear-criteria] [--max-retries <n>] [--clear-max-retries] [--review <on|off|inherit>]
+ralph step reset <num|short_id>|--step-id <uuid> [<slug>] [--force/-y]
+ralph step move <num|short_id>|--step-id <uuid> --to <n> [<slug>]
+ralph step set-hook <num|short_id>|--step-id <uuid> [<slug>] --lifecycle <lifecycle> --hook <name>
+ralph step unset-hook <num|short_id>|--step-id <uuid> [<slug>] --lifecycle <lifecycle> --hook <name>
+ralph step dependency add <num|short_id> --depends-on <short_id|num>...
+ralph step dependency remove <num|short_id> --depends-on <short_id|num>...
+ralph step dependency list <num|short_id>
 
 ralph run [<slug>] [--one/--single] [--all] [--from <n>] [--to <m>] [--dry-run] [--skip-preflight] [--current-branch] [--auto-stash] [--harness <h>] [--force]
 ralph resume [<slug>]
 ralph skip [<slug>] [--step <n>] [--reason <reason>] [--changes <stash|commit|discard>] [--force]
+
+# Harness raises an interruption mid-step (binds to the live run via the
+# run_locks table; consumes NO retry budget); human resolves it CLI-side.
+ralph question ask [<text>] [--suggest/-s <answer>]... [--priority <n>]...
+ralph block [<text>]
+ralph interruption list [<slug>]
+ralph interruption show <id|index>
+ralph interruption resolve <id|index> [--option <k>] [--answer <text>] [--comment <text>]
 
 ralph export <slug> [-o <file>]
 ralph import <file> [--slug <name>] [--branch <name>] [--strict]
@@ -226,10 +504,9 @@ ralph prompt show [--scope <global|project|universal>] [--resolved]
 ralph prompt set --scope <global|project|universal> <content>
 ralph prompt clear --scope <global|project|universal>
 
-ralph question ask [<text>] [--suggest/-s <answer>]...
-ralph question list [<slug>]
-ralph question answer <num> [<text>]
-ralph question show <num>
+ralph config show
+ralph config set-timezone <tz>
+ralph config review set [--harness <h>] [--model <m>] [--enabled <bool>]
 
 ralph agents list|show|create|delete
 ralph hooks list|show|add|remove|export|import

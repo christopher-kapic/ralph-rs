@@ -113,7 +113,7 @@ pub enum Pane {
     /// Plan-layer prompt — this IS `plan.description`.
     PlanPrompt,
     StepPrompt,
-    /// Open (unanswered) `step_questions` rows for the focused step
+    /// Open question `interruptions` rows for the focused step
     /// (TUI-plan.md §17). Sits between [`Pane::StepPrompt`] and
     /// [`Pane::Appended`] so the user sees the harness's pending blockers in
     /// the same vertical region that holds the harness's own prompt.
@@ -540,7 +540,7 @@ pub struct StepDetailApp {
     /// updates this each poll tick via [`Self::set_read_only`].
     pub read_only: ReadOnly,
 
-    /// Open (unanswered) `step_questions` rows for the *focused* step,
+    /// Open question `interruptions` rows for the *focused* step,
     /// ordered oldest first. Drives the [`Pane::OpenQuestions`] body.
     /// Refreshed by the dispatcher each poll tick.
     pub open_questions_for_step: Vec<storage::OpenQuestion>,
@@ -558,7 +558,7 @@ pub struct StepDetailApp {
     /// Active answer modal, or `None` when no question is being answered.
     /// Set by [`Self::open_answer_modal`]; cleared by either a Cancel or a
     /// successful Submit.
-    pub answer_modal: Option<crate::tui::views::answer_modal::AnswerModal>,
+    pub answer_modal: Option<crate::tui::views::answer_modal::InterruptionModal>,
 
     /// Active resume-implementation modal, or `None`. Spawned by
     /// [`Self::note_answer_persisted`] when the just-applied answer was the
@@ -594,6 +594,20 @@ pub struct StepDetailApp {
     /// True while a left-mouse drag started on the divider column is
     /// active. Cleared on `MouseEventKind::Up(Left)`.
     pub dragging_sidebar: bool,
+
+    /// Per-pane vertical scroll offsets, indexed by [`Pane::index`]. The
+    /// focused pane reads/writes its own offset via `J`/`K`, paging keys,
+    /// and the mouse wheel so long prompt bodies remain readable.
+    pane_scroll: [u16; 8],
+
+    /// Per-pane body heights from the most recent render, paired with
+    /// [`Self::pane_line_counts`] so scroll offsets clamp to the visible
+    /// content instead of drifting past the end.
+    pane_body_heights: [u16; 8],
+
+    /// Per-pane wrapped line counts from the most recent render. Used only
+    /// for scroll clamping.
+    pane_line_counts: [u16; 8],
 }
 
 impl StepDetailApp {
@@ -651,6 +665,9 @@ impl StepDetailApp {
             last_body_width: 0,
             last_sidebar_w: 0,
             dragging_sidebar: false,
+            pane_scroll: [0; 8],
+            pane_body_heights: [0; 8],
+            pane_line_counts: [0; 8],
         }
     }
 
@@ -679,6 +696,18 @@ impl StepDetailApp {
     /// the drag flag. No-op before the first frame (`last_body_width == 0`).
     pub fn handle_mouse(&mut self, event: MouseEvent) {
         use crossterm::event::{MouseButton, MouseEventKind};
+
+        match event.kind {
+            MouseEventKind::ScrollDown => {
+                self.scroll_focused_pane_down();
+                return;
+            }
+            MouseEventKind::ScrollUp => {
+                self.scroll_focused_pane_up();
+                return;
+            }
+            _ => {}
+        }
 
         if self.last_body_width == 0 {
             return;
@@ -722,6 +751,81 @@ impl StepDetailApp {
     /// the `edit_*_pane` methods or opening the question-answer modal.
     pub fn can_edit_panes(&self) -> bool {
         !self.read_only.is_locked()
+    }
+
+    fn pane_scroll(&self, pane: Pane) -> u16 {
+        self.pane_scroll[pane.index()]
+    }
+
+    fn set_pane_metrics(&mut self, pane: Pane, body_height: u16, line_count: u16) -> u16 {
+        let idx = pane.index();
+        self.pane_body_heights[idx] = body_height;
+        self.pane_line_counts[idx] = line_count.max(1);
+        let max = self.max_pane_scroll(pane);
+        if self.pane_scroll[idx] > max {
+            self.pane_scroll[idx] = max;
+        }
+        self.pane_scroll[idx]
+    }
+
+    fn max_pane_scroll(&self, pane: Pane) -> u16 {
+        let idx = pane.index();
+        self.pane_line_counts[idx].saturating_sub(self.pane_body_heights[idx].max(1))
+    }
+
+    fn pane_is_scrollable(pane: Pane) -> bool {
+        pane != Pane::BottomRow
+    }
+
+    pub fn scroll_focused_pane_down(&mut self) {
+        if !Self::pane_is_scrollable(self.focused_pane) {
+            return;
+        }
+        let idx = self.focused_pane.index();
+        let max = self.max_pane_scroll(self.focused_pane);
+        self.pane_scroll[idx] = self.pane_scroll[idx].saturating_add(1).min(max);
+    }
+
+    pub fn scroll_focused_pane_up(&mut self) {
+        if !Self::pane_is_scrollable(self.focused_pane) {
+            return;
+        }
+        let idx = self.focused_pane.index();
+        self.pane_scroll[idx] = self.pane_scroll[idx].saturating_sub(1);
+    }
+
+    pub fn page_focused_pane_down(&mut self) {
+        if !Self::pane_is_scrollable(self.focused_pane) {
+            return;
+        }
+        let idx = self.focused_pane.index();
+        let page = self.pane_body_heights[idx].max(1);
+        let max = self.max_pane_scroll(self.focused_pane);
+        self.pane_scroll[idx] = self.pane_scroll[idx].saturating_add(page).min(max);
+    }
+
+    pub fn page_focused_pane_up(&mut self) {
+        if !Self::pane_is_scrollable(self.focused_pane) {
+            return;
+        }
+        let idx = self.focused_pane.index();
+        let page = self.pane_body_heights[idx].max(1);
+        self.pane_scroll[idx] = self.pane_scroll[idx].saturating_sub(page);
+    }
+
+    pub fn scroll_focused_pane_to_top(&mut self) {
+        if !Self::pane_is_scrollable(self.focused_pane) {
+            return;
+        }
+        self.pane_scroll[self.focused_pane.index()] = 0;
+    }
+
+    pub fn scroll_focused_pane_to_bottom(&mut self) {
+        if !Self::pane_is_scrollable(self.focused_pane) {
+            return;
+        }
+        let idx = self.focused_pane.index();
+        self.pane_scroll[idx] = self.max_pane_scroll(self.focused_pane);
     }
 
     // -- Pane focus ------------------------------------------------------
@@ -873,17 +977,30 @@ impl StepDetailApp {
         let Some(q) = self.focused_open_question() else {
             return false;
         };
-        self.answer_modal = Some(crate::tui::views::answer_modal::AnswerModal::new(
-            q.id.clone(),
-            q.question.clone(),
-            q.suggestions.clone(),
-        ));
+        self.answer_modal =
+            Some(crate::tui::views::answer_modal::InterruptionModal::from_open_question(q));
         true
     }
 
     /// Close the answer modal (Cancel path). Idempotent.
     pub fn close_answer_modal(&mut self) {
         self.answer_modal = None;
+    }
+
+    /// Apply editor-captured freeform text to the active answer modal (the
+    /// dispatcher calls this after the `$EDITOR` round-trip — mirrors the
+    /// inbox's `set_modal_freeform`).
+    pub fn set_answer_modal_freeform(&mut self, text: String) {
+        if let Some(m) = self.answer_modal.as_mut() {
+            m.freeform = text;
+        }
+    }
+
+    /// Apply editor-captured comment text to the active answer modal.
+    pub fn set_answer_modal_comment(&mut self, text: String) {
+        if let Some(m) = self.answer_modal.as_mut() {
+            m.comment = text;
+        }
     }
 
     // -- Resume-implementation modal -------------------------------------
@@ -1065,15 +1182,10 @@ impl StepDetailApp {
                 storage::update_step_fields_ext(
                     conn,
                     &step.id,
-                    None,
-                    None,
-                    None,
-                    Some(Some(value)),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
+                    crate::storage::StepFieldUpdates {
+                        harness_update: Some(Some(value)),
+                        ..Default::default()
+                    },
                 )?;
                 if let Some(s) = self.steps.get_mut(self.selected_step_index) {
                     s.harness = Some(value.to_string());
@@ -1083,15 +1195,10 @@ impl StepDetailApp {
                 storage::update_step_fields_ext(
                     conn,
                     &step.id,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(Some(value)),
-                    None,
-                    None,
+                    crate::storage::StepFieldUpdates {
+                        model_update: Some(Some(value)),
+                        ..Default::default()
+                    },
                 )?;
                 if let Some(s) = self.steps.get_mut(self.selected_step_index) {
                     s.model = Some(value.to_string());
@@ -1101,15 +1208,10 @@ impl StepDetailApp {
                 storage::update_step_fields_ext(
                     conn,
                     &step.id,
-                    None,
-                    None,
-                    Some(Some(value)),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
+                    crate::storage::StepFieldUpdates {
+                        agent_update: Some(Some(value)),
+                        ..Default::default()
+                    },
                 )?;
                 if let Some(s) = self.steps.get_mut(self.selected_step_index) {
                     s.agent = Some(value.to_string());
@@ -1122,15 +1224,10 @@ impl StepDetailApp {
                 storage::update_step_fields_ext(
                     conn,
                     &step.id,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(policy),
-                    None,
+                    crate::storage::StepFieldUpdates {
+                        change_policy_update: Some(policy),
+                        ..Default::default()
+                    },
                 )?;
                 if let Some(s) = self.steps.get_mut(self.selected_step_index) {
                     s.change_policy = policy;
@@ -1378,15 +1475,12 @@ impl StepDetailApp {
         storage::update_step_fields_ext(
             conn,
             &step.id,
-            title_changed.then_some(parts.title.as_str()),
-            description_changed.then_some(parts.description.as_str()),
-            None,
-            None,
-            criteria_changed.then_some(parts.acceptance_criteria.as_slice()),
-            None,
-            None,
-            None,
-            None,
+            crate::storage::StepFieldUpdates {
+                title: title_changed.then_some(parts.title.as_str()),
+                description: description_changed.then_some(parts.description.as_str()),
+                criteria_update: criteria_changed.then_some(parts.acceptance_criteria.as_slice()),
+                ..Default::default()
+            },
         )?;
         // Refresh the in-memory step so the pane re-renders without a reload.
         if let Some(step_mut) = self.steps.get_mut(self.selected_step_index) {
@@ -1440,7 +1534,7 @@ pub fn draw(frame: &mut Frame, app: &mut StepDetailApp) {
 
     let step_segment = app.breadcrumb_step_segment();
     let crumbs: [&str; 3] = ["ralph", app.plan.slug.as_str(), step_segment.as_str()];
-    let normal_hint = "[j/k] pane  [h/←] back  [z] zen  [/:] cmd  [q] back";
+    let normal_hint = "[j/k] pane  [J/K] scroll  [h/←] back  [z] zen  [/:] cmd  [q] back";
     let palette_hint = "[tab] complete  [enter] submit  [esc] cancel";
     let hint = if app.palette_active() {
         palette_hint
@@ -1496,7 +1590,7 @@ pub fn draw(frame: &mut Frame, app: &mut StepDetailApp) {
 
     // §17 modals are last so they composite over everything else.
     if let Some(modal) = &app.answer_modal {
-        render_answer_modal(frame, frame.area(), modal);
+        super::inbox_ui::render_interruption_modal(frame, frame.area(), modal);
     } else if let Some(modal) = &app.resume_modal {
         render_resume_modal(frame, frame.area(), modal);
     }
@@ -1528,70 +1622,6 @@ pub fn draw(frame: &mut Frame, app: &mut StepDetailApp) {
             palette_bar::render(frame, palette_area, state);
         }
     }
-}
-
-/// Render the answer modal as a centered overlay. Layout mirrors the §17
-/// sketch: the question line, suggestions numbered from `[1]`, then `[c]
-/// Custom answer` and `[esc] Cancel` rows.
-fn render_answer_modal(
-    frame: &mut Frame,
-    area: Rect,
-    modal: &crate::tui::views::answer_modal::AnswerModal,
-) {
-    let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(vec![
-        Span::styled(
-            "❓ ",
-            Style::default()
-                .fg(theme::STATUS_QUESTION)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            modal.question.clone(),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-    ]));
-    lines.push(Line::from(""));
-    for (i, sug) in modal.suggestions.iter().enumerate() {
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("  [{}] ", i + 1),
-                Style::default()
-                    .fg(theme::SELECTION)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(sug.clone()),
-        ]));
-    }
-    lines.push(Line::from(vec![
-        Span::styled(
-            "  [c] ",
-            Style::default()
-                .fg(theme::CURSOR)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("Custom answer (opens $EDITOR)"),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled(
-            "  [esc] ",
-            Style::default()
-                .fg(theme::CHROME_DIM)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("Cancel"),
-    ]));
-
-    let dialog = centered_modal_rect(area, &lines, " Answer question ");
-    frame.render_widget(Clear, dialog);
-    let block = Block::default()
-        .title(" Answer question ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::STATUS_QUESTION));
-    let para = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: false });
-    frame.render_widget(para, dialog);
 }
 
 /// Render the resume-implementation prompt as a centered overlay. The text
@@ -1767,7 +1797,7 @@ fn draw_zen_gutter(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
     }
 }
 
-fn draw_pane_stack(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
+fn draw_pane_stack(frame: &mut Frame, app: &mut StepDetailApp, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -1802,7 +1832,7 @@ fn draw_pane_stack(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
 /// Draw one pane — the bordered block plus its read-only body content. The
 /// body is sourced from whichever column / config field §8 designates as the
 /// pane's source of truth.
-fn draw_pane(frame: &mut Frame, app: &StepDetailApp, pane: Pane, area: Rect) {
+fn draw_pane(frame: &mut Frame, app: &mut StepDetailApp, pane: Pane, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -1827,17 +1857,24 @@ fn draw_pane(frame: &mut Frame, app: &StepDetailApp, pane: Pane, area: Rect) {
     }
 
     match pane {
-        Pane::GlobalPrompt => render_text_pane(frame, inner, app.config_prompt.as_deref()),
+        Pane::GlobalPrompt => {
+            let text = app.config_prompt.clone();
+            render_text_pane(frame, app, pane, inner, text.as_deref())
+        }
         Pane::ProjectPrompt => {
-            render_text_pane(frame, inner, app.project_settings.prompt.as_deref())
+            let text = app.project_settings.prompt.clone();
+            render_text_pane(frame, app, pane, inner, text.as_deref())
         }
         // The Plan layer IS `plan.description`. An empty description renders
         // the `(none)` placeholder via `render_text_pane`.
-        Pane::PlanPrompt => render_text_pane(
-            frame,
-            inner,
-            Some(app.plan.description.as_str()).filter(|s| !s.is_empty()),
-        ),
+        Pane::PlanPrompt => {
+            let text = if app.plan.description.is_empty() {
+                None
+            } else {
+                Some(app.plan.description.clone())
+            };
+            render_text_pane(frame, app, pane, inner, text.as_deref())
+        }
         Pane::StepPrompt => render_step_prompt(frame, app, inner),
         Pane::OpenQuestions => render_open_questions(frame, app, inner),
         Pane::Appended => render_appended(frame, app, inner),
@@ -1846,30 +1883,90 @@ fn draw_pane(frame: &mut Frame, app: &StepDetailApp, pane: Pane, area: Rect) {
     }
 }
 
+fn wrapped_visual_line_count(chars: usize, width: u16) -> u16 {
+    if width == 0 {
+        return 0;
+    }
+    chars.max(1).div_ceil(width as usize).min(u16::MAX as usize) as u16
+}
+
+fn text_visual_line_count(text: &str, width: u16) -> u16 {
+    if width == 0 {
+        return 0;
+    }
+    text.split('\n')
+        .map(|line| wrapped_visual_line_count(line.chars().count(), width) as usize)
+        .sum::<usize>()
+        .min(u16::MAX as usize) as u16
+}
+
+fn line_visual_line_count(line: &Line, width: u16) -> u16 {
+    wrapped_visual_line_count(
+        line.spans
+            .iter()
+            .map(|span| span.content.chars().count())
+            .sum(),
+        width,
+    )
+}
+
+fn lines_visual_line_count(lines: &[Line], width: u16) -> u16 {
+    if width == 0 {
+        return 0;
+    }
+    lines
+        .iter()
+        .map(|line| line_visual_line_count(line, width) as usize)
+        .sum::<usize>()
+        .max(1)
+        .min(u16::MAX as usize) as u16
+}
+
+fn render_scrolled_paragraph<'a>(
+    frame: &mut Frame,
+    app: &mut StepDetailApp,
+    pane: Pane,
+    area: Rect,
+    paragraph: Paragraph<'a>,
+    line_count: u16,
+) {
+    let scroll = app.set_pane_metrics(pane, area.height, line_count);
+    frame.render_widget(paragraph.scroll((scroll, 0)), area);
+}
+
 /// Render the [`Pane::OpenQuestions`] body. Each unanswered question is
 /// shown as a `❓ <text>` line followed by indented `[N] suggestion`
 /// rows. The currently focused question is bolded so j/k feedback is
 /// visible even when the pane itself isn't focused.
-fn render_open_questions(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
+fn render_open_questions(frame: &mut Frame, app: &mut StepDetailApp, area: Rect) {
     if app.open_questions_for_step.is_empty() {
-        let para = Paragraph::new(Span::styled(
-            "(no open questions for this step)",
-            Style::default().fg(theme::CHROME_DIM),
-        ));
-        frame.render_widget(para, area);
+        render_scrolled_paragraph(
+            frame,
+            app,
+            Pane::OpenQuestions,
+            area,
+            Paragraph::new(Span::styled(
+                "(no open questions for this step)",
+                Style::default().fg(theme::CHROME_DIM),
+            )),
+            1,
+        );
         return;
     }
     let bold = Style::default().add_modifier(Modifier::BOLD);
     let dim = Style::default().fg(theme::CHROME_DIM);
     let mut lines: Vec<Line> = Vec::new();
+    // Open interruptions are the §12.5 blocked/interrupted concept — color
+    // them via the single mapping (one concept, one color across screens).
+    let interrupted = theme::plan_status_color(crate::plan::PlanStatus::Interrupted);
     for (i, q) in app.open_questions_for_step.iter().enumerate() {
         let focused = i == app.selected_question_index;
         let header_style = if focused {
             Style::default()
-                .fg(theme::STATUS_QUESTION)
+                .fg(interrupted)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(theme::STATUS_QUESTION)
+            Style::default().fg(interrupted)
         };
         let mut header = vec![
             Span::styled(if focused { "▶ " } else { "  " }, header_style),
@@ -1891,7 +1988,7 @@ fn render_open_questions(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
         }
         if q.suggestions.is_empty() {
             lines.push(Line::from(Span::styled(
-                "    (no suggestions — use [c] for a custom answer)",
+                "    (no suggestions — use [f] for a freeform answer)",
                 dim,
             )));
         }
@@ -1899,39 +1996,102 @@ fn render_open_questions(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
             lines.push(Line::from(""));
         }
     }
+    let line_count = lines_visual_line_count(&lines, area.width);
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
-    frame.render_widget(para, area);
+    render_scrolled_paragraph(frame, app, Pane::OpenQuestions, area, para, line_count);
 }
 
 /// Render a single text body (plan-context-prepend pane). `None` becomes the
 /// dim `(none)` placeholder; `Some("")` renders as an empty body.
-fn render_text_pane(frame: &mut Frame, area: Rect, text: Option<&str>) {
-    let para = match text {
-        None => Paragraph::new(Span::styled(
-            NONE_PLACEHOLDER,
-            Style::default().fg(theme::CHROME_DIM),
-        )),
-        Some(s) => Paragraph::new(s.to_string()),
-    }
-    .wrap(Wrap { trim: false });
-    frame.render_widget(para, area);
+fn render_text_pane(
+    frame: &mut Frame,
+    app: &mut StepDetailApp,
+    pane: Pane,
+    area: Rect,
+    text: Option<&str>,
+) {
+    let (para, line_count) = match text {
+        None => (
+            Paragraph::new(Span::styled(
+                NONE_PLACEHOLDER,
+                Style::default().fg(theme::CHROME_DIM),
+            ))
+            .wrap(Wrap { trim: false }),
+            1,
+        ),
+        Some(s) => (
+            Paragraph::new(s.to_string()).wrap(Wrap { trim: false }),
+            text_visual_line_count(s, area.width),
+        ),
+    };
+    render_scrolled_paragraph(frame, app, pane, area, para, line_count);
 }
 
 /// Render the Step prompt pane: title, description, and the bulleted
 /// acceptance criteria.
-fn render_step_prompt(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
+fn render_step_prompt(frame: &mut Frame, app: &mut StepDetailApp, area: Rect) {
     let Some(step) = app.current_step() else {
-        let para = Paragraph::new(Span::styled(
-            "(no steps)",
-            Style::default().fg(theme::CHROME_DIM),
-        ));
-        frame.render_widget(para, area);
+        render_scrolled_paragraph(
+            frame,
+            app,
+            Pane::StepPrompt,
+            area,
+            Paragraph::new(Span::styled(
+                "(no steps)",
+                Style::default().fg(theme::CHROME_DIM),
+            )),
+            1,
+        );
         return;
     };
     let mut lines: Vec<Line> = Vec::new();
     let bold = Style::default().add_modifier(Modifier::BOLD);
 
     lines.push(Line::from(Span::styled(step.title.clone(), bold)));
+
+    // docs/dag-redesign.md §12.1/§12.5: surface the step's effective status
+    // (Blocked overlay derived from an open interruption — §3.3), its
+    // `review_status` badge, and the `↳ corrects <short_id>` marker for a
+    // reviewer-inserted corrective step. All colors route through the
+    // single TUI-wide §12.5 mapping so step-detail can't drift from the
+    // outline glyph / plan-list dot.
+    {
+        let eff =
+            crate::plan::effective_step_status(step.status, app.has_open_questions_for_step());
+        let mut status_spans = vec![
+            Span::styled(
+                format!("{} ", crate::tui::widgets::outline_list::status_glyph(eff)),
+                Style::default().fg(theme::step_status_color(eff)),
+            ),
+            Span::styled(
+                format!("{} ", step.short_id),
+                Style::default().fg(theme::CHROME_DIM),
+            ),
+            Span::styled(
+                eff.as_str().to_string(),
+                Style::default().fg(theme::step_status_color(eff)),
+            ),
+        ];
+        let rs = step
+            .review_status
+            .unwrap_or(crate::plan::ReviewStatus::Pending);
+        if let Some((badge, color)) = crate::tui::widgets::outline_list::review_badge(rs) {
+            status_spans.push(Span::raw("  "));
+            status_spans.push(Span::styled(
+                badge,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ));
+        }
+        if let Some(cid) = step.corrects_step_id.as_deref()
+            && let Some(corrected) = app.steps.iter().find(|s| s.id == cid)
+        {
+            status_spans.push(Span::styled(
+                format!("  ↳ corrects {}", corrected.short_id),
+                Style::default().fg(theme::CHROME_DIM),
+            ));
+        }
+        lines.push(Line::from(status_spans));
+    }
 
     if !step.description.is_empty() {
         lines.push(Line::from(""));
@@ -1948,8 +2108,9 @@ fn render_step_prompt(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
         }
     }
 
+    let line_count = lines_visual_line_count(&lines, area.width);
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
-    frame.render_widget(para, area);
+    render_scrolled_paragraph(frame, app, Pane::StepPrompt, area, para, line_count);
 }
 
 /// Render the Appended pane body: read-only retry context for the focused
@@ -1958,25 +2119,37 @@ fn render_step_prompt(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
 /// attempt N's prompt. Attempt 1 has no previous attempt, so it renders a
 /// dim placeholder; an empty execution log renders the same shape it had
 /// before any attempts ran.
-fn render_appended(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
+fn render_appended(frame: &mut Frame, app: &mut StepDetailApp, area: Rect) {
     if app.execution_logs.is_empty() {
-        let para = Paragraph::new(Span::styled(
-            "(retry context appears here once an attempt has run)",
-            Style::default().fg(theme::CHROME_DIM),
-        ))
-        .wrap(Wrap { trim: false });
-        frame.render_widget(para, area);
+        render_scrolled_paragraph(
+            frame,
+            app,
+            Pane::Appended,
+            area,
+            Paragraph::new(Span::styled(
+                "(retry context appears here once an attempt has run)",
+                Style::default().fg(theme::CHROME_DIM),
+            ))
+            .wrap(Wrap { trim: false }),
+            1,
+        );
         return;
     }
 
     // First attempt has no preceding log to source retry context from.
     if app.appended_attempt_index == 0 {
-        let para = Paragraph::new(Span::styled(
-            "(first attempt — no appended retry context)",
-            Style::default().fg(theme::CHROME_DIM),
-        ))
-        .wrap(Wrap { trim: false });
-        frame.render_widget(para, area);
+        render_scrolled_paragraph(
+            frame,
+            app,
+            Pane::Appended,
+            area,
+            Paragraph::new(Span::styled(
+                "(first attempt — no appended retry context)",
+                Style::default().fg(theme::CHROME_DIM),
+            ))
+            .wrap(Wrap { trim: false }),
+            1,
+        );
         return;
     }
 
@@ -2009,8 +2182,9 @@ fn render_appended(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
         }
     }
 
+    let line_count = lines_visual_line_count(&lines, area.width);
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
-    frame.render_widget(para, area);
+    render_scrolled_paragraph(frame, app, Pane::Appended, area, para, line_count);
 }
 
 /// Cap `text` at `max_lines` lines, appending an `... (N lines omitted) ...`
@@ -2029,7 +2203,7 @@ fn truncate_lines(text: &str, max_lines: usize) -> String {
 
 /// Render the Tests pane: `plan.deterministic_tests` as a bulleted list, or
 /// a dim placeholder if no tests are configured.
-fn render_tests(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
+fn render_tests(frame: &mut Frame, app: &mut StepDetailApp, area: Rect) {
     let lines: Vec<Line> = if app.plan.deterministic_tests.is_empty() {
         vec![Line::from(Span::styled(
             NONE_PLACEHOLDER,
@@ -2042,8 +2216,9 @@ fn render_tests(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
             .map(|t| Line::from(format!("• {t}")))
             .collect()
     };
+    let line_count = lines_visual_line_count(&lines, area.width);
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
-    frame.render_widget(para, area);
+    render_scrolled_paragraph(frame, app, Pane::Tests, area, para, line_count);
 }
 
 /// Render the bottom row: four cells (Harness / Model / Agent / Change
@@ -2124,19 +2299,20 @@ fn status_glyph(status: StepStatus) -> &'static str {
         StepStatus::Failed => "✘",
         StepStatus::Skipped => "⊘",
         StepStatus::Aborted => "⊘",
+        // §3.3 derived overlay (open interruption — question or blocker).
+        StepStatus::Blocked => "?",
     }
 }
 
 fn status_style(status: StepStatus) -> Style {
+    // Color comes from the single TUI-wide §12.5 mapping
+    // (`theme::step_status_color`). The only per-status *non-color* styling
+    // kept here is the bold emphasis on an in-progress step (a weight
+    // decision, not a color choice).
+    let style = Style::default().fg(theme::step_status_color(status));
     match status {
-        StepStatus::Complete => Style::default().fg(theme::STATUS_COMPLETE),
-        StepStatus::InProgress => Style::default()
-            .fg(theme::STATUS_IN_PROGRESS)
-            .add_modifier(Modifier::BOLD),
-        StepStatus::Failed => Style::default().fg(theme::STATUS_FAILED),
-        StepStatus::Skipped => Style::default().fg(theme::CHROME_DIM),
-        StepStatus::Aborted => Style::default().fg(theme::STATUS_FAILED),
-        StepStatus::Pending => Style::default().fg(theme::STATUS_PENDING),
+        StepStatus::InProgress => style.add_modifier(Modifier::BOLD),
+        _ => style,
     }
 }
 
@@ -2164,13 +2340,13 @@ mod tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
-            retry_strategy: None,
+            review_enabled: None,
+            max_review_corrections: None,
         }
     }
 
@@ -2178,6 +2354,7 @@ mod tests {
         (0..n)
             .map(|i| Step {
                 id: format!("s{i}"),
+                short_id: String::new(),
                 plan_id: "p1".to_string(),
                 sort_key: format!("a{i}"),
                 title: format!("Step {}", i + 1),
@@ -2200,7 +2377,9 @@ mod tests {
                 skipped_reason: None,
                 change_policy: ChangePolicy::Required,
                 tags: vec![],
-                retry_strategy: None,
+                review_enabled: None,
+                review_status: None,
+                corrects_step_id: None,
             })
             .collect()
     }
@@ -2240,6 +2419,7 @@ mod tests {
             session_id: None,
             termination_reason: None,
             test_status: None,
+            cycle_index: 0,
         }
     }
 
@@ -2348,6 +2528,38 @@ mod tests {
         assert_eq!(app.focused_pane, Pane::OpenQuestions);
     }
 
+    #[test]
+    fn focused_pane_scroll_clamps_to_last_rendered_metrics() {
+        let mut app = make_app(3, 0);
+        app.focused_pane = Pane::StepPrompt;
+        app.set_pane_metrics(Pane::StepPrompt, 3, 7);
+
+        for _ in 0..10 {
+            app.scroll_focused_pane_down();
+        }
+        assert_eq!(app.pane_scroll(Pane::StepPrompt), 4);
+
+        app.page_focused_pane_up();
+        assert_eq!(app.pane_scroll(Pane::StepPrompt), 1);
+        app.scroll_focused_pane_to_top();
+        assert_eq!(app.pane_scroll(Pane::StepPrompt), 0);
+        app.scroll_focused_pane_to_bottom();
+        assert_eq!(app.pane_scroll(Pane::StepPrompt), 4);
+    }
+
+    #[test]
+    fn bottom_row_does_not_scroll() {
+        let mut app = make_app(3, 0);
+        app.focused_pane = Pane::BottomRow;
+        app.set_pane_metrics(Pane::BottomRow, 2, 20);
+
+        app.scroll_focused_pane_down();
+        app.page_focused_pane_down();
+        app.scroll_focused_pane_to_bottom();
+
+        assert_eq!(app.pane_scroll(Pane::BottomRow), 0);
+    }
+
     // -- Open-question pane (TUI-plan.md §17) -------------------------------
 
     fn make_question(step_id: &str, q: &str, suggestions: &[&str]) -> storage::OpenQuestion {
@@ -2361,6 +2573,7 @@ mod tests {
             attempt: 1,
             question: q.to_string(),
             suggestions: suggestions.iter().map(|s| s.to_string()).collect(),
+            kind: crate::plan::InterruptionKind::Question,
             asked_at: "2026-05-04T00:00:00Z".to_string(),
         }
     }
@@ -2453,14 +2666,23 @@ mod tests {
         assert!(!app.open_answer_modal());
         assert!(app.answer_modal.is_none());
 
-        // Pane focused → modal opens with the focused question's data.
+        // Pane focused → modal opens with the focused question's data,
+        // mapped into the §12.4 InterruptionModal (body + priority options).
         app.focused_pane = Pane::OpenQuestions;
         assert!(app.open_answer_modal());
         let modal = app.answer_modal.as_ref().expect("modal opened");
-        assert_eq!(modal.question, "Pick crate");
+        assert_eq!(modal.body, "Pick crate");
         assert_eq!(
-            modal.suggestions,
-            vec!["tracing".to_string(), "log".to_string()]
+            modal
+                .options
+                .iter()
+                .map(|o| (o.text.as_str(), o.priority))
+                .collect::<Vec<_>>(),
+            vec![("tracing", 1), ("log", 2)]
+        );
+        assert_eq!(
+            modal.focus,
+            crate::tui::views::answer_modal::InterruptionFocus::Options
         );
     }
 
@@ -2903,6 +3125,72 @@ mod tests {
         assert!(screen.contains("CRIT-A-MARK"), "{screen}");
         assert!(screen.contains("CRIT-B-MARK"), "{screen}");
         assert!(screen.contains("Acceptance:"), "{screen}");
+    }
+
+    #[test]
+    fn step_prompt_pane_surfaces_review_badge_and_corrects_marker() {
+        // docs/dag-redesign.md §12.1/§12.5: the Step pane must surface the
+        // review verdict badge and the `↳ corrects <short_id>` marker for a
+        // reviewer-inserted corrective step, colored via the §12.5 mapping.
+        let plan = make_plan();
+        let mut steps = make_steps(2);
+        steps[0].short_id = "aaaa1111".to_string();
+        steps[1].short_id = "apri0000".to_string();
+        steps[1].review_status = Some(crate::plan::ReviewStatus::Failed);
+        steps[1].corrects_step_id = Some(steps[0].id.clone());
+        let mut app = StepDetailApp::new(
+            plan,
+            steps,
+            1,
+            &Config::default(),
+            ProjectSettings::default(),
+            Vec::new(),
+        );
+        let screen = render_to_string(160, 100, &mut app);
+        assert!(
+            screen.contains("review✘"),
+            "review badge missing:\n{screen}"
+        );
+        assert!(
+            screen.contains("↳ corrects aaaa1111"),
+            "corrects marker missing:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn step_prompt_pane_shows_blocked_overlay_when_step_has_open_question() {
+        // §3.3 derived overlay: an open interruption makes the step present
+        // as Blocked in step-detail too (one concept, one color, TUI-wide).
+        let plan = make_plan();
+        let mut steps = make_steps(1);
+        steps[0].short_id = "bbbb2222".to_string();
+        steps[0].status = StepStatus::InProgress;
+        let mut app = StepDetailApp::new(
+            plan,
+            steps,
+            0,
+            &Config::default(),
+            ProjectSettings::default(),
+            Vec::new(),
+        );
+        app.set_open_questions_for_step(vec![storage::OpenQuestion {
+            id: "q1".to_string(),
+            step_id: "s0".to_string(),
+            plan_id: "p1".to_string(),
+            plan_slug: "plan".to_string(),
+            step_num: 1,
+            step_title: "t".to_string(),
+            attempt: 1,
+            question: "Q?".to_string(),
+            suggestions: vec![],
+            kind: crate::plan::InterruptionKind::Question,
+            asked_at: Utc::now().to_rfc3339(),
+        }]);
+        let screen = render_to_string(160, 100, &mut app);
+        assert!(
+            screen.contains("blocked"),
+            "blocked overlay text missing in step pane:\n{screen}"
+        );
     }
 
     #[test]
@@ -3636,9 +3924,19 @@ mod tests {
     /// match at construction time so writes can be verified by reading the
     /// row back.
     fn setup_project_app(conn: &Connection, project: &str) -> StepDetailApp {
-        let plan =
-            crate::storage::create_plan(conn, "tui-v1", project, "tui-v1", "desc", None, None, &[])
-                .unwrap();
+        let plan = crate::storage::create_plan(
+            conn,
+            crate::storage::NewPlan {
+                slug: "tui-v1",
+                project,
+                branch_name: "tui-v1",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         StepDetailApp::new(
             plan,
             Vec::new(),
@@ -4023,21 +4321,33 @@ cargo clippy
     /// so writes via `update_step_fields_ext` land on a real row that can
     /// then be reloaded.
     fn setup_step_app(conn: &Connection) -> StepDetailApp {
-        let plan =
-            crate::storage::create_plan(conn, "tui-v1", "/proj", "tui-v1", "desc", None, None, &[])
-                .unwrap();
+        let plan = crate::storage::create_plan(
+            conn,
+            crate::storage::NewPlan {
+                slug: "tui-v1",
+                project: "/proj",
+                branch_name: "tui-v1",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _pos) = crate::storage::create_step(
             conn,
             &plan.id,
-            "Original title",
-            "Original description",
-            None,
-            None,
-            &["original-crit".to_string()],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Original title",
+                description: "Original description",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &["original-crit".to_string()],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         StepDetailApp::new(
@@ -4261,21 +4571,33 @@ cargo clippy
     /// submissions can be verified by reloading the row. Mirrors
     /// `setup_step_app` but used here for picker tests.
     fn setup_picker_app(conn: &Connection) -> StepDetailApp {
-        let plan =
-            crate::storage::create_plan(conn, "tui-v1", "/proj", "tui-v1", "desc", None, None, &[])
-                .unwrap();
+        let plan = crate::storage::create_plan(
+            conn,
+            crate::storage::NewPlan {
+                slug: "tui-v1",
+                project: "/proj",
+                branch_name: "tui-v1",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _pos) = crate::storage::create_step(
             conn,
             &plan.id,
-            "Original title",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Original title",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         StepDetailApp::new(
@@ -4555,9 +4877,19 @@ cargo clippy
         // Empty plan ⇒ no step row to write to. The apply path silently
         // returns Ok rather than panicking on the missing index.
         let conn = crate::db::open_memory().unwrap();
-        let plan =
-            crate::storage::create_plan(&conn, "empty", "/proj2", "empty", "desc", None, None, &[])
-                .unwrap();
+        let plan = crate::storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "empty",
+                project: "/proj2",
+                branch_name: "empty",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let mut app = StepDetailApp::new(
             plan,
             Vec::new(),

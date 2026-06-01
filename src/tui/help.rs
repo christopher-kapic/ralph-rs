@@ -158,7 +158,6 @@ pub fn for_plan_list() -> HelpModel {
                 vec![
                     ("i / a", "Create new plan"),
                     ("A", "Approve highlighted plan"),
-                    ("Q", "Toggle questions on highlighted plan"),
                     ("d", "Archive selection or cursor target"),
                 ],
             ),
@@ -246,7 +245,6 @@ pub fn for_plan_detail() -> HelpModel {
                     ("r", "Reset highlighted step"),
                     ("Shift-J", "Move step down"),
                     ("Shift-K", "Move step up"),
-                    ("Q", "Toggle questions for this plan"),
                 ],
             ),
             Group::new(
@@ -259,10 +257,18 @@ pub fn for_plan_detail() -> HelpModel {
                 ],
             ),
             Group::new(
+                "Outline / focus",
+                vec![
+                    ("z", "Focus: re-root on cursor's step (downstream cone)"),
+                    ("Z / <esc>", "Pop focus one level toward root"),
+                ],
+            ),
+            Group::new(
                 "Sub-views",
                 vec![
                     ("D", "Plan dependencies"),
                     ("A", "Answer oldest open question"),
+                    ("I", "Open interruptions inbox"),
                 ],
             ),
             Group::new(
@@ -273,6 +279,37 @@ pub fn for_plan_detail() -> HelpModel {
                     ("Ctrl-C", "Back to plan list"),
                 ],
             ),
+        ],
+    )
+}
+
+/// Help model for the interruptions inbox view (docs/dag-redesign.md §12.3).
+pub fn for_inbox() -> HelpModel {
+    HelpModel::new(
+        "Help — Interruptions inbox",
+        vec![
+            Group::new(
+                "Navigation",
+                vec![
+                    ("j / ↓", "Next interruption"),
+                    ("k / ↑", "Previous interruption"),
+                    ("mouse wheel", "Move cursor (list mode only)"),
+                    ("enter / a", "Start run-through (answer all in one pass)"),
+                    ("q / h / ←", "Back"),
+                ],
+            ),
+            Group::new(
+                "Run-through (answer modal)",
+                vec![
+                    ("j / k", "Move within ranked options"),
+                    ("tab", "Cycle: options → freeform → comment"),
+                    ("f", "Edit freeform answer in $EDITOR"),
+                    ("m", "Edit comment in $EDITOR"),
+                    ("enter", "Resolve & advance to next open"),
+                    ("<esc>", "Exit run-through back to the list"),
+                ],
+            ),
+            Group::new("Other", vec![("?", "Toggle this help"), ("Ctrl-C", "Back")]),
         ],
     )
 }
@@ -296,6 +333,17 @@ pub fn for_step_detail() -> HelpModel {
                 vec![
                     ("c", "Open focused pane in $EDITOR"),
                     ("a", "Answer focused open question"),
+                ],
+            ),
+            Group::new(
+                "Scroll",
+                vec![
+                    ("J", "Scroll focused pane down one line"),
+                    ("K", "Scroll focused pane up one line"),
+                    ("space / PgDn", "Page focused pane down"),
+                    ("PgUp", "Page focused pane up"),
+                    ("g / Home", "Jump focused pane to top"),
+                    ("G / End", "Jump focused pane to bottom"),
                 ],
             ),
             Group::new(
@@ -470,6 +518,7 @@ pub fn for_rendered_prompt() -> HelpModel {
                 vec![
                     ("J", "Scroll down one line"),
                     ("K", "Scroll up one line"),
+                    ("mouse wheel", "Scroll the body (never switches attempts)"),
                     ("space / PgDn", "Page down"),
                     ("PgUp", "Page up"),
                     ("g / Home", "Jump to top"),
@@ -744,6 +793,54 @@ mod tests {
     }
 
     #[test]
+    fn plan_detail_documents_focus_and_inbox_bindings() {
+        // docs/dag-redesign.md §12.1/§12.2/§12.3: the outline focus (z/Z)
+        // and the inbox entry (I) must be discoverable in the help overlay.
+        let m = for_plan_detail();
+        let all: Vec<(&str, &str)> = m
+            .groups
+            .iter()
+            .flat_map(|g| g.bindings.iter().copied())
+            .collect();
+        assert!(
+            all.iter().any(|(k, _)| k.contains('z')),
+            "missing z (focus) binding: {all:?}"
+        );
+        assert!(
+            all.iter().any(|(k, _)| k.contains('Z')),
+            "missing Z (pop focus) binding: {all:?}"
+        );
+        assert!(
+            all.iter().any(|(_, a)| a.to_lowercase().contains("inbox")),
+            "missing inbox entry: {all:?}"
+        );
+    }
+
+    #[test]
+    fn inbox_help_documents_run_through_and_back() {
+        let m = for_inbox();
+        assert!(m.title.contains("inbox"));
+        let names: Vec<&str> = m.groups.iter().map(|g| g.name).collect();
+        assert!(
+            names.iter().any(|n| n.contains("Run-through")),
+            "inbox help missing run-through group: {names:?}"
+        );
+        let actions: Vec<&str> = m
+            .groups
+            .iter()
+            .flat_map(|g| g.bindings.iter().map(|(_, a)| *a))
+            .collect();
+        assert!(
+            actions.iter().any(|a| a.contains("run-through")),
+            "inbox help missing run-through action: {actions:?}"
+        );
+        assert!(
+            actions.iter().any(|a| a.contains("$EDITOR")),
+            "inbox help missing $EDITOR handoff: {actions:?}"
+        );
+    }
+
+    #[test]
     fn step_detail_documents_editor_handoff() {
         let m = for_step_detail();
         let actions: Vec<&str> = m
@@ -782,6 +879,7 @@ mod tests {
             for_plan_hooks(),
             for_step_hooks(),
             for_step_tags(),
+            for_inbox(),
         ] {
             let has_q = m
                 .groups

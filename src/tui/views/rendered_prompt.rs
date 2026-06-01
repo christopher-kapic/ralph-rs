@@ -23,14 +23,14 @@
 // when the state machine asks.
 
 use chrono::{DateTime, Utc};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
-use crate::plan::{AnsweredQuestion, ExecutionLog, Plan, RetryStrategy, Step, TerminationReason};
+use crate::plan::{ExecutionLog, Interruption, Plan, Step, TerminationReason};
 use crate::prompt::{self, Prompts, RetryContext};
 use crate::tui::help::{self, HelpState};
 use crate::tui::theme;
@@ -38,6 +38,22 @@ use crate::tui::theme;
 // ---------------------------------------------------------------------------
 // Per-attempt model
 // ---------------------------------------------------------------------------
+
+/// Grouped inputs to [`RenderedPromptApp::build_attempts`]. Bundles the
+/// `build_step_prompt` payload (plan/step/prompts/resolved-interruptions)
+/// with the per-attempt reconstruction inputs (`max_attempts`, `logs`).
+#[derive(Debug)]
+pub struct BuildAttemptsArgs<'a> {
+    pub plan: &'a Plan,
+    pub step: &'a Step,
+    pub all_steps: &'a [Step],
+    pub agent_name: Option<&'a str>,
+    pub harness_supports_agent_file: bool,
+    pub prompts: &'a Prompts,
+    pub resolved_interruptions: &'a [Interruption],
+    pub max_attempts: i32,
+    pub logs: &'a [ExecutionLog],
+}
 
 /// One attempt's fully-assembled prompt plus the metadata needed for the
 /// `Attempt N of M (started <relative-time>)` header line. `started_at` is
@@ -47,6 +63,13 @@ use crate::tui::theme;
 pub struct AttemptPrompt {
     /// 1-based attempt number (matches `execution_logs.attempt`).
     pub attempt: i32,
+    /// V33 per-step retry-from-scratch cycle pointer (mirrors
+    /// `execution_logs.cycle_index`). `0` for the common single-cycle path;
+    /// non-zero after one or more "Retry from scratch" resolutions. The
+    /// picker prepends a `[cycle N]` label when this is non-zero so the
+    /// user can disambiguate two logical attempt=1 rows from different
+    /// cycles.
+    pub cycle_index: i32,
     /// When this attempt started, from `execution_logs.started_at`. `None`
     /// for the zero-logs synthetic attempt-1 entry.
     pub started_at: Option<DateTime<Utc>>,
@@ -72,8 +95,12 @@ pub enum Outcome {
 // ---------------------------------------------------------------------------
 
 /// Reconstruct the [`RetryContext`] that the executor would have built for
-/// attempt number `attempt` (1-based), given the chronological list of this
-/// step's execution logs and the resolved attempt budget.
+/// the execution-log entry at `log_index`, given the chronological list of
+/// this step's execution logs and the resolved attempt budget.
+///
+/// The returned [`RetryContext::attempt`] is the row's logical in-budget
+/// attempt number (`execution_logs.attempt`), which may repeat across
+/// separate retry-from-scratch cycles for the same step.
 ///
 /// **Source of truth:** `src/executor.rs` (`execute_step`, ~lines 716-727 and
 /// the `prev_diff` / `prev_test_output` / `prev_files_modified` assignments at
@@ -84,7 +111,8 @@ pub enum Outcome {
 /// - `previous_test_output` = the previous attempt's test results joined with `\n`
 /// - `files_modified` = the files changed during the previous attempt
 ///
-/// Attempt 1 has no retry context (returns `None`).
+/// Logical attempt 1 within any cycle has no retry context (returns
+/// `None`).
 ///
 /// Deviation from the executor that cannot be avoided here: the executor
 /// sources `files_modified` from a *live* `git status` taken during the
@@ -96,32 +124,40 @@ pub enum Outcome {
 /// fields (`previous_diff`, `previous_test_output`, `attempt`,
 /// `max_attempts`) match the executor exactly *for the inputs given*.
 ///
-/// Fidelity caveat: this is a "what would be sent now" preview. It
-/// re-renders from *current* plan/project/step text and the *current*
-/// answered-question set, so a historical attempt's preview reflects edits
-/// made after that attempt ran — it is not the point-in-time prompt the
-/// agent actually received. The exact prompt sent for each attempt is
-/// persisted verbatim in `execution_logs.prompt_text`; this view
-/// deliberately re-assembles instead, so layer edits are visible.
-/// `strategy` is the step's resolved [`RetryStrategy`] (step > plan >
-/// default `Keep`). It scopes the reconstruction exactly as the executor
-/// does (Step 22): under `Rollback` the diff/files are included (the agent
-/// no longer sees the reverted work); under `Keep` they are omitted (the
-/// work is still on disk). `previous_failure_reason` is reconstructed from
-/// the previous attempt's `termination_reason` under both strategies.
+/// Fidelity caveat: this reconstruction is a "what would be sent now"
+/// preview — it re-renders from *current* plan/project/step text and the
+/// *current* answered-question set, so it reflects edits made after the
+/// attempt ran rather than the point-in-time prompt. It is therefore used
+/// by `build_attempts` only as a FALLBACK, when an already-run attempt has
+/// no persisted `execution_logs.prompt_text` (a row predating prompt_text
+/// capture). For attempts that did persist their prompt, `build_attempts`
+/// shows that verbatim text instead.
+///
+/// Mirrors the executor's post-test-then-commit behavior for current rows: a
+/// failed attempt leaves its work on disk, so the retry context omits the
+/// diff/files (the agent inspects the dirty tree via `git diff`) and carries
+/// only the previous failure reason + previous test output.
+///
+/// Compatibility: when replaying a legacy row whose prior attempt was
+/// persisted as `rolled_back=true`, the diff/files are reconstructed from the
+/// stored diff so old retry prompts remain audit-faithful on upgraded DBs.
 pub fn build_retry_context_for_attempt(
-    attempt: i32,
+    log_index: usize,
     max_attempts: i32,
     logs: &[ExecutionLog],
-    strategy: RetryStrategy,
 ) -> Option<RetryContext> {
-    if attempt <= 1 {
+    let current = logs.get(log_index)?;
+    let attempt = current.attempt;
+    if attempt <= 1 || log_index == 0 {
         return None;
     }
-    // The executor derives attempt N's retry context from attempt N-1's
-    // recorded outcome. Logs are ordered by `attempt` ASC, so the previous
-    // attempt is the row whose `attempt == attempt - 1`.
-    let prev = logs.iter().find(|l| l.attempt == attempt - 1)?;
+    // Chronological replay: the executor derives an attempt's retry context
+    // from the immediately previous execution-log row in time, not from a
+    // globally unique attempt number. After a human resolves the
+    // retry-exhausted blocker with "Retry from scratch", a later cycle can
+    // legitimately produce another logical attempt=1 row for the same step
+    // while the older rows remain as audit history.
+    let prev = &logs[log_index - 1];
 
     let previous_test_output = if prev.test_results.is_empty() {
         None
@@ -131,12 +167,15 @@ pub fn build_retry_context_for_attempt(
         Some(prev.test_results.join("\n"))
     };
 
-    // Strategy-scoped, mirroring src/executor.rs's RetryContext build:
-    // Rollback re-sends the (now reverted) diff/files; Keep omits them
-    // because the work is still on disk for the agent to `git diff`.
-    let (previous_diff, files_modified) = match strategy {
-        RetryStrategy::Rollback => (prev.diff.clone(), files_from_diff(prev.diff.as_deref())),
-        RetryStrategy::Keep => (None, Vec::new()),
+    // Current post-test-then-commit rows keep the failed attempt's work on
+    // disk, so the retry context omits diff/files. But a historical
+    // pre-redesign row with `rolled_back=true` means the work was reverted
+    // before the next attempt, so reconstruct the stored diff/files for an
+    // audit-faithful fallback preview.
+    let (previous_diff, files_modified) = if prev.rolled_back {
+        (prev.diff.clone(), files_from_diff(prev.diff.as_deref()))
+    } else {
+        (None, Vec::new())
     };
 
     let previous_failure_reason = prev.termination_reason.map(|r| {
@@ -163,25 +202,16 @@ pub fn build_retry_context_for_attempt(
 
 /// Best-effort reconstruction of the previous attempt's modified-file list
 /// from its stored unified diff. Parses `diff --git a/<old> b/<new>` headers
-/// and returns the `b/` (post-image) path for each, deduplicated in first-seen
-/// order. Returns an empty vec when there is no diff.
-///
-/// This is an approximation of the executor's live `git status` snapshot (see
-/// [`build_retry_context_for_attempt`] for why an exact reproduction is not
-/// possible from persisted data).
+/// and returns the `b/` path for each, deduplicated in first-seen order.
 fn files_from_diff(diff: Option<&str>) -> Vec<String> {
     let Some(diff) = diff else {
         return Vec::new();
     };
-    let mut files: Vec<String> = Vec::new();
+    let mut files = Vec::new();
     for line in diff.lines() {
         let Some(rest) = line.strip_prefix("diff --git ") else {
             continue;
         };
-        // `rest` is `a/<old> b/<new>`. The post-image path is everything
-        // after the last ` b/`. Paths with spaces are uncommon in this
-        // codebase's diffs; the executor's git-status path can't disambiguate
-        // them either, so a simple split is acceptable for a preview.
         let path = match rest.rsplit_once(" b/") {
             Some((_, b)) => b.to_string(),
             None => rest.to_string(),
@@ -220,8 +250,12 @@ pub struct RenderedPromptApp {
     /// clamp `scroll` so the user can't scroll past the end. Zero before the
     /// first frame.
     pub last_body_height: u16,
-    /// Line count of the current attempt's prompt recorded during the most
-    /// recent `render`. Paired with `last_body_height` for scroll clamping.
+    /// Visual (post-wrap) line count of the current attempt's prompt
+    /// recorded during the most recent `render`. Paired with
+    /// `last_body_height` for scroll clamping. Visual rather than logical
+    /// because `Paragraph::scroll` with `Wrap` counts wrapped rows — using
+    /// `.lines().count()` would clamp the bottom short on long prompts in
+    /// narrow viewports.
     pub last_line_count: u16,
     /// Help-overlay state. `?` toggles visibility; while visible the per-view
     /// input handler is skipped (TUI-plan.md §15).
@@ -250,67 +284,84 @@ impl RenderedPromptApp {
         }
     }
 
-    /// Assemble the full per-attempt prompt list for `step` by calling
-    /// [`prompt::build_step_prompt`] once per attempt with that attempt's
-    /// retry context. This is the single place the preview is produced — it
-    /// passes the *real* plan/step/all_steps/agent/prompt-layers, so the
-    /// output is byte-identical to what the executor would send for the same
-    /// inputs.
+    /// Assemble the full per-attempt prompt list for `step`.
+    ///
+    /// For an **already-run** attempt the persisted `execution_logs.prompt_text`
+    /// is shown VERBATIM — the exact bytes the agent received for that attempt,
+    /// the most faithful thing for audit/debug. Only when a row predates
+    /// prompt_text capture (NULL/empty) do we fall back to re-assembling via
+    /// [`prompt::build_step_prompt`] with that attempt's reconstructed retry
+    /// context (a best-effort preview from *current* plan/step/prompt text).
     ///
     /// `logs` is the step's execution logs in chronological order (as
     /// returned by `storage::list_execution_logs_for_step`). When empty, a
-    /// single attempt-1 entry with no retry context is produced.
-    #[allow(clippy::too_many_arguments)]
-    pub fn build_attempts(
-        plan: &Plan,
-        step: &Step,
-        all_steps: &[Step],
-        agent_name: Option<&str>,
-        harness_supports_agent_file: bool,
-        prompts: &Prompts,
-        answered_questions: &[AnsweredQuestion],
-        max_attempts: i32,
-        logs: &[ExecutionLog],
-    ) -> Vec<AttemptPrompt> {
+    /// single attempt-1 entry is produced by re-assembly (no attempt has run,
+    /// so there is nothing persisted yet) — a genuine "what would be sent now"
+    /// preview.
+    pub fn build_attempts(args: &BuildAttemptsArgs<'_>) -> Vec<AttemptPrompt> {
+        let &BuildAttemptsArgs {
+            plan,
+            step,
+            all_steps,
+            agent_name,
+            harness_supports_agent_file,
+            prompts,
+            resolved_interruptions,
+            max_attempts,
+            logs,
+        } = args;
         let mut out: Vec<AttemptPrompt> = Vec::new();
 
         if logs.is_empty() {
             // Zero execution logs → attempt 1, no retry context.
-            let prompt = prompt::build_step_prompt(
+            let prompt = prompt::build_step_prompt(&prompt::BuildStepPromptArgs {
                 plan,
                 step,
                 all_steps,
                 agent_name,
-                None,
+                retry_context: None,
                 harness_supports_agent_file,
                 prompts,
-                answered_questions,
-            );
+                resolved_interruptions,
+            });
             out.push(AttemptPrompt {
                 attempt: 1,
+                cycle_index: 0,
                 started_at: None,
                 prompt,
             });
             return out;
         }
 
-        // Resolve the step's retry strategy once so each per-attempt preview
-        // scopes the diff/files exactly as the executor would (Step 22).
-        let strategy = step.effective_retry_strategy(plan);
-        for log in logs {
-            let retry = build_retry_context_for_attempt(log.attempt, max_attempts, logs, strategy);
-            let prompt = prompt::build_step_prompt(
-                plan,
-                step,
-                all_steps,
-                agent_name,
-                retry.as_ref(),
-                harness_supports_agent_file,
-                prompts,
-                answered_questions,
-            );
+        for (i, log) in logs.iter().enumerate() {
+            // An already-run attempt: prefer the prompt VERBATIM as persisted
+            // for that attempt. That is exactly what the agent received,
+            // including point-in-time context a re-assembly from *current*
+            // text cannot reproduce — historical answered-question sets, plan/
+            // step text since edited, or (in an upgraded DB) a pre-redesign
+            // attempt whose retry context actually carried a rolled-back diff.
+            // Only fall back to re-assembling when the row predates
+            // prompt_text capture (NULL / empty), where a best-effort preview
+            // is the only thing available.
+            let prompt = match log.prompt_text.as_deref() {
+                Some(persisted) if !persisted.is_empty() => persisted.to_string(),
+                _ => {
+                    let retry = build_retry_context_for_attempt(i, max_attempts, logs);
+                    prompt::build_step_prompt(&prompt::BuildStepPromptArgs {
+                        plan,
+                        step,
+                        all_steps,
+                        agent_name,
+                        retry_context: retry.as_ref(),
+                        harness_supports_agent_file,
+                        prompts,
+                        resolved_interruptions,
+                    })
+                }
+            };
             out.push(AttemptPrompt {
                 attempt: log.attempt,
+                cycle_index: log.cycle_index,
                 started_at: Some(log.started_at),
                 prompt,
             });
@@ -457,6 +508,21 @@ impl RenderedPromptApp {
             _ => Outcome::Pending,
         }
     }
+
+    /// Mouse handler. The scroll wheel scrolls the prompt body regardless of
+    /// attempt count — keyboard `j`/`k` switches attempts when there are
+    /// multiple, but the wheel is always a body-scroll gesture (matches
+    /// step_detail's `handle_mouse`, where the wheel scrolls the focused
+    /// pane). Other mouse events are no-ops for now.
+    pub fn handle_mouse(&mut self, event: MouseEvent) {
+        use crossterm::event::MouseEventKind;
+
+        match event.kind {
+            MouseEventKind::ScrollDown => self.scroll_down(),
+            MouseEventKind::ScrollUp => self.scroll_up(),
+            _ => {}
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -485,6 +551,22 @@ fn relative_time(started: DateTime<Utc>, now: DateTime<Utc>) -> String {
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
+
+/// Wrapped (visual) line count for `text` at `width` columns, mirroring the
+/// helper of the same name in `step_detail` (kept local so this sub-view
+/// doesn't depend on its parent's internals). Each `\n`-delimited logical
+/// line wraps to `ceil(chars / width)` visual rows; a zero-width viewport
+/// returns 0. Caps at `u16::MAX` because the scroll API is `u16`.
+fn text_visual_line_count(text: &str, width: u16) -> u16 {
+    if width == 0 {
+        return 0;
+    }
+    let w = width as usize;
+    text.split('\n')
+        .map(|line| line.chars().count().max(1).div_ceil(w))
+        .sum::<usize>()
+        .min(u16::MAX as usize) as u16
+}
 
 /// Render the rendered-prompt preview over the parent step-detail surface.
 /// Caller is expected to have drawn the background view immediately prior;
@@ -540,6 +622,13 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut RenderedPromptApp) {
     // -- Header ----------------------------------------------------------
     let header_text = {
         let mut s = format!("Attempt {} of {}", current.attempt, total);
+        // V33: prefix `[cycle N]` when the surface contains attempts from a
+        // post-reset cycle, so two logical attempt=1 rows can be told apart
+        // at the picker. Cycle 0 is the common case and stays unlabeled.
+        let multi_cycle = app.attempts.iter().any(|a| a.cycle_index > 0);
+        if multi_cycle {
+            s = format!("[cycle {}] {s}", current.cycle_index);
+        }
         if let Some(started) = current.started_at {
             let rel = relative_time(started, Utc::now());
             s.push_str(&format!(" (started {rel})"));
@@ -558,7 +647,13 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut RenderedPromptApp) {
     // Record the metrics scroll clamping depends on, then clamp the offset
     // *before* drawing so a stale (too-large) offset from a longer prior
     // attempt can't blank the pane.
-    let line_count = current.prompt.lines().count().max(1) as u16;
+    //
+    // `Paragraph::scroll` with `Wrap{}` counts *wrapped* lines, so the
+    // clamp must also count wrapped lines — using pre-wrap `.lines().count()`
+    // here causes the scroll to stop short of the bottom on long prompts
+    // whose logical lines wrap. Mirror the helper used in step_detail's
+    // scrollable panes (`text_visual_line_count`).
+    let line_count = text_visual_line_count(&current.prompt, body_area.width).max(1);
     app.last_body_height = body_area.height;
     app.last_line_count = line_count;
     let max_scroll = line_count.saturating_sub(body_area.height.max(1));
@@ -620,19 +715,20 @@ mod tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
-            retry_strategy: None,
+            review_enabled: None,
+            max_review_corrections: None,
         }
     }
 
     fn make_step() -> Step {
         Step {
             id: "s1".to_string(),
+            short_id: String::new(),
             plan_id: "p1".to_string(),
             sort_key: "a0".to_string(),
             title: "Implement harness spawning".to_string(),
@@ -649,7 +745,9 @@ mod tests {
             skipped_reason: None,
             change_policy: ChangePolicy::Required,
             tags: vec![],
-            retry_strategy: None,
+            review_enabled: None,
+            review_status: None,
+            corrects_step_id: None,
         }
     }
 
@@ -674,6 +772,7 @@ mod tests {
             session_id: None,
             termination_reason: None,
             test_status: None,
+            cycle_index: 0,
         }
     }
 
@@ -690,44 +789,14 @@ mod tests {
 
     #[test]
     fn attempt_one_has_no_retry_context() {
-        assert!(build_retry_context_for_attempt(1, 4, &[], RetryStrategy::Keep).is_none());
-        assert!(build_retry_context_for_attempt(1, 4, &[], RetryStrategy::Rollback).is_none());
+        assert!(build_retry_context_for_attempt(0, 4, &[]).is_none());
     }
 
     #[test]
-    fn later_attempt_pulls_previous_log_outcome_rollback() {
-        // Under Rollback the reverted diff/files are re-sent so the agent
-        // can learn from work it no longer sees on disk.
-        let mut l1 = make_log(1, Utc::now());
-        l1.diff = Some("diff --git a/src/foo.rs b/src/foo.rs\n@@ -1 +1 @@\n-old\n+new".to_string());
-        l1.test_results = vec!["FAIL test_a".to_string(), "error: boom".to_string()];
-        l1.termination_reason = Some(TerminationReason::TestFailed);
-        let l2 = make_log(2, Utc::now());
-        let logs = vec![l1, l2];
-
-        let ctx = build_retry_context_for_attempt(2, 4, &logs, RetryStrategy::Rollback)
-            .expect("retry ctx for attempt 2");
-        assert_eq!(ctx.attempt, 2);
-        assert_eq!(ctx.max_attempts, 4);
-        assert_eq!(
-            ctx.previous_diff.as_deref(),
-            Some("diff --git a/src/foo.rs b/src/foo.rs\n@@ -1 +1 @@\n-old\n+new")
-        );
-        // test_results joined with `\n`, exactly like the executor.
-        assert_eq!(
-            ctx.previous_test_output.as_deref(),
-            Some("FAIL test_a\nerror: boom")
-        );
-        // files_modified parsed from the diff's `diff --git ... b/<path>`.
-        assert_eq!(ctx.files_modified, vec!["src/foo.rs".to_string()]);
-        assert_eq!(ctx.previous_failure_reason.as_deref(), Some("tests failed"));
-    }
-
-    #[test]
-    fn later_attempt_keep_omits_diff_and_files_keeps_reason_and_output() {
-        // Step 22: under Keep the prior work is still on disk, so the preview
-        // mirrors the executor by omitting diff/files but keeping the test
-        // output and a reconstructed failure reason.
+    fn later_attempt_omits_diff_and_files_keeps_reason_and_output() {
+        // Post test-then-commit: the prior work is still on disk, so the
+        // preview mirrors the executor by omitting diff/files but keeping the
+        // test output and a reconstructed failure reason.
         let mut l1 = make_log(1, Utc::now());
         l1.diff = Some("diff --git a/src/foo.rs b/src/foo.rs\n@@ -1 +1 @@\n-old\n+new".to_string());
         l1.test_results = vec!["FAIL test_a".to_string()];
@@ -735,30 +804,102 @@ mod tests {
         let l2 = make_log(2, Utc::now());
         let logs = vec![l1, l2];
 
-        let ctx = build_retry_context_for_attempt(2, 4, &logs, RetryStrategy::Keep)
-            .expect("retry ctx for attempt 2");
+        let ctx = build_retry_context_for_attempt(1, 4, &logs).expect("retry ctx for attempt 2");
         assert_eq!(ctx.attempt, 2);
+        assert_eq!(ctx.max_attempts, 4);
         assert!(
             ctx.previous_diff.is_none(),
-            "Keep must not re-send the diff"
+            "the diff is not re-sent (dirty tree is on disk)"
         );
         assert!(
             ctx.files_modified.is_empty(),
-            "Keep must not re-send the file list"
+            "the file list is not re-sent"
         );
         assert_eq!(ctx.previous_test_output.as_deref(), Some("FAIL test_a"));
         assert_eq!(ctx.previous_failure_reason.as_deref(), Some("tests failed"));
     }
 
     #[test]
-    fn files_from_diff_dedupes_and_handles_none() {
-        assert!(files_from_diff(None).is_empty());
-        let d = "diff --git a/a.rs b/a.rs\n@@\n+x\ndiff --git a/a.rs b/a.rs\n@@\n+y\n\
-                 diff --git a/b.rs b/b.rs\n@@\n+z";
+    fn legacy_rolled_back_attempt_restores_diff_and_files_in_fallback() {
+        let mut l1 = make_log(1, Utc::now());
+        l1.prompt_text = None;
+        l1.diff = Some("diff --git a/src/foo.rs b/src/foo.rs\n@@ -1 +1 @@\n-old\n+new".to_string());
+        l1.test_results = vec!["FAIL test_a".to_string(), "error: boom".to_string()];
+        l1.termination_reason = Some(TerminationReason::TestFailed);
+        l1.rolled_back = true;
+        let mut l2 = make_log(2, Utc::now());
+        l2.prompt_text = None;
+        let logs = vec![l1, l2];
+
+        let ctx = build_retry_context_for_attempt(1, 4, &logs).expect("retry ctx for attempt 2");
+        assert_eq!(ctx.attempt, 2);
+        assert_eq!(ctx.max_attempts, 4);
         assert_eq!(
-            files_from_diff(Some(d)),
-            vec!["a.rs".to_string(), "b.rs".to_string()]
+            ctx.previous_diff.as_deref(),
+            Some("diff --git a/src/foo.rs b/src/foo.rs\n@@ -1 +1 @@\n-old\n+new")
         );
+        assert_eq!(
+            ctx.previous_test_output.as_deref(),
+            Some("FAIL test_a\nerror: boom")
+        );
+        assert_eq!(ctx.files_modified, vec!["src/foo.rs".to_string()]);
+        assert_eq!(ctx.previous_failure_reason.as_deref(), Some("tests failed"));
+    }
+
+    #[test]
+    fn retry_context_uses_chronological_previous_log_after_attempt_reset() {
+        let plan = make_plan();
+        let step = make_step();
+        let all = vec![step.clone()];
+        let prompts = prompts_for(&plan);
+
+        let mut l1 = make_log(1, Utc::now() - Duration::seconds(30));
+        l1.test_results = vec!["FAIL old cycle".to_string()];
+        l1.termination_reason = Some(TerminationReason::TestFailed);
+        let mut l2 = make_log(2, Utc::now() - Duration::seconds(20));
+        let mut l3 = make_log(1, Utc::now() - Duration::seconds(10));
+        // Null the persisted prompt so `build_attempts` exercises the
+        // re-assembly FALLBACK path this test is about (the verbatim-prompt
+        // path is covered by `build_attempts_prefers_persisted_prompt_text`).
+        l1.prompt_text = None;
+        l2.prompt_text = None;
+        l3.prompt_text = None;
+        let logs = vec![l1, l2, l3];
+
+        assert!(
+            build_retry_context_for_attempt(2, 4, &logs).is_none(),
+            "logical attempt=1 after a retry-from-scratch reset must not inherit retry context"
+        );
+
+        let attempts = RenderedPromptApp::build_attempts(&BuildAttemptsArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all,
+            agent_name: None,
+            harness_supports_agent_file: true,
+            prompts: &prompts,
+            resolved_interruptions: &[],
+            max_attempts: 4,
+            logs: &logs,
+        });
+        assert_eq!(attempts.len(), 3);
+        assert_eq!(attempts[2].attempt, 1);
+        assert!(
+            !attempts[2].prompt.contains("# Retry Context"),
+            "a post-reset attempt 1 preview must rebuild with no retry section"
+        );
+
+        let expected = prompt::build_step_prompt(&prompt::BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &prompts,
+            resolved_interruptions: &[],
+        });
+        assert_eq!(attempts[2].prompt, expected);
     }
 
     // -- assembly equals build_step_prompt ------------------------------
@@ -770,24 +911,32 @@ mod tests {
         let all = vec![step.clone()];
         let prompts = prompts_for(&plan);
 
-        let attempts = RenderedPromptApp::build_attempts(
-            &plan,
-            &step,
-            &all,
-            None,
-            true,
-            &prompts,
-            &[],
-            4,
-            &[],
-        );
+        let attempts = RenderedPromptApp::build_attempts(&BuildAttemptsArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all,
+            agent_name: None,
+            harness_supports_agent_file: true,
+            prompts: &prompts,
+            resolved_interruptions: &[],
+            max_attempts: 4,
+            logs: &[],
+        });
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].attempt, 1);
         assert!(attempts[0].started_at.is_none());
 
         // Byte-identical to a direct build_step_prompt call with no retry ctx.
-        let expected =
-            prompt::build_step_prompt(&plan, &step, &all, None, None, true, &prompts, &[]);
+        let expected = prompt::build_step_prompt(&prompt::BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &prompts,
+            resolved_interruptions: &[],
+        });
         assert_eq!(attempts[0].prompt, expected);
     }
 
@@ -801,39 +950,118 @@ mod tests {
         let mut l1 = make_log(1, Utc::now());
         l1.diff = Some("diff --git a/src/x.rs b/src/x.rs\n+change".to_string());
         l1.test_results = vec!["FAIL".to_string()];
-        let l2 = make_log(2, Utc::now());
+        let mut l2 = make_log(2, Utc::now());
+        // Null the persisted prompt so this test exercises the re-assembly
+        // FALLBACK (its purpose: verifying reconstructed retry context). The
+        // verbatim-prompt path is covered by
+        // `build_attempts_prefers_persisted_prompt_text`.
+        l1.prompt_text = None;
+        l2.prompt_text = None;
         let logs = vec![l1, l2];
 
-        let attempts = RenderedPromptApp::build_attempts(
-            &plan,
-            &step,
-            &all,
-            None,
-            true,
-            &prompts,
-            &[],
-            4,
-            &logs,
-        );
+        let attempts = RenderedPromptApp::build_attempts(&BuildAttemptsArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all,
+            agent_name: None,
+            harness_supports_agent_file: true,
+            prompts: &prompts,
+            resolved_interruptions: &[],
+            max_attempts: 4,
+            logs: &logs,
+        });
         assert_eq!(attempts.len(), 2);
 
         // Attempt 1: no retry context.
-        let exp1 = prompt::build_step_prompt(&plan, &step, &all, None, None, true, &prompts, &[]);
+        let exp1 = prompt::build_step_prompt(&prompt::BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &prompts,
+            resolved_interruptions: &[],
+        });
         assert_eq!(attempts[0].prompt, exp1);
         assert!(!attempts[0].prompt.contains("# Retry Context"));
 
         // Attempt 2: retry context reconstructed from attempt 1's log.
-        // `build_attempts` resolves the strategy via
-        // `step.effective_retry_strategy(plan)`; make_step/make_plan both
-        // leave it None → default `Keep`, so mirror that here.
-        let ctx =
-            build_retry_context_for_attempt(2, 4, &logs, step.effective_retry_strategy(&plan))
-                .unwrap();
-        let exp2 =
-            prompt::build_step_prompt(&plan, &step, &all, None, Some(&ctx), true, &prompts, &[]);
+        let ctx = build_retry_context_for_attempt(1, 4, &logs).unwrap();
+        let exp2 = prompt::build_step_prompt(&prompt::BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all,
+            agent_name: None,
+            retry_context: Some(&ctx),
+            harness_supports_agent_file: true,
+            prompts: &prompts,
+            resolved_interruptions: &[],
+        });
         assert_eq!(attempts[1].prompt, exp2);
         assert!(attempts[1].prompt.contains("# Retry Context"));
         assert!(attempts[1].prompt.contains("attempt 2 of 4"));
+    }
+
+    #[test]
+    fn files_from_diff_dedupes_and_handles_none() {
+        assert!(files_from_diff(None).is_empty());
+        let d = "diff --git a/a.rs b/a.rs\n@@\n+x\ndiff --git a/a.rs b/a.rs\n@@\n+y\n\
+                 diff --git a/b.rs b/b.rs\n@@\n+z";
+        assert_eq!(
+            files_from_diff(Some(d)),
+            vec!["a.rs".to_string(), "b.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn build_attempts_prefers_persisted_prompt_text() {
+        let plan = make_plan();
+        let step = make_step();
+        let all = vec![step.clone()];
+        let prompts = prompts_for(&plan);
+
+        // Two already-run attempts: one with a persisted prompt (shown
+        // verbatim), one whose prompt_text is NULL (must fall back to a
+        // re-assembled preview).
+        let mut l1 = make_log(1, Utc::now());
+        l1.prompt_text = Some("VERBATIM PROMPT AS SENT TO THE AGENT".to_string());
+        let mut l2 = make_log(2, Utc::now());
+        l2.prompt_text = None;
+        let logs = vec![l1, l2];
+
+        let attempts = RenderedPromptApp::build_attempts(&BuildAttemptsArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all,
+            agent_name: None,
+            harness_supports_agent_file: true,
+            prompts: &prompts,
+            resolved_interruptions: &[],
+            max_attempts: 4,
+            logs: &logs,
+        });
+        assert_eq!(attempts.len(), 2);
+
+        // Attempt 1: the persisted prompt is returned byte-for-byte — NOT a
+        // re-assembly (which would carry the plan/step layers, not this
+        // sentinel).
+        assert_eq!(attempts[0].prompt, "VERBATIM PROMPT AS SENT TO THE AGENT");
+
+        // Attempt 2: no persisted prompt → re-assembled fallback (carries the
+        // reconstructed retry context for attempt 2).
+        let ctx = build_retry_context_for_attempt(1, 4, &logs).unwrap();
+        let exp2 = prompt::build_step_prompt(&prompt::BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all,
+            agent_name: None,
+            retry_context: Some(&ctx),
+            harness_supports_agent_file: true,
+            prompts: &prompts,
+            resolved_interruptions: &[],
+        });
+        assert_eq!(attempts[1].prompt, exp2);
     }
 
     // -- attempt navigation ---------------------------------------------
@@ -844,16 +1072,19 @@ mod tests {
         let attempts = vec![
             AttemptPrompt {
                 attempt: 1,
+                cycle_index: 0,
                 started_at: Some(now - Duration::seconds(300)),
                 prompt: "P1".to_string(),
             },
             AttemptPrompt {
                 attempt: 2,
+                cycle_index: 0,
                 started_at: Some(now - Duration::seconds(120)),
                 prompt: "P2".to_string(),
             },
             AttemptPrompt {
                 attempt: 3,
+                cycle_index: 0,
                 started_at: Some(now - Duration::seconds(10)),
                 prompt: "P3".to_string(),
             },
@@ -888,11 +1119,13 @@ mod tests {
         let attempts = vec![
             AttemptPrompt {
                 attempt: 1,
+                cycle_index: 0,
                 started_at: Some(Utc::now()),
                 prompt: "a\nb\nc\nd\ne".to_string(),
             },
             AttemptPrompt {
                 attempt: 2,
+                cycle_index: 0,
                 started_at: Some(Utc::now()),
                 prompt: "x".to_string(),
             },
@@ -909,6 +1142,7 @@ mod tests {
     fn single_attempt_jk_scrolls_instead_of_navigating() {
         let attempts = vec![AttemptPrompt {
             attempt: 1,
+            cycle_index: 0,
             started_at: None,
             prompt: (0..50)
                 .map(|i| format!("line {i}"))
@@ -935,6 +1169,7 @@ mod tests {
                 "l".into(),
                 vec![AttemptPrompt {
                     attempt: 1,
+                    cycle_index: 0,
                     started_at: None,
                     prompt: "p".into(),
                 }],
@@ -951,12 +1186,74 @@ mod tests {
     }
 
     #[test]
+    fn mouse_wheel_scrolls_body_regardless_of_attempt_count() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+
+        fn wheel(kind: MouseEventKind) -> MouseEvent {
+            MouseEvent {
+                kind,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }
+        }
+
+        // Multi-attempt: keyboard j/k switches attempts, but the wheel must
+        // still scroll the body (we want consistent gesture semantics — wheel
+        // = scroll, regardless of how many attempts there are).
+        let now = Utc::now();
+        let attempts = vec![
+            AttemptPrompt {
+                attempt: 1,
+                cycle_index: 0,
+                started_at: Some(now),
+                prompt: (0..50)
+                    .map(|i| format!("line {i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            },
+            AttemptPrompt {
+                attempt: 2,
+                cycle_index: 0,
+                started_at: Some(now),
+                prompt: (0..50)
+                    .map(|i| format!("attempt2 {i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            },
+        ];
+        let mut app = RenderedPromptApp::new("s".into(), "l".into(), attempts);
+        // Land on the most recent attempt by construction.
+        let initial_attempt = app.current().attempt;
+        app.last_body_height = 10;
+        app.last_line_count = 50;
+
+        app.handle_mouse(wheel(MouseEventKind::ScrollDown));
+        assert_eq!(app.scroll, 1, "wheel-down scrolls body by one line");
+        assert_eq!(
+            app.current().attempt,
+            initial_attempt,
+            "wheel never switches attempts (that is keyboard j/k territory)"
+        );
+        app.handle_mouse(wheel(MouseEventKind::ScrollUp));
+        assert_eq!(app.scroll, 0, "wheel-up reverses by one line");
+
+        // Other mouse events (e.g. a left click) are explicit no-ops — we are
+        // not yet wiring click-to-scrub or selection.
+        let click = wheel(MouseEventKind::Down(crossterm::event::MouseButton::Left));
+        app.handle_mouse(click);
+        assert_eq!(app.scroll, 0);
+        assert_eq!(app.current().attempt, initial_attempt);
+    }
+
+    #[test]
     fn help_overlay_swallows_keys() {
         let mut app = RenderedPromptApp::new(
             "s".into(),
             "l".into(),
             vec![AttemptPrompt {
                 attempt: 1,
+                cycle_index: 0,
                 started_at: None,
                 prompt: "p".into(),
             }],
@@ -970,6 +1267,24 @@ mod tests {
         // `?` again closes it.
         assert_eq!(app.handle_key(key(KeyCode::Char('?'))), Outcome::Pending);
         assert!(!app.help.is_visible());
+    }
+
+    // -- wrap-aware line count ------------------------------------------
+
+    #[test]
+    fn text_visual_line_count_accounts_for_wrap() {
+        // Short lines (≤ width) count as 1 each.
+        assert_eq!(super::text_visual_line_count("a\nb\nc", 80), 3);
+        // A 25-char line in a 10-col viewport wraps to 3 visual rows.
+        let twenty_five = "a".repeat(25);
+        assert_eq!(super::text_visual_line_count(&twenty_five, 10), 3);
+        // Mixed: a 25-char line (3 rows) + a short line (1 row) = 4.
+        let mixed = format!("{twenty_five}\nshort");
+        assert_eq!(super::text_visual_line_count(&mixed, 10), 4);
+        // Empty logical line still counts as 1 row (matches step_detail).
+        assert_eq!(super::text_visual_line_count("\n\n", 10), 3);
+        // Zero-width viewport returns 0 (caller guards the render path).
+        assert_eq!(super::text_visual_line_count("hello", 0), 0);
     }
 
     // -- relative time ---------------------------------------------------

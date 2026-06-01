@@ -7,7 +7,7 @@ use serde::Serialize;
 use std::io::Write;
 use std::path::Path;
 
-use crate::plan::{ChangePolicy, Plan, RetryStrategy, Step};
+use crate::plan::{ChangePolicy, Plan, Step};
 use crate::storage;
 
 // ---------------------------------------------------------------------------
@@ -41,12 +41,23 @@ pub struct ExportedPlanMeta {
     pub depends_on: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan_harness: Option<String>,
-    /// Plan-level retry-strategy override. Omitted from the JSON when the
-    /// plan has no override (`None`) so an unset plan exports identically
-    /// to pre-V24 output; a `Some` value round-trips back via the matching
-    /// `#[serde(default)]` field on [`crate::import::ImportedPlanMeta`].
+    /// Plan-level review on/off override (docs/dag-redesign.md §13.2). The
+    /// review *toggle* is plan-template data so it IS exported; the review
+    /// *harness/model* is global config and is **never** exported (a bundle
+    /// stays portable across machines whose review harness differs).
+    /// Omitted when the plan has no override (`None` = inherit global), so a
+    /// plan with no review override exports identically to a pre-V27
+    /// bundle; round-trips via the matching `#[serde(default)]` field on
+    /// [`crate::import::ImportedPlanMeta`].
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub retry_strategy: Option<RetryStrategy>,
+    pub review_enabled: Option<bool>,
+    /// Plan-level `max_review_corrections` recursion cap
+    /// (docs/dag-redesign.md §10 item 4 / §13.2). Plan-template data
+    /// (the per-plan way to configure the review recursion bound), so it
+    /// round-trips. Omitted when the plan has no override (`None` = use the
+    /// built-in default).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_review_corrections: Option<i32>,
 }
 
 /// Step stripped of internal fields.
@@ -68,26 +79,110 @@ pub struct ExportedStep {
     /// tags so pre-V13 export output is unchanged for untagged steps.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
-    /// Step-level retry-strategy override. Omitted from the JSON when the
-    /// step has no override (`None`) so an unset step exports identically
-    /// to pre-V24 output; a `Some` value round-trips back via the matching
-    /// `#[serde(default)]` field on [`crate::import::ImportedStep`].
+    /// Step-level review on/off override (docs/dag-redesign.md §13.2).
+    /// Plan-template data (the per-step `--review on|off|inherit` value), so
+    /// it IS exported; the review harness/model is global config and is
+    /// never exported. Omitted when the step has no override (`None` =
+    /// inherit plan/global), so an unset step exports identically to a
+    /// pre-V27 bundle; round-trips via the matching `#[serde(default)]`
+    /// field on [`crate::import::ImportedStep`]. The runtime `review_status`
+    /// and the `corrects_step_id` provenance pointer are NOT exported
+    /// (runtime state, by existing policy — §13.2).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub retry_strategy: Option<RetryStrategy>,
+    pub review_enabled: Option<bool>,
+    /// Plan-unique, portable edge handle (docs/dag-redesign.md §13.2).
+    /// **Always emitted** — it is the stable handle other steps' `depends_on`
+    /// reference. The internal UUID is still never exported. Export reuses the
+    /// step's existing `short_id` (never re-minted), so re-exporting a bundle
+    /// yields byte-stable `short_id`s.
+    pub short_id: String,
+    /// `short_id`s of the steps this step directly depends on
+    /// (docs/dag-redesign.md §13.2). `#[serde(skip_serializing_if =
+    /// "Vec::is_empty")]` so a *root* step (genuinely no dependencies — a
+    /// linear plan's first step, or any root of a multi-root DAG) omits the
+    /// field. Edges are **not** suppressed: a linear plan exports its real
+    /// chain edges (each step depends on its predecessor) so the round-trip
+    /// reproduces the exact chain with stable `short_id`s, while a genuine
+    /// no-edge multi-root DAG exports with the field absent everywhere and
+    /// round-trips with no edges (§13.3). Only a *true legacy* bundle (no
+    /// `short_id` on any step) re-imports via the linear-chain backfill.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
 // Export logic
 // ---------------------------------------------------------------------------
 
+/// Resolve each step's direct dependencies to a sorted list of *step*
+/// `short_id`s (docs/dag-redesign.md §13.2 / §13.3).
+///
+/// **No chain suppression.** Earlier revisions dropped the edge data when the
+/// plan was a degenerate linear chain so the bundle stayed "byte-identical to
+/// pre-DAG output". That rationale is void: `short_id` is now *always*
+/// emitted on every step (a field pre-DAG bundles never had), so a bundle is
+/// never byte-identical to pre-DAG output anyway. Worse, suppression made a
+/// chain-suppressed linear export and a genuine *multi-root no-edge* DAG
+/// produce byte-identical bundles, so the importer could not honour both the
+/// linear round-trip guarantee (§13.3) and "preserve a no-edge multi-root DAG
+/// as no-edge" (§13.3) at once. Emitting the real edges makes export lossless:
+/// a linear plan round-trips to its exact chain with stable `short_id`s, a
+/// no-edge multi-root DAG round-trips with no edges, and only a *true* legacy
+/// bundle (no `short_id` anywhere) takes the import linear-chain backfill.
+///
+/// `steps` must be in canonical `sort_key` order (as [`storage::list_steps`]
+/// returns). The returned vec is parallel to `steps`; `short_id`s within each
+/// entry are sorted so re-exports are byte-stable regardless of internal UUID
+/// values.
+fn resolve_step_depends_on(conn: &Connection, steps: &[Step]) -> Result<Vec<Vec<String>>> {
+    use std::collections::HashMap;
+
+    let id_to_short: HashMap<&str, &str> = steps
+        .iter()
+        .map(|s| (s.id.as_str(), s.short_id.as_str()))
+        .collect();
+
+    // Every step belongs to the same plan, so load the whole edge set in a
+    // single query rather than one `list_step_dependencies` call per step
+    // (the scheduler/runner/TUI already use this bulk path).
+    let edges = match steps.first() {
+        Some(first) => storage::list_step_dependency_edges(conn, &first.plan_id)?,
+        None => return Ok(Vec::new()),
+    };
+
+    let mut resolved: Vec<Vec<String>> = Vec::with_capacity(steps.len());
+    for s in steps {
+        // Only edges whose target is also a step of this plan are portable;
+        // anything else (shouldn't happen in practice) is silently dropped,
+        // mirroring the plan-level dependency resolution in `export_plan`.
+        let mut shorts: Vec<String> = edges
+            .get(&s.id)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| id_to_short.get(id.as_str()).map(|x| x.to_string()))
+            .collect();
+        shorts.sort();
+        resolved.push(shorts);
+    }
+
+    Ok(resolved)
+}
+
 /// Build an ExportedPlan from a Plan and its steps.
 ///
 /// `depends_on_slugs` is the caller-supplied list of slugs this plan
 /// depends on (resolved by [`export_plan`] from the dependency graph).
+///
+/// `step_depends_on` is parallel to `steps`: entry *i* is the sorted list of
+/// dependency `short_id`s for `steps[i]` — every real edge, no chain
+/// suppression — as produced by [`resolve_step_depends_on`]. A shorter/empty slice is
+/// treated as "no edges" for the unspecified steps, which keeps pure
+/// callers (tests, legacy linear plans) byte-stable.
 pub fn build_exported_plan(
     plan: &Plan,
     steps: &[Step],
     depends_on_slugs: Vec<String>,
+    step_depends_on: &[Vec<String>],
 ) -> ExportedPlan {
     let version = env!("CARGO_PKG_VERSION").to_string();
     let exported_at = Utc::now().to_rfc3339();
@@ -101,12 +196,14 @@ pub fn build_exported_plan(
         deterministic_tests: plan.deterministic_tests.clone(),
         depends_on: depends_on_slugs,
         plan_harness: plan.plan_harness.clone(),
-        retry_strategy: plan.retry_strategy,
+        review_enabled: plan.review_enabled,
+        max_review_corrections: plan.max_review_corrections,
     };
 
     let exported_steps: Vec<ExportedStep> = steps
         .iter()
-        .map(|s| ExportedStep {
+        .enumerate()
+        .map(|(i, s)| ExportedStep {
             title: s.title.clone(),
             description: s.description.clone(),
             agent: s.agent.clone(),
@@ -116,7 +213,9 @@ pub fn build_exported_plan(
             model: s.model.clone(),
             change_policy: s.change_policy,
             tags: s.tags.clone(),
-            retry_strategy: s.retry_strategy,
+            review_enabled: s.review_enabled,
+            short_id: s.short_id.clone(),
+            depends_on: step_depends_on.get(i).cloned().unwrap_or_default(),
         })
         .collect();
 
@@ -151,7 +250,9 @@ pub fn export_plan(
     }
     dep_slugs.sort();
 
-    let exported = build_exported_plan(&plan, &steps, dep_slugs);
+    let step_depends_on = resolve_step_depends_on(conn, &steps)?;
+
+    let exported = build_exported_plan(&plan, &steps, dep_slugs, &step_depends_on);
     let json = serde_json::to_string_pretty(&exported)?;
 
     match output {
@@ -189,48 +290,54 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(
             &conn,
-            "test-export",
-            "/tmp/proj",
-            "feat/export",
-            "Export test plan",
-            Some("claude"),
-            Some("opus"),
-            &["cargo test".to_string(), "cargo clippy".to_string()],
+            crate::storage::NewPlan {
+                slug: "test-export",
+                project: "/tmp/proj",
+                branch_name: "feat/export",
+                description: "Export test plan",
+                harness: Some("claude"),
+                agent: Some("opus"),
+                deterministic_tests: &["cargo test".to_string(), "cargo clippy".to_string()],
+            },
         )
         .unwrap();
 
         let (_s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step one",
-            "First step desc",
-            Some("sonnet"),
-            None,
-            &["tests pass".to_string()],
-            Some(3),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step one",
+                description: "First step desc",
+                agent: Some("sonnet"),
+                harness: None,
+                acceptance_criteria: &["tests pass".to_string()],
+                max_retries: Some(3),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
         let (_s2, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step two",
-            "Second step desc",
-            None,
-            Some("codex"),
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step two",
+                description: "Second step desc",
+                agent: None,
+                harness: Some("codex"),
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
-        let exported = build_exported_plan(&plan, &steps, Vec::new());
+        let exported = build_exported_plan(&plan, &steps, Vec::new(), &[]);
 
         // Check version and timestamp are present
         assert!(!exported.ralph_rs_version.is_empty());
@@ -268,33 +375,37 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(
             &conn,
-            "json-test",
-            "/tmp/proj",
-            "branch",
-            "desc",
-            None,
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "json-test",
+                project: "/tmp/proj",
+                branch_name: "branch",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
 
         storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
-        let exported = build_exported_plan(&plan, &steps, Vec::new());
+        let exported = build_exported_plan(&plan, &steps, Vec::new(), &[]);
         let json = serde_json::to_string_pretty(&exported).unwrap();
 
         // The JSON should NOT contain internal fields
@@ -320,33 +431,37 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(
             &conn,
-            "valid-json",
-            "/tmp/proj",
-            "branch",
-            "desc",
-            Some("claude"),
-            None,
-            &["cargo test".to_string()],
+            crate::storage::NewPlan {
+                slug: "valid-json",
+                project: "/tmp/proj",
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("claude"),
+                agent: None,
+                deterministic_tests: &["cargo test".to_string()],
+            },
         )
         .unwrap();
 
         storage::create_step(
             &conn,
             &plan.id,
-            "Step A",
-            "desc a",
-            None,
-            None,
-            &["criterion".to_string()],
-            Some(2),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step A",
+                description: "desc a",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &["criterion".to_string()],
+                max_retries: Some(2),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
-        let exported = build_exported_plan(&plan, &steps, Vec::new());
+        let exported = build_exported_plan(&plan, &steps, Vec::new(), &[]);
         let json = serde_json::to_string(&exported).unwrap();
 
         // Should parse back as valid JSON
@@ -362,28 +477,32 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(
             &conn,
-            "file-export",
-            "/tmp/proj",
-            "branch",
-            "desc",
-            None,
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "file-export",
+                project: "/tmp/proj",
+                branch_name: "branch",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
 
         storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -409,13 +528,15 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(
             &conn,
-            "order-test",
-            "/tmp/proj",
-            "branch",
-            "desc",
-            None,
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "order-test",
+                project: "/tmp/proj",
+                branch_name: "branch",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
 
@@ -423,48 +544,54 @@ mod tests {
         storage::create_step(
             &conn,
             &plan.id,
-            "Alpha",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Alpha",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::create_step(
             &conn,
             &plan.id,
-            "Beta",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Beta",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::create_step(
             &conn,
             &plan.id,
-            "Gamma",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Gamma",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
-        let exported = build_exported_plan(&plan, &steps, Vec::new());
+        let exported = build_exported_plan(&plan, &steps, Vec::new(), &[]);
 
         assert_eq!(exported.steps[0].title, "Alpha");
         assert_eq!(exported.steps[1].title, "Beta");
@@ -476,28 +603,32 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(
             &conn,
-            "status-test",
-            "/tmp/proj",
-            "branch",
-            "desc",
-            None,
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "status-test",
+                project: "/tmp/proj",
+                branch_name: "branch",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
 
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -506,7 +637,7 @@ mod tests {
 
         // Export should NOT include status at all (the ExportedStep struct has no status field)
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
-        let exported = build_exported_plan(&plan, &steps, Vec::new());
+        let exported = build_exported_plan(&plan, &steps, Vec::new(), &[]);
         let json = serde_json::to_string(&exported).unwrap();
 
         // The steps array shouldn't have "status" or "attempts" fields
@@ -517,6 +648,36 @@ mod tests {
     }
 
     #[test]
+    fn test_export_omits_questions_enabled() {
+        // questions_enabled was fully removed (V36): the exported JSON must
+        // no longer carry the key at all.
+        let conn = setup();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "questions-export",
+                project: "/tmp/proj",
+                branch_name: "branch",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        let exported = build_exported_plan(&plan, &steps, Vec::new(), &[]);
+
+        let json = serde_json::to_string(&exported).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            parsed["plan"].get("questions_enabled").is_none(),
+            "exported plan must not carry questions_enabled"
+        );
+    }
+
+    #[test]
     fn test_export_includes_tags() {
         // Exported JSON must carry through user-supplied tags verbatim, and
         // must omit the `tags` field entirely for untagged steps so pre-V13
@@ -524,13 +685,15 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(
             &conn,
-            "tags-export",
-            "/tmp/proj",
-            "branch",
-            "desc",
-            None,
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "tags-export",
+                project: "/tmp/proj",
+                branch_name: "branch",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
 
@@ -538,35 +701,39 @@ mod tests {
         storage::create_step(
             &conn,
             &plan.id,
-            "Tagged",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            Some(&tags),
+            crate::storage::NewStep {
+                title: "Tagged",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: Some(&tags),
+            },
         )
         .unwrap();
         // Untagged sibling.
         storage::create_step(
             &conn,
             &plan.id,
-            "Untagged",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Untagged",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
-        let exported = build_exported_plan(&plan, &steps, Vec::new());
+        let exported = build_exported_plan(&plan, &steps, Vec::new(), &[]);
         assert_eq!(exported.steps[0].tags, tags);
         assert!(exported.steps[1].tags.is_empty());
 
@@ -579,5 +746,280 @@ mod tests {
         assert_eq!(tagged_tags[1], "REGRESSION");
         // Untagged step omits the field (skip_serializing_if).
         assert!(parsed["steps"][1].get("tags").is_none());
+    }
+
+    /// Helper: create a titled step with all-default optional fields.
+    fn mk_step(conn: &Connection, plan_id: &str, title: &str) -> Step {
+        let (s, _) = storage::create_step(
+            conn,
+            plan_id,
+            crate::storage::NewStep {
+                title,
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+        s
+    }
+
+    #[test]
+    fn test_export_linear_plan_emits_short_ids_and_real_chain_edges() {
+        // docs/dag-redesign.md §13.2/§13.3: `short_id` is ALWAYS emitted and
+        // stable, and chain edges are **no longer suppressed** — a linear
+        // plan exports its real chain so the round-trip reproduces the exact
+        // chain with stable short_ids (and is unambiguous against a genuine
+        // no-edge multi-root DAG, which exports with the field absent
+        // everywhere).
+        let conn = setup();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "chain",
+                project: "/tmp/proj",
+                branch_name: "branch",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let a = mk_step(&conn, &plan.id, "A");
+        let b = mk_step(&conn, &plan.id, "B");
+        let c = mk_step(&conn, &plan.id, "C");
+        // Canonical V25/legacy-import chain: B→A, C→B.
+        storage::add_step_dependency(&conn, &b.id, &a.id).unwrap();
+        storage::add_step_dependency(&conn, &c.id, &b.id).unwrap();
+
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        let resolved = resolve_step_depends_on(&conn, &steps).unwrap();
+        // Real edges are emitted: A is a root; B→A; C→B.
+        assert!(resolved[0].is_empty(), "A is a root");
+        assert_eq!(resolved[1], vec![a.short_id.clone()]);
+        assert_eq!(resolved[2], vec![b.short_id.clone()]);
+
+        let exported = build_exported_plan(&plan, &steps, Vec::new(), &resolved);
+        // short_id is carried through verbatim, never re-minted.
+        assert_eq!(exported.steps[0].short_id, a.short_id);
+        assert_eq!(exported.steps[1].short_id, b.short_id);
+        assert_eq!(exported.steps[2].short_id, c.short_id);
+        assert!(exported.steps[0].depends_on.is_empty());
+        assert_eq!(exported.steps[1].depends_on, vec![a.short_id.clone()]);
+        assert_eq!(exported.steps[2].depends_on, vec![b.short_id.clone()]);
+
+        let json = serde_json::to_string(&exported).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // short_id present on every step; only the root omits depends_on.
+        for i in 0..3 {
+            assert!(parsed["steps"][i]["short_id"].is_string());
+        }
+        assert!(
+            parsed["steps"][0].get("depends_on").is_none(),
+            "root step omits depends_on (skip_serializing_if on empty)"
+        );
+        assert_eq!(parsed["steps"][1]["depends_on"][0], a.short_id);
+        assert_eq!(parsed["steps"][2]["depends_on"][0], b.short_id);
+        assert!(
+            !json.contains(&a.id),
+            "internal UUID must never be exported"
+        );
+    }
+
+    #[test]
+    fn test_export_branched_plan_emits_depends_on() {
+        // A genuinely-branched plan (not the canonical chain) carries edge
+        // data: B→A and C→A (fan-out), so chain suppression does NOT apply.
+        let conn = setup();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "branched",
+                project: "/tmp/proj",
+                branch_name: "branch",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let a = mk_step(&conn, &plan.id, "A");
+        let b = mk_step(&conn, &plan.id, "B");
+        let c = mk_step(&conn, &plan.id, "C");
+        storage::add_step_dependency(&conn, &b.id, &a.id).unwrap();
+        storage::add_step_dependency(&conn, &c.id, &a.id).unwrap();
+
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        let resolved = resolve_step_depends_on(&conn, &steps).unwrap();
+        let exported = build_exported_plan(&plan, &steps, Vec::new(), &resolved);
+
+        assert!(exported.steps[0].depends_on.is_empty(), "A is a root");
+        assert_eq!(exported.steps[1].depends_on, vec![a.short_id.clone()]);
+        assert_eq!(exported.steps[2].depends_on, vec![a.short_id.clone()]);
+
+        let json = serde_json::to_string(&exported).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // Root omits the field; branched dependents emit it referencing
+        // A's short_id (the portable edge handle, never the UUID).
+        assert!(parsed["steps"][0].get("depends_on").is_none());
+        assert_eq!(parsed["steps"][1]["depends_on"][0], a.short_id);
+        assert_eq!(parsed["steps"][2]["depends_on"][0], a.short_id);
+        assert!(
+            !json.contains(&a.id),
+            "internal UUID must never be exported"
+        );
+    }
+
+    /// STEP 43 / docs/dag-redesign.md §13.2: the review *toggles* are
+    /// plan-template data and ARE exported; the review harness/model and
+    /// all runtime state (`review_status`, `corrects_step_id`) are NOT.
+    /// `max_review_corrections` is plan-template data and round-trips.
+    #[test]
+    fn test_export_emits_review_toggles_and_strips_runtime_state() {
+        let conn = setup();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "rev-exp",
+                project: "/tmp/proj",
+                branch_name: "branch",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        storage::set_plan_review_enabled(&conn, &plan.id, Some(true)).unwrap();
+        storage::set_plan_max_review_corrections(&conn, &plan.id, Some(7)).unwrap();
+        let (s, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            crate::storage::NewStep {
+                title: "S",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+        storage::set_step_review_enabled(&conn, &s.id, Some(false)).unwrap();
+        // Drive runtime state that MUST NOT be exported.
+        storage::update_step_review_status(&conn, &s.id, crate::plan::ReviewStatus::Failed)
+            .unwrap();
+
+        let plan = storage::get_plan_by_id(&conn, &plan.id).unwrap();
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        let exported = build_exported_plan(&plan, &steps, Vec::new(), &[]);
+
+        assert_eq!(exported.plan.review_enabled, Some(true));
+        assert_eq!(exported.plan.max_review_corrections, Some(7));
+        assert_eq!(exported.steps[0].review_enabled, Some(false));
+
+        let json = serde_json::to_string(&exported).unwrap();
+        // Toggles present; review harness/model + runtime state absent.
+        assert!(json.contains("\"review_enabled\":true"));
+        assert!(json.contains("\"review_enabled\":false"));
+        assert!(json.contains("\"max_review_corrections\":7"));
+        assert!(!json.contains("review_status"), "{json}");
+        assert!(!json.contains("review_harness"), "{json}");
+        assert!(!json.contains("review_model"), "{json}");
+        assert!(!json.contains("corrects_step_id"), "{json}");
+
+        // An all-default plan omits every new key (skip_serializing_if).
+        let plain = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "plain",
+                project: "/tmp/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        storage::create_step(
+            &conn,
+            &plain.id,
+            crate::storage::NewStep {
+                title: "x",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+        let psteps = storage::list_steps(&conn, &plain.id).unwrap();
+        let pj =
+            serde_json::to_string(&build_exported_plan(&plain, &psteps, Vec::new(), &[])).unwrap();
+        assert!(!pj.contains("review_enabled"), "{pj}");
+        assert!(!pj.contains("max_review_corrections"), "{pj}");
+    }
+
+    #[test]
+    fn test_export_round_trip_short_ids_stable() {
+        // Re-exporting a bundle must yield byte-stable short_ids and edges
+        // (docs/dag-redesign.md §13.2: short_ids are not re-minted on export).
+        let conn = setup();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "stable",
+                project: "/tmp/proj",
+                branch_name: "branch",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let a = mk_step(&conn, &plan.id, "A");
+        let b = mk_step(&conn, &plan.id, "B");
+        let c = mk_step(&conn, &plan.id, "C");
+        // Branched so depends_on is actually serialized (not suppressed).
+        storage::add_step_dependency(&conn, &b.id, &a.id).unwrap();
+        storage::add_step_dependency(&conn, &c.id, &a.id).unwrap();
+
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        let r1 = resolve_step_depends_on(&conn, &steps).unwrap();
+        let e1 = build_exported_plan(&plan, &steps, Vec::new(), &r1);
+        let steps2 = storage::list_steps(&conn, &plan.id).unwrap();
+        let r2 = resolve_step_depends_on(&conn, &steps2).unwrap();
+        let e2 = build_exported_plan(&plan, &steps2, Vec::new(), &r2);
+
+        for i in 0..3 {
+            assert_eq!(
+                e1.steps[i].short_id, e2.steps[i].short_id,
+                "short_id must be stable across re-exports"
+            );
+            assert_eq!(
+                e1.steps[i].depends_on, e2.steps[i].depends_on,
+                "edge data must be stable across re-exports"
+            );
+        }
+        // Stable also means equal to the stored step short_ids.
+        assert_eq!(e1.steps[0].short_id, a.short_id);
+        assert_eq!(e1.steps[1].short_id, b.short_id);
+        assert_eq!(e1.steps[2].short_id, c.short_id);
     }
 }

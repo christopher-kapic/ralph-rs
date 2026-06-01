@@ -7,6 +7,7 @@ mod agents;
 pub mod config_cmd;
 pub mod harness;
 mod hooks;
+pub mod interruption;
 mod plan;
 mod prompt;
 pub mod question;
@@ -151,25 +152,64 @@ pub fn resolve_resume_plan(
     }
 }
 
-/// Resolve a step reference: either a 1-based positional number within the
-/// plan's step list, or a UUID string looked up via `storage::get_step_by_id`.
+/// Resolve a step reference from the two shared selector forms.
 ///
-/// Exactly one of `step_num` / `step_id` must be `Some`; the caller (clap
-/// `conflicts_with`) guarantees they are mutually exclusive, and this function
-/// checks that at least one is present.
+/// A step can be named two ways on the CLI:
 ///
-/// Returns `(step, step_display_num)` where `step_display_num` is the 1-based
-/// position in the plan's step list (used for user-facing messages).
+/// * the positional selector `<num|short_id>` (`step_sel`), and
+/// * the `--step-id <uuid>` flag (`step_id`).
+///
+/// Exactly one must be `Some`; clap's `conflicts_with` guarantees they are
+/// mutually exclusive and this function rejects the "neither" case.
+///
+/// ## Positional selector disambiguation (docs/dag-redesign.md §7)
+///
+/// Every `<num>` selector also accepts a step `short_id`. The rule is
+/// deterministic, with the short-id branch requiring an *actual* match so
+/// it can never shadow a number:
+///
+/// 1. If the token is **exactly [`storage::is_short_id_shaped`]-shaped**
+///    (8 base-62 chars) **and equals the `short_id` of some step in this
+///    plan**, it resolves as that step.
+/// 2. Otherwise the token is parsed as a **1-based step number** (range
+///    error if out of bounds, parse error if non-numeric).
+///
+/// Because branch 1 fires only on a concrete match, a purely numeric token
+/// keeps its historical numeric meaning. An 8-digit numeric like
+/// `"00000001"` is short-id-*shaped* but, absent a step whose short_id is
+/// literally that string, falls through to the numeric branch and parses
+/// as `1` — so linear-plan behavior stays byte-identical (minted short_ids
+/// are random 8-char base-62 strings; a collision with a literal position
+/// string is both astronomically unlikely and still resolves to the same
+/// step the number would have).
+///
+/// Returns `(step, step_display_num)` where `step_display_num` is the
+/// 1-based position in the plan's step list (used for user-facing messages).
 pub fn resolve_step(
     conn: &Connection,
     plan_id: &str,
-    step_num: Option<usize>,
+    step_sel: Option<&str>,
     step_id: Option<&str>,
 ) -> Result<(Step, usize)> {
     let steps = storage::list_steps(conn, plan_id)?;
 
-    match (step_num, step_id) {
-        (Some(num), None) => {
+    match (step_sel, step_id) {
+        (Some(tok), None) => {
+            // 1. short_id form: correctly shaped AND an existing match in
+            //    this plan. Requiring a hit means a coincidentally
+            //    8-char-numeric token still parses as a number below.
+            if storage::is_short_id_shaped(tok)
+                && let Some(idx) = steps.iter().position(|s| s.short_id == tok)
+            {
+                return Ok((steps.into_iter().nth(idx).unwrap(), idx + 1));
+            }
+            // 2. numeric form (1-based).
+            let num: usize = tok.parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "Invalid step selector '{tok}': expected a 1-based step number \
+                     or an 8-character short id"
+                )
+            })?;
             if num == 0 || num > steps.len() {
                 bail!(
                     "Step {} is out of range (plan has {} steps)",
@@ -195,11 +235,11 @@ pub fn resolve_step(
             Ok((step, pos))
         }
         (None, None) => {
-            bail!("Provide either a step number or --step-id");
+            bail!("Provide either a step number/short id or --step-id");
         }
         (Some(_), Some(_)) => {
             // Should be prevented by clap conflicts_with, but guard anyway.
-            bail!("Cannot specify both a step number and --step-id");
+            bail!("Cannot specify both a step number/short id and --step-id");
         }
     }
 }
@@ -865,15 +905,17 @@ mod tests {
 
         plan_create(
             &conn,
-            "my-plan",
-            &project,
-            Some("A test plan"),
-            Some("feat/test"),
-            None,
-            None,
-            None,
-            &["cargo build".to_string()],
-            &[],
+            PlanCreateArgs {
+                slug: "my-plan",
+                project: &project,
+                description: Some("A test plan"),
+                branch: Some("feat/test"),
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &["cargo build".to_string()],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
@@ -885,36 +927,6 @@ mod tests {
         assert_eq!(plan.description, "A test plan");
         assert_eq!(plan.branch_name, "feat/test");
         assert_eq!(plan.deterministic_tests, vec!["cargo build"]);
-        // No --retry-strategy given -> plan has no override (None).
-        assert!(plan.retry_strategy.is_none());
-    }
-
-    #[test]
-    fn test_plan_create_persists_retry_strategy() {
-        let (conn, project) = setup();
-
-        plan_create(
-            &conn,
-            "rs-plan",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            Some(crate::plan::RetryStrategy::Rollback),
-            &[],
-            &[],
-            &test_out(),
-        )
-        .unwrap();
-
-        let plan = storage::get_plan_by_slug(&conn, "rs-plan", &project)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            plan.retry_strategy,
-            Some(crate::plan::RetryStrategy::Rollback)
-        );
     }
 
     #[test]
@@ -923,15 +935,17 @@ mod tests {
 
         plan_create(
             &conn,
-            "my-plan",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "my-plan",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
@@ -949,15 +963,17 @@ mod tests {
 
         plan_create(
             &conn,
-            "my-plan",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "my-plan",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
@@ -974,15 +990,17 @@ mod tests {
 
         plan_create(
             &conn,
-            "my-plan",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "my-plan",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
@@ -998,51 +1016,61 @@ mod tests {
 
         plan_create(
             &conn,
-            "my-plan",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "my-plan",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         step_add(
             &conn,
-            "my-plan",
-            &project,
-            "First step",
-            Some("Do something"),
-            None,
-            None,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            &[],
+            StepAddArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                title: "First step",
+                description: Some("Do something"),
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         step_add(
             &conn,
-            "my-plan",
-            &project,
-            "Second step",
-            Some("Do another thing"),
-            None,
-            None,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            &[],
+            StepAddArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                title: "Second step",
+                description: Some("Do another thing"),
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
@@ -1062,70 +1090,87 @@ mod tests {
 
         plan_create(
             &conn,
-            "my-plan",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "my-plan",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
+            &test_out(),
+        )
+        .unwrap();
+        // First is the root; Third depends on First (a First -> Third chain).
+        step_add(
+            &conn,
+            StepAddArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                title: "First",
+                description: None,
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         step_add(
             &conn,
-            "my-plan",
-            &project,
-            "First",
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            &[],
+            StepAddArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                title: "Third",
+                description: None,
+                after: Some("1"),
+                before: None,
+                root: false,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
+        // Splice "Second" between First and Third: it takes over Third's
+        // incoming edge so the chain becomes First -> Second -> Third.
+        // (Replaces the old positional "insert after position 1".)
         step_add(
             &conn,
-            "my-plan",
-            &project,
-            "Third",
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            &[],
-            &test_out(),
-        )
-        .unwrap();
-        // Insert after position 1
-        step_add(
-            &conn,
-            "my-plan",
-            &project,
-            "Second",
-            None,
-            Some(1),
-            None,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            &[],
+            StepAddArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                title: "Second",
+                description: None,
+                after: None,
+                before: Some("2"),
+                root: false,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
@@ -1135,9 +1180,22 @@ mod tests {
             .unwrap();
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         assert_eq!(steps.len(), 3);
-        assert_eq!(steps[0].title, "First");
-        assert_eq!(steps[1].title, "Second");
-        assert_eq!(steps[2].title, "Third");
+        let first = steps.iter().find(|s| s.title == "First").unwrap();
+        let second = steps.iter().find(|s| s.title == "Second").unwrap();
+        let third = steps.iter().find(|s| s.title == "Third").unwrap();
+
+        // The new model is structural: assert the spliced dependency edges
+        // (First -> Second -> Third), not a flat list position.
+        let second_deps = storage::list_step_dependencies(&conn, &second.id).unwrap();
+        assert_eq!(second_deps, vec![first.id.clone()]);
+        let third_deps = storage::list_step_dependencies(&conn, &third.id).unwrap();
+        assert_eq!(third_deps, vec![second.id.clone()]);
+        // First is the sole root.
+        assert!(
+            storage::list_step_dependencies(&conn, &first.id)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1146,34 +1204,40 @@ mod tests {
 
         plan_create(
             &conn,
-            "my-plan",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "my-plan",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         let criteria = vec!["Tests pass".to_string(), "No warnings".to_string()];
         step_add(
             &conn,
-            "my-plan",
-            &project,
-            "Build it",
-            None,
-            None,
-            None,
-            None,
-            None,
-            &criteria,
-            Some(5),
-            None,
-            None,
-            &[],
+            StepAddArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                title: "Build it",
+                description: None,
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &criteria,
+                max_retries: Some(5),
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
@@ -1193,52 +1257,65 @@ mod tests {
 
         plan_create(
             &conn,
-            "my-plan",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "my-plan",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         step_add(
             &conn,
-            "my-plan",
-            &project,
-            "First",
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            &[],
+            StepAddArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                title: "First",
+                description: None,
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         let criteria = vec!["Inserted check".to_string()];
+        // Insert "Inserted" so it depends on First (a new branch off step #1)
+        // and carries its own criteria + max_retries. (Replaces the old
+        // positional "insert after position 1".)
         step_add(
             &conn,
-            "my-plan",
-            &project,
-            "Inserted",
-            None,
-            Some(1),
-            None,
-            None,
-            None,
-            &criteria,
-            Some(2),
-            None,
-            None,
-            &[],
+            StepAddArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                title: "Inserted",
+                description: None,
+                after: Some("1"),
+                before: None,
+                root: false,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &criteria,
+                max_retries: Some(2),
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
@@ -1247,9 +1324,16 @@ mod tests {
             .unwrap()
             .unwrap();
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
-        assert_eq!(steps[1].title, "Inserted");
-        assert_eq!(steps[1].acceptance_criteria, criteria);
-        assert_eq!(steps[1].max_retries, Some(2));
+        let first = steps.iter().find(|s| s.title == "First").unwrap();
+        let inserted = steps.iter().find(|s| s.title == "Inserted").unwrap();
+        // The inserted step carries its own criteria/max_retries...
+        assert_eq!(inserted.acceptance_criteria, criteria);
+        assert_eq!(inserted.max_retries, Some(2));
+        // ...and is structurally placed as a dependent of First.
+        assert_eq!(
+            storage::list_step_dependencies(&conn, &inserted.id).unwrap(),
+            vec![first.id.clone()]
+        );
     }
 
     #[test]
@@ -1258,56 +1342,75 @@ mod tests {
 
         plan_create(
             &conn,
-            "my-plan",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "my-plan",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         step_add(
             &conn,
-            "my-plan",
-            &project,
-            "First",
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            &[],
+            StepAddArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                title: "First",
+                description: None,
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         step_add(
             &conn,
-            "my-plan",
-            &project,
-            "Second",
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            &[],
+            StepAddArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                title: "Second",
+                description: None,
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
 
-        step_remove(&conn, "my-plan", &project, Some(2), None, true, &test_out()).unwrap();
+        step_remove(
+            &conn,
+            "my-plan",
+            &project,
+            Some("2"),
+            None,
+            true,
+            &test_out(),
+        )
+        .unwrap();
 
         let plan = storage::get_plan_by_slug(&conn, "my-plan", &project)
             .unwrap()
@@ -1323,57 +1426,64 @@ mod tests {
 
         plan_create(
             &conn,
-            "my-plan",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "my-plan",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         step_add(
             &conn,
-            "my-plan",
-            &project,
-            "Old title",
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            &[],
+            StepAddArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                title: "Old title",
+                description: None,
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
 
         step_edit(
             &conn,
-            "my-plan",
-            &project,
-            Some(1),
-            None,
-            Some("New title"),
-            Some("New desc"),
-            None,
-            None,
-            None,
-            &[],
-            false,
-            None,
-            false,
-            None,
-            None,
-            false,
-            &[],
-            false,
+            StepEditArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                step_sel: Some("1"),
+                step_id: None,
+                title: Some("New title"),
+                description: Some("New desc"),
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                clear_criteria: false,
+                max_retries: None,
+                clear_max_retries: false,
+                change_policy: None,
+                review: None,
+                tags: &[],
+                clear_tags: false,
+            },
             &test_out(),
         )
         .unwrap();
@@ -1392,33 +1502,39 @@ mod tests {
 
         plan_create(
             &conn,
-            "my-plan",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "my-plan",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         step_add(
             &conn,
-            "my-plan",
-            &project,
-            "Step",
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            &[],
+            StepAddArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                title: "Step",
+                description: None,
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
@@ -1429,7 +1545,16 @@ mod tests {
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         storage::update_step_status(&conn, &steps[0].id, StepStatus::Failed).unwrap();
 
-        step_reset(&conn, "my-plan", &project, Some(1), None, true, &test_out()).unwrap();
+        step_reset(
+            &conn,
+            "my-plan",
+            &project,
+            Some("1"),
+            None,
+            true,
+            &test_out(),
+        )
+        .unwrap();
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         assert_eq!(steps[0].status, StepStatus::Pending);
@@ -1442,75 +1567,89 @@ mod tests {
 
         plan_create(
             &conn,
-            "my-plan",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "my-plan",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         step_add(
             &conn,
-            "my-plan",
-            &project,
-            "A",
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            &[],
+            StepAddArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                title: "A",
+                description: None,
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         step_add(
             &conn,
-            "my-plan",
-            &project,
-            "B",
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            &[],
+            StepAddArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                title: "B",
+                description: None,
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         step_add(
             &conn,
-            "my-plan",
-            &project,
-            "C",
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            &[],
+            StepAddArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                title: "C",
+                description: None,
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
 
         // Move step 3 (C) to position 1
-        step_move(&conn, "my-plan", &project, Some(3), None, 1, &test_out()).unwrap();
+        step_move(&conn, "my-plan", &project, Some("3"), None, 1, &test_out()).unwrap();
 
         let plan = storage::get_plan_by_slug(&conn, "my-plan", &project)
             .unwrap()
@@ -1527,75 +1666,89 @@ mod tests {
 
         plan_create(
             &conn,
-            "my-plan",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "my-plan",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         step_add(
             &conn,
-            "my-plan",
-            &project,
-            "A",
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            &[],
+            StepAddArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                title: "A",
+                description: None,
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         step_add(
             &conn,
-            "my-plan",
-            &project,
-            "B",
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            &[],
+            StepAddArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                title: "B",
+                description: None,
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         step_add(
             &conn,
-            "my-plan",
-            &project,
-            "C",
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            &[],
+            StepAddArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                title: "C",
+                description: None,
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
 
         // Move step 1 (A) to position 3
-        step_move(&conn, "my-plan", &project, Some(1), None, 3, &test_out()).unwrap();
+        step_move(&conn, "my-plan", &project, Some("1"), None, 3, &test_out()).unwrap();
 
         let plan = storage::get_plan_by_slug(&conn, "my-plan", &project)
             .unwrap()
@@ -1614,43 +1767,49 @@ mod tests {
 
         plan_create(
             &conn,
-            "plan-a",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "plan-a",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         plan_create(
             &conn,
-            "plan-b",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "plan-b",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         plan_create(
             &conn,
-            "plan-c",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &["plan-a".to_string(), "plan-b".to_string()],
+            PlanCreateArgs {
+                slug: "plan-c",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &["plan-a".to_string(), "plan-b".to_string()],
+            },
             &test_out(),
         )
         .unwrap();
@@ -1676,15 +1835,17 @@ mod tests {
 
         let result = plan_create(
             &conn,
-            "plan-x",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &["nonexistent".to_string()],
+            PlanCreateArgs {
+                slug: "plan-x",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &["nonexistent".to_string()],
+            },
             &test_out(),
         );
         assert!(result.is_err());
@@ -1700,29 +1861,33 @@ mod tests {
 
         plan_create(
             &conn,
-            "plan-a",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "plan-a",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         plan_create(
             &conn,
-            "plan-b",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "plan-b",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
@@ -1749,15 +1914,17 @@ mod tests {
 
         plan_create(
             &conn,
-            "plan-a",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "plan-a",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
@@ -1778,29 +1945,33 @@ mod tests {
 
         plan_create(
             &conn,
-            "plan-a",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "plan-a",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         plan_create(
             &conn,
-            "plan-b",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "plan-b",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
@@ -1831,29 +2002,33 @@ mod tests {
 
         plan_create(
             &conn,
-            "plan-a",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "plan-a",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         plan_create(
             &conn,
-            "plan-b",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &["plan-a".to_string()],
+            PlanCreateArgs {
+                slug: "plan-b",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &["plan-a".to_string()],
+            },
             &test_out(),
         )
         .unwrap();
@@ -1886,43 +2061,49 @@ mod tests {
 
         plan_create(
             &conn,
-            "plan-a",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "plan-a",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         plan_create(
             &conn,
-            "plan-b",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &["plan-a".to_string()],
+            PlanCreateArgs {
+                slug: "plan-b",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &["plan-a".to_string()],
+            },
             &test_out(),
         )
         .unwrap();
         plan_create(
             &conn,
-            "plan-c",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &["plan-a".to_string()],
+            PlanCreateArgs {
+                slug: "plan-c",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &["plan-a".to_string()],
+            },
             &test_out(),
         )
         .unwrap();
@@ -1941,44 +2122,117 @@ mod tests {
         plan_dependency_list(&conn, "plan-b", &project, &test_out()).unwrap();
     }
 
+    // -- step dependency add/remove/list (docs/dag-redesign.md §7) --
+
+    #[test]
+    fn test_step_dependency_add_remove_list_end_to_end() {
+        let (conn, project) = setup();
+        // `plan_with_steps` creates plan slug "sel" with `n` appended steps.
+        let (_plan_id, sids) = plan_with_steps(&conn, &project, 3);
+
+        // Add via a numeric selector (step 3) depending on a short_id
+        // selector (step 1) — both forms must resolve through resolve_step.
+        step_dependency_add(&conn, "sel", &project, "3", &[sids[0].clone()], &test_out()).unwrap();
+
+        let s3 = resolve_step(&conn, &_plan_id, Some(sids[2].as_str()), None)
+            .unwrap()
+            .0;
+        let s1 = resolve_step(&conn, &_plan_id, Some(sids[0].as_str()), None)
+            .unwrap()
+            .0;
+        assert_eq!(
+            storage::list_step_dependencies(&conn, &s3.id).unwrap(),
+            vec![s1.id.clone()]
+        );
+        // Reverse edge is visible from the dependency's side.
+        assert_eq!(
+            storage::list_step_dependents(&conn, &s1.id).unwrap(),
+            vec![s3.id.clone()]
+        );
+
+        // list runs without error in both human and JSON modes.
+        step_dependency_list(&conn, "sel", &project, "3", &test_out()).unwrap();
+        let mut json_out = test_out();
+        json_out.format = OutputFormat::Json;
+        step_dependency_list(&conn, "sel", &project, &sids[2], &json_out).unwrap();
+
+        // Self-edge is rejected by the storage layer.
+        assert!(
+            step_dependency_add(&conn, "sel", &project, "1", &["1".to_string()], &test_out())
+                .is_err()
+        );
+
+        // Remove drops the edge; a second remove is a harmless no-op.
+        step_dependency_remove(
+            &conn,
+            "sel",
+            &project,
+            &sids[2],
+            &[sids[0].clone()],
+            &test_out(),
+        )
+        .unwrap();
+        assert!(
+            storage::list_step_dependencies(&conn, &s3.id)
+                .unwrap()
+                .is_empty()
+        );
+        step_dependency_remove(&conn, "sel", &project, "3", &["1".to_string()], &test_out())
+            .unwrap();
+    }
+
     #[test]
     fn test_step_out_of_range() {
         let (conn, project) = setup();
 
         plan_create(
             &conn,
-            "my-plan",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "my-plan",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         step_add(
             &conn,
-            "my-plan",
-            &project,
-            "Step",
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            &[],
+            StepAddArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                title: "Step",
+                description: None,
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
 
-        let result = step_remove(&conn, "my-plan", &project, Some(5), None, true, &test_out());
+        let result = step_remove(
+            &conn,
+            "my-plan",
+            &project,
+            Some("5"),
+            None,
+            true,
+            &test_out(),
+        );
         assert!(result.is_err());
     }
 
@@ -2022,8 +2276,19 @@ mod tests {
     fn test_resolve_resume_plan_with_slug_uses_exact_lookup() {
         let (_tmp, dir, project, _branch) = git_repo_for_resume();
         let conn = db::open_memory().unwrap();
-        let plan =
-            storage::create_plan(&conn, "exact", &project, "any", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "exact",
+                project: &project,
+                branch_name: "any",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         storage::update_plan_status(&conn, &plan.id, PlanStatus::Failed).unwrap();
 
         let p = resolve_resume_plan(&conn, Some("exact".to_string()), &project, &dir).unwrap();
@@ -2034,8 +2299,19 @@ mod tests {
     fn test_resolve_resume_plan_no_slug_single_branch_match() {
         let (_tmp, dir, project, branch) = git_repo_for_resume();
         let conn = db::open_memory().unwrap();
-        let plan =
-            storage::create_plan(&conn, "only", &project, "x", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "only",
+                project: &project,
+                branch_name: "x",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         storage::update_plan_status(&conn, &plan.id, PlanStatus::Failed).unwrap();
         storage::set_plan_last_run_branch(&conn, &plan.id, &branch).unwrap();
 
@@ -2047,8 +2323,32 @@ mod tests {
     fn test_resolve_resume_plan_no_slug_picks_most_recent_when_ambiguous() {
         let (_tmp, dir, project, branch) = git_repo_for_resume();
         let conn = db::open_memory().unwrap();
-        let p1 = storage::create_plan(&conn, "older", &project, "x", "d", None, None, &[]).unwrap();
-        let p2 = storage::create_plan(&conn, "newer", &project, "x", "d", None, None, &[]).unwrap();
+        let p1 = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "older",
+                project: &project,
+                branch_name: "x",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let p2 = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "newer",
+                project: &project,
+                branch_name: "x",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         storage::update_plan_status(&conn, &p1.id, PlanStatus::Failed).unwrap();
         storage::update_plan_status(&conn, &p2.id, PlanStatus::Failed).unwrap();
         storage::set_plan_last_run_branch(&conn, &p1.id, &branch).unwrap();
@@ -2068,8 +2368,19 @@ mod tests {
         let conn = db::open_memory().unwrap();
         // A plan whose last_run_branch is some OTHER branch — must not
         // match by branch.
-        let other =
-            storage::create_plan(&conn, "elsewhere", &project, "x", "d", None, None, &[]).unwrap();
+        let other = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "elsewhere",
+                project: &project,
+                branch_name: "x",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         storage::update_plan_status(&conn, &other.id, PlanStatus::Failed).unwrap();
         let bogus_branch = format!("not-{branch}");
         storage::set_plan_last_run_branch(&conn, &other.id, &bogus_branch).unwrap();
@@ -2088,7 +2399,19 @@ mod tests {
     fn test_resolve_resume_plan_falls_back_to_aborted_plan_when_no_branch_match() {
         let (_tmp, dir, project, branch) = git_repo_for_resume();
         let conn = db::open_memory().unwrap();
-        let p = storage::create_plan(&conn, "ab", &project, "x", "d", None, None, &[]).unwrap();
+        let p = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "ab",
+                project: &project,
+                branch_name: "x",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         storage::update_plan_status(&conn, &p.id, PlanStatus::Aborted).unwrap();
         // Last run executed on a branch that is NOT the current one, so
         // the branch-based resolver finds nothing.
@@ -2127,8 +2450,19 @@ mod tests {
 
         // Plan A: slug='deploy', branch_name='deploy'. Last run on
         // 'old-master' (some branch that is NOT the current one).
-        let a = storage::create_plan(&conn, "deploy", &project, "deploy", "d", None, None, &[])
-            .unwrap();
+        let a = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "deploy",
+                project: &project,
+                branch_name: "deploy",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         storage::update_plan_status(&conn, &a.id, PlanStatus::Failed).unwrap();
         let unrelated = format!("unrelated-{current_branch}");
         storage::set_plan_last_run_branch(&conn, &a.id, &unrelated).unwrap();
@@ -2172,13 +2506,15 @@ mod tests {
         // last_run_branch stays NULL.
         let p = storage::create_plan(
             &conn,
-            "fresh",
-            &project,
-            &current_branch,
-            "d",
-            None,
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "fresh",
+                project: &project,
+                branch_name: &current_branch,
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         storage::update_plan_status(&conn, &p.id, PlanStatus::Ready).unwrap();
@@ -2189,5 +2525,163 @@ mod tests {
 
         let resolved = resolve_resume_plan(&conn, None, &project, &dir).unwrap();
         assert_eq!(resolved.slug, "fresh");
+    }
+
+    // -- resolve_step: numeric vs short_id selector (docs/dag-redesign.md §7) --
+
+    /// Build a plan with `n` appended steps titled `Step {i}` (0-based).
+    /// Returns `(plan_id, short_ids_in_order)`.
+    fn plan_with_steps(conn: &Connection, project: &str, n: usize) -> (String, Vec<String>) {
+        let plan = storage::create_plan(
+            conn,
+            crate::storage::NewPlan {
+                slug: "sel",
+                project,
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let mut sids = Vec::with_capacity(n);
+        for i in 0..n {
+            let (s, _) = storage::create_step(
+                conn,
+                &plan.id,
+                crate::storage::NewStep {
+                    title: &format!("Step {i}"),
+                    description: "",
+                    agent: None,
+                    harness: None,
+                    acceptance_criteria: &[],
+                    max_retries: None,
+                    model: None,
+                    change_policy: None,
+                    tags: None,
+                },
+            )
+            .unwrap();
+            sids.push(s.short_id);
+        }
+        (plan.id, sids)
+    }
+
+    #[test]
+    fn test_resolve_step_numeric_selector_still_works() {
+        let (conn, project) = setup();
+        let (plan_id, _sids) = plan_with_steps(&conn, &project, 3);
+
+        let (step, pos) = resolve_step(&conn, &plan_id, Some("2"), None).unwrap();
+        assert_eq!(pos, 2);
+        // Titles are 0-based: position 2 is "Step 1".
+        assert_eq!(step.title, "Step 1");
+    }
+
+    #[test]
+    fn test_resolve_step_short_id_resolves_same_step_as_number() {
+        let (conn, project) = setup();
+        let (plan_id, sids) = plan_with_steps(&conn, &project, 3);
+
+        // The 2nd step's short_id must resolve to exactly the same step and
+        // display position as the numeric selector "2".
+        let by_num = resolve_step(&conn, &plan_id, Some("2"), None).unwrap();
+        let by_sid = resolve_step(&conn, &plan_id, Some(sids[1].as_str()), None).unwrap();
+        assert_eq!(by_num.0.id, by_sid.0.id, "both forms resolve the same step");
+        assert_eq!(by_num.1, by_sid.1, "both forms report the same position");
+        assert_eq!(by_sid.0.short_id, sids[1]);
+    }
+
+    #[test]
+    fn test_resolve_step_ambiguous_looking_but_numeric() {
+        let (conn, project) = setup();
+        let (plan_id, _sids) = plan_with_steps(&conn, &project, 3);
+
+        // "00000001" is short_id-SHAPED (8 base-62 chars) but no step owns
+        // it, so it falls through to the numeric branch and resolves step 1
+        // — byte-identical to passing "1".
+        let shaped = resolve_step(&conn, &plan_id, Some("00000001"), None).unwrap();
+        let plain = resolve_step(&conn, &plan_id, Some("1"), None).unwrap();
+        assert_eq!(shaped.0.id, plain.0.id);
+        assert_eq!(shaped.1, 1);
+
+        // A short numeric like "3" is never short-id-shaped → numeric.
+        let (s3, p3) = resolve_step(&conn, &plan_id, Some("3"), None).unwrap();
+        assert_eq!(p3, 3);
+        assert_eq!(s3.title, "Step 2");
+    }
+
+    #[test]
+    fn test_resolve_step_unknown_short_id_errors_cleanly() {
+        let (conn, project) = setup();
+        let (plan_id, _sids) = plan_with_steps(&conn, &project, 2);
+
+        // 8-char base-62 token matching no short_id and not numeric: a
+        // clean, actionable error — never a panic or silent fallback.
+        let err = resolve_step(&conn, &plan_id, Some("zzzzABCD"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Invalid step selector") && err.contains("zzzzABCD"),
+            "unknown short id must error cleanly, got: {err}"
+        );
+
+        // Out-of-range numeric still yields the historical range error.
+        let oor = resolve_step(&conn, &plan_id, Some("9"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(oor.contains("out of range"), "got: {oor}");
+    }
+
+    #[test]
+    fn test_resolve_step_short_id_scoped_to_plan() {
+        // A short_id is plan-unique, not global: plan-A's short_id must
+        // never resolve to plan-A's step when used against plan B. (It
+        // either errors as a non-numeric token or, in the astronomically
+        // unlikely all-digit case, resolves a *plan-B* position — never
+        // crossing the plan boundary.)
+        let (conn, project) = setup();
+        let (_plan_a, a_sids) = plan_with_steps(&conn, &project, 1);
+        let a_step = resolve_step(&conn, &_plan_a, Some(a_sids[0].as_str()), None)
+            .unwrap()
+            .0;
+        let plan_b = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "other",
+                project: &project,
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        storage::create_step(
+            &conn,
+            &plan_b.id,
+            crate::storage::NewStep {
+                title: "B0",
+                description: "",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+
+        match resolve_step(&conn, &plan_b.id, Some(a_sids[0].as_str()), None) {
+            Err(_) => {} // non-numeric token → clean error (the common case).
+            Ok((step, _)) => assert_ne!(
+                step.id, a_step.id,
+                "plan-A short id must never resolve to plan-A's step in plan B"
+            ),
+        }
     }
 }

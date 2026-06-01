@@ -44,10 +44,6 @@ pub enum PaletteCommand {
     PlanDelete(String),
     /// `/plan approve [<slug>]`.
     PlanApprove(Option<String>),
-    /// `/plan questions on [<slug>]`.
-    PlanQuestionsOn(Option<String>),
-    /// `/plan questions off [<slug>]`.
-    PlanQuestionsOff(Option<String>),
     /// `/plan dependency add` — routes to the plan-dependency sub-view.
     PlanDependencyAdd,
     /// `/plan dependency remove` — routes to the plan-dependency sub-view.
@@ -87,6 +83,13 @@ pub enum PaletteCommand {
     Quit,
     /// `/help`.
     Help,
+    /// `/inbox` — open the cross-branch interruptions inbox
+    /// (docs/dag-redesign.md §12.3).
+    Inbox,
+    /// `/focus <short_id>` — re-root the plan-detail outline on a step's
+    /// downstream-dependents cone (docs/dag-redesign.md §12.2). `None`
+    /// focuses the cursor's step; `Some(id)` focuses an explicit short id.
+    Focus(Option<String>),
 }
 
 impl PaletteCommand {
@@ -102,8 +105,6 @@ impl PaletteCommand {
             PaletteCommand::PlanUnarchive(_) => "/plan unarchive",
             PaletteCommand::PlanDelete(_) => "/plan delete",
             PaletteCommand::PlanApprove(_) => "/plan approve",
-            PaletteCommand::PlanQuestionsOn(_) => "/plan questions on",
-            PaletteCommand::PlanQuestionsOff(_) => "/plan questions off",
             PaletteCommand::PlanDependencyAdd => "/plan dependency add",
             PaletteCommand::PlanDependencyRemove => "/plan dependency remove",
             PaletteCommand::PlanDependencyList => "/plan dependency list",
@@ -121,6 +122,8 @@ impl PaletteCommand {
             PaletteCommand::Import(_) => "/import",
             PaletteCommand::Quit => "/quit",
             PaletteCommand::Help => "/help",
+            PaletteCommand::Inbox => "/inbox",
+            PaletteCommand::Focus(_) => "/focus",
         }
     }
 }
@@ -202,16 +205,6 @@ pub fn parse(input: &str) -> Result<PaletteCommand, ParseError> {
         // /plan approve [<slug>]
         ["plan", "approve"] => Ok(PaletteCommand::PlanApprove(None)),
         ["plan", "approve", slug] => Ok(PaletteCommand::PlanApprove(Some((*slug).to_string()))),
-
-        // /plan questions on|off [<slug>]
-        ["plan", "questions", "on"] => Ok(PaletteCommand::PlanQuestionsOn(None)),
-        ["plan", "questions", "on", slug] => {
-            Ok(PaletteCommand::PlanQuestionsOn(Some((*slug).to_string())))
-        }
-        ["plan", "questions", "off"] => Ok(PaletteCommand::PlanQuestionsOff(None)),
-        ["plan", "questions", "off", slug] => {
-            Ok(PaletteCommand::PlanQuestionsOff(Some((*slug).to_string())))
-        }
 
         // /plan dependency add|remove|list
         ["plan", "dependency", "add"] => Ok(PaletteCommand::PlanDependencyAdd),
@@ -298,6 +291,13 @@ pub fn parse(input: &str) -> Result<PaletteCommand, ParseError> {
         // /help
         ["help"] => Ok(PaletteCommand::Help),
 
+        // /inbox — cross-branch interruptions inbox (§12.3)
+        ["inbox"] => Ok(PaletteCommand::Inbox),
+
+        // /focus [<short_id>] — re-root the outline (§12.2)
+        ["focus"] => Ok(PaletteCommand::Focus(None)),
+        ["focus", short_id] => Ok(PaletteCommand::Focus(Some((*short_id).to_string()))),
+
         _ => Err(ParseError::Unknown(body.to_string())),
     }
 }
@@ -369,14 +369,6 @@ const VERB_SPECS: &[VerbSpec] = &[
         arg: ArgSource::PlanSlug,
     },
     VerbSpec {
-        tokens: &["plan", "questions", "on"],
-        arg: ArgSource::PlanSlug,
-    },
-    VerbSpec {
-        tokens: &["plan", "questions", "off"],
-        arg: ArgSource::PlanSlug,
-    },
-    VerbSpec {
         tokens: &["plan", "dependency", "add"],
         arg: ArgSource::None,
     },
@@ -442,6 +434,14 @@ const VERB_SPECS: &[VerbSpec] = &[
     },
     VerbSpec {
         tokens: &["help"],
+        arg: ArgSource::None,
+    },
+    VerbSpec {
+        tokens: &["inbox"],
+        arg: ArgSource::None,
+    },
+    VerbSpec {
+        tokens: &["focus"],
         arg: ArgSource::None,
     },
 ];
@@ -942,18 +942,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_plan_questions_on_off() {
-        assert_eq!(
-            parse("/plan questions on"),
-            Ok(PaletteCommand::PlanQuestionsOn(None))
-        );
-        assert_eq!(
-            parse("/plan questions off p"),
-            Ok(PaletteCommand::PlanQuestionsOff(Some("p".to_string())))
-        );
-    }
-
-    #[test]
     fn parses_plan_dependency_subcommands() {
         assert_eq!(
             parse("/plan dependency add"),
@@ -1054,6 +1042,23 @@ mod tests {
         assert_eq!(parse("/quit"), Ok(PaletteCommand::Quit));
         assert_eq!(parse("/q"), Ok(PaletteCommand::Quit));
         assert_eq!(parse("/help"), Ok(PaletteCommand::Help));
+    }
+
+    #[test]
+    fn parses_inbox_and_focus() {
+        // docs/dag-redesign.md §12.3 / §12.2 palette wiring. The `:` prefix
+        // key is consumed by the palette bar before `parse`, so the parser
+        // only ever sees the slash-or-bare form (mirrors every other verb).
+        assert_eq!(parse("/inbox"), Ok(PaletteCommand::Inbox));
+        assert_eq!(parse("inbox"), Ok(PaletteCommand::Inbox));
+        assert_eq!(parse("/focus"), Ok(PaletteCommand::Focus(None)));
+        assert_eq!(
+            parse("/focus c9d4a1b2"),
+            Ok(PaletteCommand::Focus(Some("c9d4a1b2".to_string())))
+        );
+        // Labels for the help/toast surfaces.
+        assert_eq!(PaletteCommand::Inbox.label(), "/inbox");
+        assert_eq!(PaletteCommand::Focus(None).label(), "/focus");
     }
 
     #[test]
@@ -1233,11 +1238,11 @@ mod tests {
 
     #[test]
     fn completion_prefers_longer_verb_match() {
-        // "/plan questions on " should complete plan slugs (the deeper
-        // verb) — NOT cycle through verbs starting with "plan questions".
-        let c = build_completion("/plan questions on ", &ctx(&[], &["alpha", "beta"], &[]))
+        // "/plan approve " should complete plan slugs (the matched verb's
+        // PlanSlug arg) — NOT cycle through verbs starting with "plan".
+        let c = build_completion("/plan approve ", &ctx(&[], &["alpha", "beta"], &[]))
             .expect("candidates");
-        assert_eq!(c.stem, "/plan questions on ");
+        assert_eq!(c.stem, "/plan approve ");
         assert_eq!(c.candidates.len(), 2);
     }
 
@@ -1435,8 +1440,6 @@ mod tests {
             PaletteCommand::PlanUnarchive(String::new()),
             PaletteCommand::PlanDelete(String::new()),
             PaletteCommand::PlanApprove(None),
-            PaletteCommand::PlanQuestionsOn(None),
-            PaletteCommand::PlanQuestionsOff(None),
             PaletteCommand::PlanDependencyAdd,
             PaletteCommand::PlanDependencyRemove,
             PaletteCommand::PlanDependencyList,

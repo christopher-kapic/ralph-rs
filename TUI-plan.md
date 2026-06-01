@@ -1,7 +1,42 @@
 # ralph-rs Interactive TUI — Design Plan
 
-Status: design draft, not yet implemented. This document captures the target UX
-for ralph's full interactive mode and the related changes to the
+> **⚠️ Historical design draft — superseded in part. Not the authoritative
+> reference.** This document was written *before* implementation and has
+> since been overtaken by two changes:
+>
+> 1. **The prompt overhaul** — replaced the per-plan
+>    `context_prepend` / global+project prefix-suffix model with the
+>    four-layer Global→Project→Plan→Step model (§11/§8 here are stale).
+> 2. **The DAG redesign** (`docs/dag-redesign.md`) — a plan is now a
+>    **dependency DAG**, not a flat step list. The plan-detail view
+>    renders a topological **outline** (not the flat step list described
+>    in §7); the per-plan opt-in question system (§17) was superseded by
+>    the unified **interruptions** model (questions + blockers, one
+>    table, a cross-branch **inbox** view reachable via `I`); and the
+>    flat "Deterministic Execution Planner" framing is reframed as
+>    **deterministic dependencies & validation, dynamic scheduling,
+>    optional nondeterministic review** (per-step determinism and the
+>    deterministic `(topological depth, sort_key, short_id)` scheduling
+>    tie-break are *retained*; dynamic scheduling and first-class
+>    nondeterministic review are *added*; the wall-clock interleave of
+>    concurrently-running reviews is explicitly **not** part of the
+>    reproducibility guarantee — `docs/dag-redesign.md` §11/§14.4).
+>
+> The narrative prose touched by these changes has been reconciled with
+> banners/notes where it would otherwise mislead. The **older keybinding
+> tables and ASCII mock-ups in this document are deliberately retained as
+> historical design notes** — they capture the original intent and are
+> *not* kept in lockstep with the shipped bindings (e.g. the inbox is
+> `I`, not the `i` some tables imply, because lowercase `i` is a
+> pre-existing create binding; focus is `z`/`Z`). For the project's
+> current, authoritative state see **`CLAUDE.md`** (overall) and
+> **`docs/dag-redesign.md`** (the DAG model, interruptions, the built-in
+> review pipeline, the scheduler, and the outline/inbox TUI).
+
+---
+
+Status (original): design draft, not yet implemented. This document captures
+the target UX for ralph's full interactive mode and the related changes to the
 non-interactive `ralph run` surface. The existing TUI in `src/tui/` is
 single-plan and step-list-only; this plan supersedes it.
 
@@ -282,6 +317,17 @@ This cannot be undone. [y/N]`.
 ---
 
 ## 7. View 3 — Plan detail (step list)
+
+> **Reconciled (DAG redesign):** plan-detail no longer renders a *flat*
+> step list. It renders a topologically-ordered **DAG outline** (depth
+> indent; a join step lists its dependencies inline as `deps: …` by
+> 8-char `short_id`; reviewer-inserted steps marked `↳ corrects
+> <short_id>`; `Blocked` is a derived overlay). `z` focuses the
+> downstream-dependents cone of a step, `Z`/`Esc` pops back; focus is a
+> pure view transform. The cross-branch interruptions **inbox** is
+> reachable via `I`. The ASCII mock and keybinding table below are the
+> original flat-list design, kept as a historical note — see
+> `docs/dag-redesign.md` §12 and `CLAUDE.md` for the shipped outline.
 
 Entered via `enter` on a plan tile, or by `ralph run`.
 
@@ -798,6 +844,20 @@ TUI refactor. See the plan steps for the contractual order.
 ---
 
 ## 17. Question state (per-plan, opt-in)
+
+> **Superseded (DAG redesign).** The standalone per-plan question system
+> described in this section was generalized into the unified
+> **interruptions** model: questions *and* blockers are one entity, one
+> table (`interruptions`, migration V26 — supersedes `step_questions`),
+> one state machine, with a cross-branch **inbox** TUI view (`View::Inbox`,
+> reachable via `I`) and two CLI verbs (`ralph question ask --priority` /
+> `ralph block`, resolved via `ralph interruption list/show/resolve`).
+> `PlanStatus::Question` became the broader derived `Interrupted`; a
+> step's `Blocked` is a derived overlay. The `step_questions` storage,
+> the migration version, and the keybindings below are the original
+> design and are retained as a historical note — see
+> `docs/dag-redesign.md` §3.4/§7/§12.3 and `CLAUDE.md` for the shipped
+> interruptions model.
 
 Resolution of the original Q2: questions are a **per-plan opt-in feature**
 that lets the harness pause execution and ask the user for clarification.

@@ -5,6 +5,7 @@
 // managing plan-level status transitions.
 
 use std::collections::{HashMap, HashSet};
+use std::io::{IsTerminal, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -30,12 +31,12 @@ use crate::storage;
 // ---------------------------------------------------------------------------
 
 /// Options controlling a plan run.
+///
+/// Note: the `--all` (run-all-plans) decision is made by the caller, which
+/// dispatches directly to [`run_all_plans`]; there is intentionally no
+/// `all_plans` field here (it would be write-only).
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
 pub struct RunOptions {
-    /// Run all plans in dependency order, chaining branches between plans.
-    /// Plan slug is ignored when set.
-    pub all_plans: bool,
     /// Run only the next pending step instead of all remaining steps.
     pub one: bool,
     /// Start from a specific step number (1-based).
@@ -52,6 +53,13 @@ pub struct RunOptions {
     pub auto_stash: bool,
     /// Override the harness for this run.
     pub harness_override: Option<String>,
+    /// Optional short_id of the resume target step (populated by
+    /// `resume_plan` from `find_resume_point` + steps list). When present,
+    /// `stash_if_dirty` uses it with `git::has_crash_residue_overlap_for_step`
+    /// (via `iteration_commits_for_step` on the plan branch) for the
+    /// conservative crash-residue detection before offering the medium
+    /// interactive reconcile UX.
+    pub resume_target_short_id: Option<String>,
     /// Dry-run mode: print what would happen without executing.
     pub dry_run: bool,
     /// Print the full per-attempt prompt to stderr instead of the
@@ -113,6 +121,10 @@ pub async fn run_plan(
     // here is definitively orphaned. Skip in dry-run mode (it mutates state).
     if !options.dry_run {
         sweep_and_log_stale_in_progress(conn, &effective_plan, out)?;
+        // Best-effort: reap review worktrees stranded by a force-quit/SIGKILL
+        // of a prior run (RAII Drop is skipped on exit(130)/SIGKILL). Acts
+        // only on >6h-old dirs, so it is safe under a concurrent run.
+        crate::git::sweep_stale_review_worktrees(workdir);
     }
 
     // 2. Stash dirty tree + (optionally) create branch.
@@ -138,7 +150,16 @@ pub async fn run_plan(
                 .await
                 .context("Failed to get current git branch")?
         };
-        let stashed = stash_if_dirty(workdir, &effective_plan.slug, options.auto_stash).await?;
+        let stashed = stash_if_dirty(
+            workdir,
+            &effective_plan.slug,
+            Some(&effective_plan.branch_name),
+            options.resume_target_short_id.as_deref(),
+            Some(conn),
+            Some(&effective_plan.id),
+            options.auto_stash,
+        )
+        .await?;
         // Record source_branch + stash_sha on the run_lock row so resume /
         // diagnostics can see what we'll try to restore. Best-effort — if
         // the row isn't there (tests), swallow the error.
@@ -215,6 +236,55 @@ struct TeardownState {
     stashed: Option<StashedState>,
 }
 
+/// Read-only context shared by the scheduler loop helpers (`scheduler_tick`,
+/// `drain_remaining_reviews`, `finalize_plan_run`). These are the immutable
+/// borrows the original `run_plan_inner` body closed over; bundling them keeps
+/// the extracted helper signatures readable without changing any borrow.
+struct SchedulerCtx<'a> {
+    conn: &'a Connection,
+    effective_plan: &'a Plan,
+    config: &'a Config,
+    workdir: &'a Path,
+    options: &'a RunOptions,
+    out: &'a OutputContext,
+    window: &'a RunWindow,
+    hook_ctx: &'a HookContext,
+    impl_slot: &'a Arc<tokio::sync::Semaphore>,
+    chunk_seq: &'a Arc<AtomicU64>,
+    one_target_id: &'a Option<String>,
+}
+
+/// Mutable scheduler state threaded through the loop and the post-loop drain.
+/// Each field is exactly the corresponding `mut` local from the original
+/// `run_plan_inner`; the helpers mutate them in place so control flow and DB
+/// writes stay byte-identical.
+struct SchedulerState {
+    known_step_ids: HashSet<String>,
+    executed_step_ids: HashSet<String>,
+    reviews: tokio::task::JoinSet<crate::review::SpawnedReview>,
+    review_respawns: HashMap<String, u32>,
+    last_review_error: HashMap<String, String>,
+    abort_rx: watch::Receiver<CancelState>,
+}
+
+/// How one scheduler-loop iteration ended. Each variant maps 1:1 to a control
+/// path in the original inline loop body:
+///   * `Continue` — the loop's `continue` (normal tick / parked branch /
+///     already-done step / blocked-after-failure / paused).
+///   * `Break`    — the loop's `break` (empty runnable set, `--one` target
+///     reached / moved, or the captured `--one` target completed).
+///   * `Return`   — an inline `return Ok(result)` (abort, pause, review-drain
+///     terminal status, step Failed/Timeout). `result` is mutated in place via
+///     the `&mut PlanRunResult` the tick receives, so the caller returns it by
+///     value on this signal.
+///
+/// Errors propagate via `?` exactly as before.
+enum TickOutcome {
+    Continue,
+    Break,
+    Return,
+}
+
 async fn run_plan_inner(
     conn: &Connection,
     effective_plan: &Plan,
@@ -239,9 +309,8 @@ async fn run_plan_inner(
     // translate them to sort_key bounds so later filtering tolerates inserts.
     let window = resolve_window(&initial_steps, options)?;
 
-    // Snapshot of currently-actionable steps in the window. Used to capture
-    // the `--one` target (earliest actionable step) before we start mutating
-    // state. If the window contains NO steps at all (e.g. a bogus
+    // Steps that fall inside the run window. Used to bail early when the
+    // window is empty. If the window contains NO steps at all (e.g. a bogus
     // `--from`/`--to` range), bail — but if the window contains steps that
     // just happen to all be Complete/Skipped, fall through and let the final
     // status computation report Complete. That mirrors the pre-fix behavior
@@ -253,11 +322,6 @@ async fn run_plan_inner(
     if window_steps.is_empty() {
         bail!("No pending steps to run in plan '{}'", effective_plan.slug);
     }
-    let initial_actionable: Vec<Step> = window_steps
-        .iter()
-        .filter(|s| is_actionable(s.status))
-        .map(|s| (*s).clone())
-        .collect();
 
     // Dry-run mode: just print what would happen.
     if options.dry_run {
@@ -331,8 +395,8 @@ async fn run_plan_inner(
         step_results: Vec::new(),
     };
 
-    let mut known_step_ids: HashSet<String> = initial_steps.iter().map(|s| s.id.clone()).collect();
-    let mut executed_step_ids: HashSet<String> = HashSet::new();
+    let known_step_ids: HashSet<String> = initial_steps.iter().map(|s| s.id.clone()).collect();
+    let executed_step_ids: HashSet<String> = HashSet::new();
 
     // Monotonic per-run counter for `HarnessChunk` / `TestChunk` event
     // `seq` fields. Created once here so the same `Arc<AtomicU64>` is
@@ -341,14 +405,87 @@ async fn run_plan_inner(
     // TUI-plan §13.1.
     let chunk_seq: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
+    // ONE implementation slot (docs/dag-redesign.md §9 invariant 1 / §3.5
+    // item 2). A `Semaphore` with exactly **1** permit guards the
+    // implement+test+commit phase: at most one step may be in that phase at
+    // a time — this *is* "implementation steps don't run in parallel". The
+    // loop is already serial, so under no review this changes no behavior
+    // (a linear plan is byte-identical); the explicit semaphore makes the
+    // invariant a structural, test-observable guarantee and is what the
+    // read-only review is deliberately allowed to run *outside* of (it
+    // never acquires this permit — §9-inv-2 / §3.5 item 3), so the
+    // scheduler is free to pick the next *unrelated* implementation while a
+    // review is outstanding. A step's *direct dependents* are still gated
+    // (they require the reviewed step `Complete`, which only happens after
+    // the review returns — §3.1/§3.3), so concurrency never starts work on
+    // un-reviewed output.
+    let impl_slot = Arc::new(tokio::sync::Semaphore::new(1));
+
+    // Mutable scheduler state threaded through the loop and post-loop drain.
+    //
+    // `reviews`: In-flight read-only reviews (docs/dag-redesign.md §3.5 item
+    // 3 / §9). Each entry is a DETACHED `tokio::spawn`ed
+    // `run_review_subprocess` future — `Send`, holds NO `rusqlite::Connection`
+    // and NO implementation permit — so it runs CONCURRENTLY with whatever the
+    // scheduler picks next. The orchestrator (this loop = the SOLE DB writer,
+    // §9-inv-3) drains finished tasks at every scheduler tick via
+    // `drain_finished_reviews`, where ALL DB / git-note side effects happen
+    // serialized. A linear / no-review plan never spawns into this set (the
+    // executor returns `needs_review: None`), so `reviews.is_empty()` is
+    // always true on that path and the loop is byte-identical to before.
+    //
+    // `review_respawns`: Per-run, per-step count of how many times the
+    // scheduler has (re-)spawned a step's review. A committed-but-unreviewed
+    // step whose review state is lost — a hard crash mid-review (recovered by
+    // the stale sweep, which now KEEPS such a step `InProgress` and resets
+    // `review_status` to `Pending`), or a transient reviewer error (the drain
+    // resets it to `Pending`) — is recovered by RE-RUNNING ONLY THE REVIEW
+    // against the durable committed SHA, never by re-implementing the step.
+    // `respawn_pending_reviews` retries up to `MAX_REVIEW_RESPAWNS` times and
+    // then escalates to a needs-human blocker, so a persistently-broken
+    // reviewer can't loop forever. In-memory (not durable): a fresh process /
+    // a human-resolved escalation grants a fresh budget, which is exactly the
+    // desired recovery semantics.
+    //
+    // `last_review_error`: The most recent reviewer-subprocess error per step
+    // (e.g. "review harness auth failed: 401", a timeout, or the
+    // read-only-invariant tripping). Captured by `drain_finished_reviews` when
+    // a review task errors and surfaced in the needs-human escalation blocker
+    // raised by `respawn_pending_reviews` after `MAX_REVIEW_RESPAWNS`, so the
+    // human triaging the blocker can see *why* the review keeps failing instead
+    // of a generic "could not run". In-memory like `review_respawns`: advisory
+    // diagnostic context, not durable state.
+    let mut state = SchedulerState {
+        known_step_ids,
+        executed_step_ids,
+        reviews: tokio::task::JoinSet::new(),
+        review_respawns: HashMap::new(),
+        last_review_error: HashMap::new(),
+        abort_rx,
+    };
+
     // For `--one`, we need to stop after the first step actually executed;
-    // capture its ID at the start (the earliest actionable step in the
-    // window) and exit after it completes. Positions can shift due to
-    // inserts, but the ID is stable. If `--one` is requested but nothing
-    // is actionable, bail — mirrors the pre-fix behavior of `select_steps`
-    // returning an empty slice in that case.
+    // capture its ID at the start (the step the topological scheduler would
+    // pick first) and exit after it completes. Positions can shift due to
+    // inserts, but the ID is stable. If `--one` is requested but nothing is
+    // runnable, bail — mirrors the pre-fix behavior of `select_steps`
+    // returning an empty slice in that case. Computing the target via
+    // `pick_next_step` (not `initial_actionable.first()`) makes `--one`
+    // honor dependencies under the DAG: a step whose prerequisite is not
+    // yet `Complete` is not the first pick even if it has the lowest
+    // sort_key. With no edges this is identical to the old behavior.
     let one_target_id: Option<String> = if options.one {
-        match initial_actionable.first() {
+        let deps_of = storage::list_step_dependency_edges(conn, &effective_plan.id)?;
+        let depths = compute_step_depths(&initial_steps, &deps_of);
+        let blocked = blocked_step_ids(conn, &effective_plan.id)?;
+        match pick_next_step(
+            &initial_steps,
+            &deps_of,
+            &depths,
+            &window,
+            &HashSet::new(),
+            &blocked,
+        ) {
             Some(s) => Some(s.id.clone()),
             None => bail!("No pending steps to run in plan '{}'", effective_plan.slug),
         }
@@ -356,293 +493,775 @@ async fn run_plan_inner(
         None
     };
 
+    let ctx = SchedulerCtx {
+        conn,
+        effective_plan: &effective_plan,
+        config,
+        workdir,
+        options,
+        out,
+        window: &window,
+        hook_ctx: &hook_ctx,
+        impl_slot: &impl_slot,
+        chunk_seq: &chunk_seq,
+        one_target_id: &one_target_id,
+    };
+
+    // Drive the topological scheduler. Each `scheduler_tick` runs exactly one
+    // iteration of the original inline loop and reports how it ended:
+    // `Continue` re-ticks, `Break` exits to the post-loop drain, `Return`
+    // short-circuits the whole run (abort / pause / step Failed/Timeout /
+    // review-drain terminal status). Errors propagate via `?`.
     loop {
-        // Check the cancel signal between steps. Only `Aborted` (Ctrl+C)
-        // terminates the whole run here; a `Skipped` reason only ever
-        // targets the in-flight step (consumed inside the executor) and
-        // must NOT end the run — fall through and pick the next step.
-        if matches!(
-            *abort_rx.borrow(),
-            Some(crate::signal::CancelReason::Aborted)
-        ) {
-            eprintln!("Aborted");
-            storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Aborted)?;
-            result.final_status = PlanStatus::Aborted;
-            return Ok(result);
+        match scheduler_tick(&ctx, &mut state, &mut result).await? {
+            TickOutcome::Continue => {}
+            TickOutcome::Break => break,
+            TickOutcome::Return => return Ok(result),
         }
+    }
 
-        // Check the operator's graceful-pause flag between steps. The read +
-        // clear is atomic so a subsequent `ralph resume` doesn't immediately
-        // re-pause. We leave `plans.status` as-is (InProgress) — pause is a
-        // transient runner-control signal, not a status transition — so
-        // resume's normal "find earliest non-complete step" path Just Works.
-        if storage::take_plan_pause_requested(conn, &effective_plan.id)? {
-            if out.format == OutputFormat::Json {
-                output::emit_ndjson(&RunEvent::PausedByUser {
-                    plan_slug: effective_plan.slug.clone(),
-                })?;
-            } else {
-                eprintln!(
-                    "> Paused by user request after {} step(s). Use `ralph resume` to continue.",
-                    result.steps_executed,
-                );
-            }
-            result.final_status = PlanStatus::InProgress;
-            return Ok(result);
-        }
+    // Post-loop review drain. If it returns a terminal status, short-circuit.
+    if drain_remaining_reviews(&ctx, &mut state, &mut result).await? {
+        return Ok(result);
+    }
+    debug_assert!(
+        state.reviews.is_empty(),
+        "the plan must not be finalized with a review still in flight (§3.3)"
+    );
 
-        // Re-fetch the step list. This is the core of the mid-run-insert fix.
-        let all_steps = storage::list_steps(conn, &effective_plan.id)?;
+    finalize_plan_run(&ctx, result)
+}
 
-        // Detect and report new inserts.
-        let new_inserts: Vec<Step> = all_steps
-            .iter()
-            .filter(|s| !known_step_ids.contains(&s.id))
-            .filter(|s| window.contains_key(&s.sort_key))
-            .cloned()
-            .collect();
-        if !new_inserts.is_empty() {
-            report_plan_grew(&new_inserts, &all_steps, out)?;
-        }
-        for s in &all_steps {
-            known_step_ids.insert(s.id.clone());
-        }
+/// One iteration of the topological scheduler loop (the body of
+/// `run_plan_inner`'s `loop`). Returns a [`TickOutcome`] describing how the
+/// iteration ended so the caller's `loop` can `continue` / `break` / `return`
+/// with byte-identical control flow to the original inline body.
+async fn scheduler_tick(
+    ctx: &SchedulerCtx<'_>,
+    state: &mut SchedulerState,
+    result: &mut PlanRunResult,
+) -> Result<TickOutcome> {
+    let SchedulerCtx {
+        conn,
+        effective_plan,
+        config,
+        workdir,
+        options,
+        out,
+        window,
+        hook_ctx,
+        impl_slot,
+        chunk_seq,
+        one_target_id,
+    } = *ctx;
 
-        let total_now = all_steps.len();
+    // Check the cancel signal between steps. Only `Aborted` (Ctrl+C)
+    // terminates the whole run here; a `Skipped` reason only ever
+    // targets the in-flight step (consumed inside the executor) and
+    // must NOT end the run — fall through and pick the next step.
+    if matches!(
+        *state.abort_rx.borrow(),
+        Some(crate::signal::CancelReason::Aborted)
+    ) {
+        // Best-effort drain of any review verdicts that already
+        // completed before the abort latched, then `shutdown()` the
+        // still-in-flight ones so `kill_on_drop` fires on each review
+        // child. Without this, a review whose subprocess finished but
+        // whose verdict hasn't been drained would be silently dropped:
+        //   * no `update_step_review_status` write,
+        //   * no git-note annotation,
+        //   * no V29 corrective-step request row,
+        // leaving the reviewed step `review_status=InFlight`. The next
+        // run's stale-InProgress sweep would then re-implement the
+        // step and re-run the reviewer (burning tokens), and a Fail
+        // verdict that lost its bridge row would silently skip the
+        // §10 corrective step entirely — the §9-inv-2 violation the
+        // pipeline guards against.
+        drain_reviews_on_abort(
+            conn,
+            effective_plan,
+            &mut state.reviews,
+            workdir,
+            out,
+            &mut state.abort_rx,
+        )
+        .await;
+        eprintln!("Aborted");
+        storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Aborted)?;
+        result.final_status = PlanStatus::Aborted;
+        return Ok(TickOutcome::Return);
+    }
 
-        // Find the next step to execute in the window: first actionable step
-        // whose ID we haven't already executed in this invocation.
-        let next = all_steps
-            .iter()
-            .find(|s| {
-                window.contains_key(&s.sort_key)
-                    && is_actionable(s.status)
-                    && !executed_step_ids.contains(&s.id)
-            })
-            .cloned();
-
-        let current_step = match next {
-            Some(s) => s,
-            None => break, // no more actionable steps in the window
-        };
-
-        // `--one`: once we've executed the captured target, stop. We also
-        // refuse to pivot to a later step if the original target has moved
-        // out of the actionable set (e.g. it was skipped out-of-band).
-        if let Some(ref target) = one_target_id
-            && current_step.id != *target
-        {
-            break;
-        }
-
-        // Skip already-completed or skipped steps that happen to fall in
-        // the window but weren't filtered out above (defensive: the
-        // is_actionable filter already excludes these).
-        if current_step.status == StepStatus::Complete || current_step.status == StepStatus::Skipped
-        {
-            if current_step.status == StepStatus::Skipped {
-                result.steps_skipped += 1;
-            }
-            executed_step_ids.insert(current_step.id.clone());
-            continue;
-        }
-
-        // Print progress header / emit step_started event.
-        let step_num = step_number_in_plan(&all_steps, &current_step);
+    // Check the operator's graceful-pause flag between steps. The read +
+    // clear is atomic so a subsequent `ralph resume` doesn't immediately
+    // re-pause. We leave `plans.status` as-is (InProgress) — pause is a
+    // transient runner-control signal, not a status transition — so
+    // resume's normal "find earliest non-complete step" path Just Works.
+    if storage::take_plan_pause_requested(conn, &effective_plan.id)? {
         if out.format == OutputFormat::Json {
-            output::emit_ndjson(&RunEvent::StepStarted {
+            output::emit_ndjson(&RunEvent::PausedByUser {
+                plan_slug: effective_plan.slug.clone(),
+            })?;
+        } else {
+            eprintln!(
+                "> Paused by user request after {} step(s). Use `ralph resume` to continue.",
+                result.steps_executed,
+            );
+        }
+        result.final_status = PlanStatus::InProgress;
+        return Ok(TickOutcome::Return);
+    }
+
+    // Drain any stranded corrective-step requests BEFORE the scheduler
+    // picks its next step. This closes the restart window where a crash
+    // after a failed review but before request consumption would otherwise
+    // let the resumed run re-execute the reviewed step instead of first
+    // materializing its already-requested corrective step.
+    consume_open_corrective_requests(conn, effective_plan, out)?;
+
+    // Re-fetch the step list. This is the core of the mid-run-insert fix.
+    let all_steps = storage::list_steps(conn, &effective_plan.id)?;
+
+    // Detect and report new inserts.
+    let new_inserts: Vec<Step> = all_steps
+        .iter()
+        .filter(|s| !state.known_step_ids.contains(&s.id))
+        .filter(|s| window.contains_key(&s.sort_key))
+        .cloned()
+        .collect();
+    if !new_inserts.is_empty() {
+        report_plan_grew(&new_inserts, &all_steps, out)?;
+    }
+    for s in &all_steps {
+        state.known_step_ids.insert(s.id.clone());
+    }
+
+    let total_now = all_steps.len();
+
+    // Topological scheduler tick (docs/dag-redesign.md §3.5). Re-read
+    // the dependency edges every iteration so a step inserted mid-run
+    // with `--depends-on` is scheduled correctly. `pick_next_step`
+    // returns the runnable step with the smallest
+    // `(topological depth, sort_key, short_id)`; with no edges every
+    // depth is 0 and this is exactly the old "first actionable step by
+    // sort_key" behavior.
+    let deps_of = storage::list_step_dependency_edges(conn, &effective_plan.id)?;
+    let depths = compute_step_depths(&all_steps, &deps_of);
+    // Recompute the blocked set every tick: a cross-process resolution
+    // (§9 invariant 4) drops a step out of it here, re-queuing the step
+    // on the very next iteration with the resolution injected (the
+    // injection is already done by prompt.rs via the bounded
+    // resolved-interruption section). An empty set ⇒ pre-interruption
+    // behavior, so a linear plan is byte-identical.
+    let blocked = blocked_step_ids(conn, &effective_plan.id)?;
+
+    // Recover/retry reviews for committed steps whose review is pending
+    // but not in flight — a crash mid-review or a transient reviewer
+    // error. This re-runs ONLY the review against the durable committed
+    // SHA; it never re-implements the step. The returned `under_review`
+    // set (every committed step whose review is pending or in flight) is
+    // unioned into the pick exclusion so the scheduler does not re-pick a
+    // committed step for re-implementation while its review is
+    // outstanding (mirrors how a freshly-reviewed step is excluded during
+    // a live run). Empty for any linear / no-review plan, so that path is
+    // byte-identical to before.
+    let under_review = respawn_pending_reviews(
+        conn,
+        &mut state.reviews,
+        RespawnReviews {
+            plan: effective_plan,
+            all_steps: &all_steps,
+            window,
+            blocked: &blocked,
+            review_respawns: &mut state.review_respawns,
+            last_review_error: &state.last_review_error,
+            config,
+            workdir,
+        },
+        out,
+    )?;
+    // Steps excluded from this tick's pick: blocked (open interruption) or
+    // committed-and-awaiting-review. `chain` yields `blocked` verbatim when
+    // `under_review` is empty — i.e. byte-identical to the linear/no-review
+    // path — so no special-case branch is needed.
+    let not_runnable: HashSet<String> =
+        blocked.iter().chain(under_review.iter()).cloned().collect();
+    let next = pick_next_step(
+        &all_steps,
+        &deps_of,
+        &depths,
+        window,
+        &state.executed_step_ids,
+        &not_runnable,
+    )
+    .cloned();
+
+    let current_step = match next {
+        Some(s) => s,
+        None => {
+            // Nothing is runnable *right now*. If a read-only review is
+            // still in flight, the runnable set is not final: when that
+            // review returns, the orchestrator either promotes the
+            // reviewed step to `Complete` (un-gating its dependents) or
+            // inserts a corrective step `A′` (a fresh runnable step) —
+            // either of which re-populates the runnable set. So instead
+            // of declaring the plan done, BLOCK on the next finished
+            // review, drain it (sole DB writer), then loop and re-tick.
+            // This is what makes the plan not complete with a review
+            // still pending/undrained (§3.3). With no in-flight reviews
+            // (the linear / no-review path always) this is an immediate
+            // `break`, byte-identical to before.
+            if state.reviews.is_empty() {
+                return Ok(TickOutcome::Break);
+            }
+            if let Some(fs) = drain_finished_reviews(
+                conn,
+                &mut state.reviews,
+                DrainReviews {
+                    plan: effective_plan,
+                    workdir,
+                    block: true, // wait for at least one review to finish
+                    abort_rx: &mut state.abort_rx,
+                    last_review_error: &mut state.last_review_error,
+                },
+                out,
+            )
+            .await?
+            {
+                result.final_status = fs;
+                return Ok(TickOutcome::Return);
+            }
+            return Ok(TickOutcome::Continue);
+        }
+    };
+
+    // `--one`: once we've executed the captured target, stop. We also
+    // refuse to pivot to a later step if the original target has moved
+    // out of the actionable set (e.g. it was skipped out-of-band).
+    if let Some(target) = one_target_id
+        && current_step.id != *target
+    {
+        return Ok(TickOutcome::Break);
+    }
+
+    // Skip already-completed or skipped steps that happen to fall in
+    // the window but weren't filtered out above (defensive: the
+    // is_actionable filter already excludes these).
+    if current_step.status == StepStatus::Complete || current_step.status == StepStatus::Skipped {
+        if current_step.status == StepStatus::Skipped {
+            result.steps_skipped += 1;
+        }
+        state.executed_step_ids.insert(current_step.id.clone());
+        return Ok(TickOutcome::Continue);
+    }
+
+    // Cluster 3 Fix #2: per-step granularity on parked-restore failure.
+    // A NotFound (admin `git stash clear`) or Conflicted apply used to
+    // bail the whole run via `?`, killing every other branch in the
+    // DAG. The new outcome raises a blocker on JUST this step and
+    // skips it; the scheduler then picks another runnable branch on
+    // the next tick (the blocker's open interruption shadows the step
+    // via the derived `Blocked` overlay, so `pick_next_step` excludes
+    // it).
+    let resumed_parked_worktree =
+        match restore_parked_step_worktree(conn, &current_step, workdir, out).await? {
+            RestoreParkedOutcome::Resumed => true,
+            RestoreParkedOutcome::NotParked => false,
+            RestoreParkedOutcome::BlockedAfterFailure => {
+                // Mark as "seen this tick" so the immediate re-pick
+                // doesn't return the same step (defense-in-depth — the
+                // blocked-set query below will also exclude it once the
+                // open interruption is visible, but the in-tick
+                // bookkeeping makes the skip immediate and explicit).
+                state.executed_step_ids.insert(current_step.id.clone());
+                return Ok(TickOutcome::Continue);
+            }
+        };
+    if resumed_parked_worktree && out.format != OutputFormat::Json {
+        eprintln!(
+            "> Restored parked worktree for step {} '{}' before re-running.",
+            current_step.short_id, current_step.title
+        );
+    }
+
+    // Print progress header / emit step_started event.
+    let step_num = step_number_in_plan(&all_steps, &current_step);
+    if out.format == OutputFormat::Json {
+        output::emit_ndjson(&RunEvent::StepStarted {
+            step_id: current_step.id.clone(),
+            step_title: current_step.title.clone(),
+            step_num,
+            step_total: total_now,
+        })?;
+    } else {
+        // Resolve the step-level harness label (hooks into the executor's
+        // per-attempt sub-header below). Per-step override falls back to
+        // the plan-level harness, then to config default.
+        let (harness_name, harness_config) =
+            harness::resolve_harness(&current_step, effective_plan, config)?;
+        let harness_label = output::format_harness_label_with_override(
+            harness_name,
+            harness_config.color.as_deref(),
+            out.color,
+        );
+        eprintln!(
+            "[{}/{}] > Step {} \"{}\" ({})",
+            step_num, total_now, step_num, current_step.title, harness_label
+        );
+    }
+
+    let started = Instant::now();
+
+    // Mark this step in-flight for the duration of `execute_step` so a
+    // same-process `ralph skip` (CLI or TUI) routes through the cancel
+    // ladder instead of just flipping the DB status. The guard clears
+    // the flag on drop — covering the `?`-early-return path too.
+    let _in_flight = crate::signal::StepInFlightGuard::enter();
+
+    // Acquire the single implementation slot (§9-inv-1 / §3.5 item 2).
+    // Held ONLY for implement+test+commit; explicitly released before any
+    // read-only review so a review never occupies the implementation
+    // slot (§9-inv-2). `acquire_owned` cannot fail here — the semaphore
+    // is never closed — but we surface it rather than `unwrap` to keep
+    // the runner panic-free.
+    let impl_permit = impl_slot
+        .clone()
+        .acquire_owned()
+        .await
+        .context("implementation semaphore closed unexpectedly")?;
+
+    // Execute the step.
+    let step_result = executor::execute_step(executor::ExecuteStepArgs {
+        conn,
+        plan: effective_plan,
+        step: &current_step,
+        config,
+        workdir,
+        hook_ctx,
+        abort_rx: state.abort_rx.clone(),
+        exec_opts: executor::ExecuteOptions {
+            verbose: options.verbose,
+            step_num_in_plan: step_num,
+            step_total: total_now,
+            json_output: out.format == OutputFormat::Json,
+            color: out.color,
+            chunk_seq: Some(chunk_seq.clone()),
+            chunk_max_bytes: config.harness_chunk_max_bytes,
+            resumed_parked_worktree,
+        },
+    })
+    .await?;
+    drop(_in_flight);
+
+    // Fix #4: widen the `run_locks.step_id` window between consecutive
+    // steps to be honest about the gap. `update_live_phase` uses
+    // COALESCE on the per-step fields, so absent this call
+    // `run_locks.step_id` would still name the *previous* step until
+    // the next step's first `write_phase` fires. An orphan subprocess
+    // from the prior step calling `ralph question ask` during that
+    // window would bind the question to the wrong step (already
+    // Complete). `bind_live_run_to_plan` widens the same row to "no
+    // live step" on a cross-plan rebind; this is the within-plan
+    // equivalent.
+    storage::clear_live_run_step(conn, &effective_plan.project)?;
+
+    // Release the implementation slot BEFORE any review (§9-inv-2 /
+    // §3.5 item 3): a read-only review must never hold the
+    // implementation permit, so the scheduler is free to take it for the
+    // next *unrelated* implementation while this step's review is
+    // outstanding. Direct dependents of `current_step` are NOT in the
+    // runnable set yet — `execute_step` left a review-gated step
+    // `InProgress` (not `Complete`), and `deps_satisfied` requires
+    // `Complete` — so concurrency never starts work on un-reviewed
+    // output.
+    drop(impl_permit);
+
+    // Built-in review pipeline (docs/dag-redesign.md §3.2-§3.3 / §3.5
+    // item 3 / §9 / §10). When the step's success carries `needs_review`,
+    // the executor deliberately left it `InProgress` with
+    // `review_status = Pending`. We DO NOT review inline — that would
+    // serialize the scheduler behind the reviewer and defeat the entire
+    // §2-Decision-3 / §3.5-item-3 promise that *unrelated branches run
+    // concurrently with a review*. Instead we:
+    //
+    //  1. mark the step `review_status = InFlight` and emit
+    //     `ReviewStarted` HERE (the orchestrator is the SOLE DB writer —
+    //     §9-inv-3 — so this status write must NOT happen in the task);
+    //  2. `tokio::spawn` the read-only `run_review_subprocess` future
+    //     (it is `Send`, holds NO `Connection` and NO impl permit, and
+    //     runs `git show <fixed sha>` only — §9-inv-2) into the
+    //     `reviews` JoinSet;
+    //  3. CONTINUE the scheduler loop. The impl permit is already
+    //     dropped, so the next *unrelated* runnable step implements
+    //     concurrently with this outstanding review. `current_step`'s
+    //     direct dependents stay non-runnable (it is `InProgress`, not
+    //     `Complete`; `deps_satisfied` requires `Complete`), so
+    //     concurrency never starts work on un-reviewed output.
+    //
+    // The orchestrator drains finished reviews at every tick via
+    // `drain_finished_reviews` (below) — the ONLY place
+    // `review_status` Passed/Failed, the git-note verdict, the V29
+    // bridge row, and the §10 insert + re-parent are written, all
+    // serialized on this single loop. A linear / no-review plan never
+    // sets `needs_review`, so nothing is ever spawned and behavior is
+    // byte-identical to before.
+    if let StepResult {
+        outcome: StepOutcome::Success,
+        needs_review: Some((ref commit_sha, iteration)),
+        ..
+    } = step_result
+    {
+        spawn_step_review(
+            conn,
+            &mut state.reviews,
+            ReviewSpawn {
+                plan: effective_plan,
+                step: &current_step,
+                config,
+                workdir,
+                commit_sha: commit_sha.clone(),
+                iteration,
+                step_num,
+            },
+            out,
+        )?;
+    }
+
+    // Drain any reviews that finished while this step implemented
+    // (non-blocking). This is the SOLE DAG-writer point for review
+    // verdicts (§9-inv-3): finalize verdict + git-note, promote a passed
+    // step to `Complete`, and consume corrective requests (§10). A review
+    // *error* (reviewer failed to execute) raises a recoverable blocker
+    // and the run continues; only a task *panic* returns `Some(Failed)`.
+    if let Some(fs) = drain_finished_reviews(
+        conn,
+        &mut state.reviews,
+        DrainReviews {
+            plan: effective_plan,
+            workdir,
+            block: false,
+            abort_rx: &mut state.abort_rx,
+            last_review_error: &mut state.last_review_error,
+        },
+        out,
+    )
+    .await?
+    {
+        result.final_status = fs;
+        result.step_results.push(step_result);
+        return Ok(TickOutcome::Return);
+    }
+
+    let elapsed = started.elapsed();
+    result.steps_executed += 1;
+    state.executed_step_ids.insert(current_step.id.clone());
+
+    // Print result / emit step_finished event.
+    let outcome_str = match step_result.outcome {
+        StepOutcome::Success => "success",
+        StepOutcome::Failed => "failed",
+        StepOutcome::Aborted => "aborted",
+        StepOutcome::Skipped => "skipped",
+        StepOutcome::Timeout => "timeout",
+        StepOutcome::PausedForQuestion => "paused_for_question",
+    };
+
+    let emit_finished = |outcome: &str| -> Result<()> {
+        if out.format == OutputFormat::Json {
+            output::emit_ndjson(&RunEvent::StepFinished {
                 step_id: current_step.id.clone(),
                 step_title: current_step.title.clone(),
                 step_num,
                 step_total: total_now,
+                outcome: outcome.to_string(),
+                attempts: step_result.attempts_used,
+                duration_secs: elapsed.as_secs_f64(),
             })?;
-        } else {
-            // Resolve the step-level harness label (hooks into the executor's
-            // per-attempt sub-header below). Per-step override falls back to
-            // the plan-level harness, then to config default.
-            let (harness_name, harness_config) =
-                harness::resolve_harness(&current_step, &effective_plan, config)?;
-            let harness_label = output::format_harness_label_with_override(
-                harness_name,
-                harness_config.color.as_deref(),
-                out.color,
-            );
-            eprintln!(
-                "[{}/{}] > Step {} \"{}\" ({})",
-                step_num, total_now, step_num, current_step.title, harness_label
-            );
         }
+        Ok(())
+    };
 
-        let started = Instant::now();
-
-        // Mark this step in-flight for the duration of `execute_step` so a
-        // same-process `ralph skip` (CLI or TUI) routes through the cancel
-        // ladder instead of just flipping the DB status. The guard clears
-        // the flag on drop — covering the `?`-early-return path too.
-        let _in_flight = crate::signal::StepInFlightGuard::enter();
-
-        // Execute the step.
-        let step_result = executor::execute_step(
-            conn,
-            &effective_plan,
-            &current_step,
-            config,
-            workdir,
-            &hook_ctx,
-            abort_rx.clone(),
-            executor::ExecuteOptions {
-                verbose: options.verbose,
-                step_num_in_plan: step_num,
-                step_total: total_now,
-                json_output: out.format == OutputFormat::Json,
-                color: out.color,
-                chunk_seq: Some(chunk_seq.clone()),
-                chunk_max_bytes: config.harness_chunk_max_bytes,
-            },
-        )
-        .await?;
-        drop(_in_flight);
-
-        let elapsed = started.elapsed();
-        result.steps_executed += 1;
-        executed_step_ids.insert(current_step.id.clone());
-
-        // Print result / emit step_finished event.
-        let outcome_str = match step_result.outcome {
-            StepOutcome::Success => "success",
-            StepOutcome::Failed => "failed",
-            StepOutcome::Aborted => "aborted",
-            StepOutcome::Skipped => "skipped",
-            StepOutcome::Timeout => "timeout",
-            StepOutcome::PausedForQuestion => "paused_for_question",
-        };
-
-        let emit_finished = |outcome: &str| -> Result<()> {
-            if out.format == OutputFormat::Json {
-                output::emit_ndjson(&RunEvent::StepFinished {
-                    step_id: current_step.id.clone(),
-                    step_title: current_step.title.clone(),
+    match step_result.outcome {
+        StepOutcome::Success => {
+            result.steps_succeeded += 1;
+            emit_finished(outcome_str)?;
+            if out.format != OutputFormat::Json {
+                eprintln!(
+                    "[{}/{}] > {} ... OK ({:.0}s)",
                     step_num,
-                    step_total: total_now,
-                    outcome: outcome.to_string(),
-                    attempts: step_result.attempts_used,
-                    duration_secs: elapsed.as_secs_f64(),
-                })?;
-            }
-            Ok(())
-        };
-
-        match step_result.outcome {
-            StepOutcome::Success => {
-                result.steps_succeeded += 1;
-                emit_finished(outcome_str)?;
-                if out.format != OutputFormat::Json {
-                    eprintln!(
-                        "[{}/{}] > {} ... OK ({:.0}s)",
-                        step_num,
-                        total_now,
-                        current_step.title,
-                        elapsed.as_secs_f64()
-                    );
-                }
-            }
-            StepOutcome::Failed => {
-                result.steps_failed += 1;
-                emit_finished(outcome_str)?;
-                if out.format != OutputFormat::Json {
-                    eprintln!(
-                        "[{}/{}] > {} ... FAILED (after {} attempts, {:.0}s)",
-                        step_num,
-                        total_now,
-                        current_step.title,
-                        step_result.attempts_used,
-                        elapsed.as_secs_f64()
-                    );
-                }
-                // Mark plan as failed and stop.
-                storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Failed)?;
-                result.final_status = PlanStatus::Failed;
-                result.step_results.push(step_result);
-                return Ok(result);
-            }
-            StepOutcome::Aborted => {
-                emit_finished(outcome_str)?;
-                if out.format != OutputFormat::Json {
-                    eprintln!(
-                        "[{}/{}] > {} ... ABORTED",
-                        step_num, total_now, current_step.title
-                    );
-                }
-                storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Aborted)?;
-                result.final_status = PlanStatus::Aborted;
-                result.step_results.push(step_result);
-                return Ok(result);
-            }
-            StepOutcome::Skipped => {
-                // `ralph skip` killed the in-flight harness for THIS step
-                // only. Unlike Aborted, the run does NOT end — count the
-                // skip and fall through so the loop advances to the next
-                // actionable step.
-                result.steps_skipped += 1;
-                emit_finished(outcome_str)?;
-                if out.format != OutputFormat::Json {
-                    eprintln!(
-                        "[{}/{}] > {} ... SKIPPED",
-                        step_num, total_now, current_step.title
-                    );
-                }
-            }
-            StepOutcome::Timeout => {
-                result.steps_failed += 1;
-                emit_finished(outcome_str)?;
-                if out.format != OutputFormat::Json {
-                    eprintln!(
-                        "[{}/{}] > {} ... TIMEOUT",
-                        step_num, total_now, current_step.title
-                    );
-                }
-                storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Failed)?;
-                result.final_status = PlanStatus::Failed;
-                result.step_results.push(step_result);
-                return Ok(result);
-            }
-            StepOutcome::PausedForQuestion => {
-                emit_finished(outcome_str)?;
-                if out.format != OutputFormat::Json {
-                    eprintln!(
-                        "[{}/{}] > {} ... PAUSED (open question — answer to resume)",
-                        step_num, total_now, current_step.title
-                    );
-                }
-                // Don't write `Question` to plans.status — it's a *derived*
-                // status (TUI-plan.md §17). Leave the underlying lifecycle
-                // (`in_progress`) alone so it un-shadows automatically once
-                // the user answers. The PlanRunResult reports the derived
-                // state for the caller's benefit.
-                result.final_status = PlanStatus::Question;
-                result.step_results.push(step_result);
-                return Ok(result);
+                    total_now,
+                    current_step.title,
+                    elapsed.as_secs_f64()
+                );
             }
         }
-
-        result.step_results.push(step_result);
-
-        // `--one`: stop after executing the captured target.
-        if one_target_id.is_some() {
-            break;
+        StepOutcome::Failed => {
+            result.steps_failed += 1;
+            emit_finished(outcome_str)?;
+            if out.format != OutputFormat::Json {
+                eprintln!(
+                    "[{}/{}] > {} ... FAILED (after {} attempts, {:.0}s)",
+                    step_num,
+                    total_now,
+                    current_step.title,
+                    step_result.attempts_used,
+                    elapsed.as_secs_f64()
+                );
+            }
+            // Mark plan as failed and stop.
+            storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Failed)?;
+            result.final_status = PlanStatus::Failed;
+            result.step_results.push(step_result);
+            return Ok(TickOutcome::Return);
+        }
+        StepOutcome::Aborted => {
+            emit_finished(outcome_str)?;
+            if out.format != OutputFormat::Json {
+                eprintln!(
+                    "[{}/{}] > {} ... ABORTED",
+                    step_num, total_now, current_step.title
+                );
+            }
+            // Mirror the top-of-loop abort handler: best-effort drain of
+            // any review verdicts that already completed before this abort
+            // latched, then `shutdown()` the still-in-flight ones. Without
+            // this, a review whose subprocess finished but whose verdict
+            // hasn't been drained would be silently dropped (no
+            // `update_step_review_status` write, no git-note annotation, no
+            // V29 corrective-step request row), leaving the reviewed step
+            // `review_status=InFlight`. This arm fires when the executor
+            // observes the abort *inside* a step, so it can leave undrained
+            // reviews just like the between-steps check does.
+            drain_reviews_on_abort(
+                conn,
+                effective_plan,
+                &mut state.reviews,
+                workdir,
+                out,
+                &mut state.abort_rx,
+            )
+            .await;
+            storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Aborted)?;
+            result.final_status = PlanStatus::Aborted;
+            result.step_results.push(step_result);
+            return Ok(TickOutcome::Return);
+        }
+        StepOutcome::Skipped => {
+            // `ralph skip` killed the in-flight harness for THIS step
+            // only. Unlike Aborted, the run does NOT end — count the
+            // skip and fall through so the loop advances to the next
+            // actionable step.
+            result.steps_skipped += 1;
+            emit_finished(outcome_str)?;
+            if out.format != OutputFormat::Json {
+                eprintln!(
+                    "[{}/{}] > {} ... SKIPPED",
+                    step_num, total_now, current_step.title
+                );
+            }
+        }
+        StepOutcome::Timeout => {
+            result.steps_failed += 1;
+            emit_finished(outcome_str)?;
+            if out.format != OutputFormat::Json {
+                eprintln!(
+                    "[{}/{}] > {} ... TIMEOUT",
+                    step_num, total_now, current_step.title
+                );
+            }
+            storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Failed)?;
+            result.final_status = PlanStatus::Failed;
+            result.step_results.push(step_result);
+            return Ok(TickOutcome::Return);
+        }
+        StepOutcome::PausedForQuestion => {
+            emit_finished(outcome_str)?;
+            if out.format != OutputFormat::Json {
+                eprintln!(
+                    "[{}/{}] > {} ... BLOCKED (open interruption — resolve to resume)",
+                    step_num, total_now, current_step.title
+                );
+            }
+            // DAG scheduler change (docs/dag-redesign.md §1/§3.4/§3.5):
+            // a blocked branch must NOT pause the whole plan. While the
+            // interruption is open the step is in the recomputed
+            // `blocked` set, so the next scheduler tick excludes it and
+            // picks another runnable branch instead of stalling — the §1
+            // payoff. We do NOT `return` here and do NOT write
+            // `Interrupted` to plans.status (it's a *derived* status).
+            // The plan only reports `Interrupted` once the runnable set
+            // is exhausted (handled after the loop), so a *linear* plan —
+            // whose one blocked step starves all dependents — still
+            // pauses exactly as before (§1: linear plans get zero benefit
+            // and must not regress).
+            //
+            // Crucially, a paused step must NOT stay in
+            // `state.executed_step_ids`: that set permanently excludes a step
+            // from `pick_next_step` for the rest of this run, so leaving
+            // it there means a *same-run* resolution (a human answers
+            // while the loop keeps ticking on another branch — the exact
+            // §1 scenario, or the §9-invariant-4 cross-process bridge)
+            // would drop the step out of `blocked` but it would still
+            // never be re-picked until a fresh `ralph resume` process.
+            // Drop it back out so the next tick after the interruption is
+            // resolved re-queues it (the resolution is injected by
+            // prompt.rs via the bounded resolved-interruption section);
+            // while the interruption stays open `blocked` keeps it
+            // excluded, so this does not busy-spin.
+            state.executed_step_ids.remove(&current_step.id);
+            // Undo the unconditional `steps_executed += 1` above: this step
+            // did not complete an execution — it parked and will be
+            // re-picked (and re-counted) once the interruption is resolved.
+            // Without this, a step that pauses then succeeds is counted
+            // twice in the summary / "paused after N steps" totals. Mirrors
+            // the `state.executed_step_ids.remove` directly above.
+            result.steps_executed = result.steps_executed.saturating_sub(1);
+            result.step_results.push(step_result);
+            return Ok(TickOutcome::Continue);
         }
     }
 
-    // All steps completed successfully.
-    // Check if *all* steps in the plan are done (not just the subset we ran).
+    result.step_results.push(step_result);
+
+    // `--one`: stop after executing the captured target.
+    if one_target_id.is_some() {
+        return Ok(TickOutcome::Break);
+    }
+
+    Ok(TickOutcome::Continue)
+}
+
+/// Post-loop review drain (`run_plan_inner`'s `while !reviews.is_empty()`
+/// block). Returns `true` if a terminal status was reached (review-drain panic
+/// verdict, or an abort latched while parked on a reviewer) — `final_status` is
+/// written into `result` in that case and the caller returns it; `false` lets
+/// the caller proceed to finalization.
+async fn drain_remaining_reviews(
+    ctx: &SchedulerCtx<'_>,
+    state: &mut SchedulerState,
+    result: &mut PlanRunResult,
+) -> Result<bool> {
+    let SchedulerCtx {
+        conn,
+        effective_plan,
+        workdir,
+        out,
+        ..
+    } = *ctx;
+
+    // The scheduler loop exited because the runnable set is empty. Three
+    // terminal shapes (docs/dag-redesign.md §3.4/§3.5):
+    //
+    //  1. Every step Complete/Skipped         → plan Complete.
+    //  2. Some step has an open interruption   → plan Interrupted (derived;
+    //     never written to plans.status — it un-shadows automatically when
+    //     the human resolves the last open interruption, possibly from a
+    //     different process via the §9-invariant-4 bridge). For a *linear*
+    //     plan this is reached exactly when its one blocked step starves
+    //     all dependents — i.e. it still pauses the whole plan just like
+    //     before (§1: no regression). For a *wide* DAG it is reached only
+    //     after every independent branch has run to a stop (the payoff).
+    //  3. Otherwise (e.g. `--from/--to` window, a Failed step)
+    //     → InProgress, exactly as before.
+    //
+    // The loop only reaches here once the runnable set is empty AND every
+    // in-flight review has been drained (the `None`-branch blocks on
+    // `drain_finished_reviews` and re-ticks while `!state.reviews.is_empty()`, so
+    // a corrective step a failed review inserts is itself picked up before
+    // the loop can exit). Therefore a plan is never declared `Complete`
+    // with a review pending or undrained (docs/dag-redesign.md §3.3). The
+    // ONE exception is `--one` (it `break`s after its single target): drain
+    // that step's outstanding review here so its status is finalized before
+    // we compute terminal status / return.
+    while !state.reviews.is_empty() {
+        if let Some(fs) = drain_finished_reviews(
+            conn,
+            &mut state.reviews,
+            DrainReviews {
+                plan: effective_plan,
+                workdir,
+                block: true,
+                abort_rx: &mut state.abort_rx,
+                last_review_error: &mut state.last_review_error,
+            },
+            out,
+        )
+        .await?
+        {
+            result.final_status = fs;
+            return Ok(true);
+        }
+        // If the abort signal latched while we were parked on a reviewer,
+        // `drain_finished_reviews` returns `Ok(None)` early. Route through
+        // the same teardown path the in-loop Aborted branch uses: best-
+        // effort drain finished verdicts, then `shutdown()` the rest so
+        // `kill_on_drop` fires on each review child. This keeps the
+        // §3.3-no-in-flight-review invariant satisfied even on Ctrl+C.
+        if matches!(
+            *state.abort_rx.borrow(),
+            Some(crate::signal::CancelReason::Aborted)
+        ) {
+            drain_reviews_on_abort(
+                conn,
+                effective_plan,
+                &mut state.reviews,
+                workdir,
+                out,
+                &mut state.abort_rx,
+            )
+            .await;
+            eprintln!("Aborted");
+            storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Aborted)?;
+            result.final_status = PlanStatus::Aborted;
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Final status reconciliation (`run_plan_inner`'s post-drain tail). Computes
+/// the terminal `PlanStatus` from the durable step states + open
+/// interruptions, writes it (Complete only), and emits the `PlanComplete`
+/// NDJSON event. `result` is moved in and returned with `final_status` set.
+fn finalize_plan_run(ctx: &SchedulerCtx<'_>, mut result: PlanRunResult) -> Result<PlanRunResult> {
+    let SchedulerCtx {
+        conn,
+        effective_plan,
+        out,
+        ..
+    } = *ctx;
+
     let final_steps = storage::list_steps(conn, &effective_plan.id)?;
     let all_done = final_steps
         .iter()
         .all(|s| s.status == StepStatus::Complete || s.status == StepStatus::Skipped);
+    let any_open_interruption =
+        !storage::list_open_interruptions_for_plan(conn, &effective_plan.id)?.is_empty();
+
+    // Invariant: a plan can only be `all_done` (every step Complete/Skipped)
+    // with NO open interruption. A Complete step can't carry an open
+    // interruption (the scheduler parks a derived-`Blocked` step before it
+    // reaches Complete), and skipping a step now resolves its open
+    // interruptions (`storage::mark_step_skipped` /
+    // `resolve_open_interruptions_for_step`) — closing the prior hole where
+    // `ralph skip` on a derived-`Blocked` step left an unresolved
+    // interruption behind a `Complete` plan. The `all_done` arm is kept
+    // first deliberately: a fully Complete/Skipped plan must reach
+    // `Complete`, and preferring `Interrupted` here would instead strand it
+    // forever on a stale interruption the operator already moved past. The
+    // assert catches any future path that reintroduces the inconsistency.
+    debug_assert!(
+        !(all_done && any_open_interruption),
+        "plan {} finalized all-done with an open interruption — a skip path \
+     failed to resolve it (see resolve_open_interruptions_for_step)",
+        effective_plan.slug
+    );
 
     if all_done {
         storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Complete)?;
         result.final_status = PlanStatus::Complete;
+    } else if any_open_interruption {
+        result.final_status = PlanStatus::Interrupted;
     } else {
         result.final_status = PlanStatus::InProgress;
     }
@@ -773,9 +1392,10 @@ fn compute_branch_plan(
 /// If `options.current_branch` is true, the orchestrator stays on the
 /// current branch for every plan and does not set up any branches itself.
 ///
-/// Plans in `Planning`, `Complete`, `Aborted`, or `Archived` state are
-/// skipped (only `Ready`, `InProgress`, and `Failed` are considered
-/// runnable).
+/// Plans in `Planning`, `Complete`, or `Archived` state are skipped (only
+/// `Ready`, `InProgress`, `Failed`, and `Aborted` are considered runnable;
+/// an aborted plan is resumable and must stay in-scope so downstream
+/// dependencies never run as if it were absent).
 pub async fn run_all_plans(
     conn: &Connection,
     project: &str,
@@ -792,7 +1412,10 @@ pub async fn run_all_plans(
         .filter(|p| {
             matches!(
                 p.status,
-                PlanStatus::Ready | PlanStatus::InProgress | PlanStatus::Failed
+                PlanStatus::Ready
+                    | PlanStatus::InProgress
+                    | PlanStatus::Failed
+                    | PlanStatus::Aborted
             )
         })
         .collect();
@@ -821,7 +1444,8 @@ pub async fn run_all_plans(
                 .await
                 .context("Failed to get current git branch")?
         };
-        let stashed = stash_if_dirty(workdir, "all", options.auto_stash).await?;
+        let stashed =
+            stash_if_dirty(workdir, "all", None, None, None, None, options.auto_stash).await?;
         let _ = run_lock::record_source_branch_and_stash(
             conn,
             project,
@@ -847,15 +1471,17 @@ pub async fn run_all_plans(
 
     let inner = run_all_plans_inner(
         conn,
-        project,
-        config,
-        workdir,
-        options,
+        AllPlansRun {
+            project,
+            config,
+            workdir,
+            options,
+            topo_order,
+            plan_by_id,
+            run_start_sha,
+        },
         abort_rx,
         out,
-        topo_order,
-        plan_by_id,
-        run_start_sha,
     )
     .await;
 
@@ -875,19 +1501,35 @@ pub async fn run_all_plans(
     inner
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_all_plans_inner(
-    conn: &Connection,
-    project: &str,
-    config: &Config,
-    workdir: &Path,
-    options: &RunOptions,
-    abort_rx: watch::Receiver<CancelState>,
-    out: &OutputContext,
+/// The `--all` run scope passed to [`run_all_plans_inner`]: the project /
+/// config / working dir, the run `options`, the topologically-ordered plan
+/// set (`topo_order` + `plan_by_id`), and the SHA the run started at. The DB
+/// handle, abort receiver, and output sink stay separate lead arguments.
+struct AllPlansRun<'a> {
+    project: &'a str,
+    config: &'a Config,
+    workdir: &'a Path,
+    options: &'a RunOptions,
     topo_order: Vec<String>,
     plan_by_id: HashMap<String, Plan>,
     run_start_sha: String,
+}
+
+async fn run_all_plans_inner(
+    conn: &Connection,
+    run: AllPlansRun<'_>,
+    abort_rx: watch::Receiver<CancelState>,
+    out: &OutputContext,
 ) -> Result<Vec<PlanRunResult>> {
+    let AllPlansRun {
+        project,
+        config,
+        workdir,
+        options,
+        topo_order,
+        plan_by_id,
+        run_start_sha,
+    } = run;
     // 4. Build deps_of map for the in-scope plan set.
     let mut deps_of: HashMap<String, Vec<String>> = HashMap::new();
     for pid in &topo_order {
@@ -1017,10 +1659,8 @@ async fn run_all_plans_inner(
 
         // Build the inner RunOptions. Force `current_branch: true` so the
         // inner run_plan doesn't try to re-do branch setup — we've already
-        // handled it at the orchestrator level. Also force `all_plans: false`
-        // to avoid any chance of recursion.
+        // handled it at the orchestrator level.
         let inner_options = RunOptions {
-            all_plans: false,
             one: options.one,
             from: options.from,
             to: options.to,
@@ -1030,6 +1670,7 @@ async fn run_all_plans_inner(
             // call won't re-run `setup_branch`.
             auto_stash: options.auto_stash,
             harness_override: options.harness_override.clone(),
+            resume_target_short_id: options.resume_target_short_id.clone(),
             dry_run: options.dry_run,
             verbose: options.verbose,
         };
@@ -1066,6 +1707,40 @@ async fn run_all_plans_inner(
                     plan.slug, final_status
                 );
                 return Ok(results);
+            }
+            PlanStatus::Interrupted => {
+                // The plan is blocked on an open interruption (a question or
+                // blocker) on one branch, but it made committed progress. Its
+                // branch tip is NOT a clean completion, so we still fence its
+                // transitive dependents (their branches would root on an
+                // incomplete tip) — but, unlike a plain stalled plan, this is
+                // resolvable: `ralph interruption resolve` + `ralph resume`.
+                // The message reflects that so the operator knows the next
+                // step. Keep iterating so independent plans still run.
+                incomplete_slugs.push(plan.slug.clone());
+                let newly_blocked = transitive_dependents(plan_id, &dependents_of);
+                if newly_blocked.is_empty() {
+                    eprintln!(
+                        "Plan '{}' is blocked on an open interruption; resolve it \
+                         (ralph interruption resolve) and resume. Continuing with \
+                         independent plans.",
+                        plan.slug
+                    );
+                } else {
+                    let blocked_slugs: Vec<String> = newly_blocked
+                        .iter()
+                        .filter_map(|id| plan_by_id.get(id).map(|p| p.slug.clone()))
+                        .collect();
+                    eprintln!(
+                        "Plan '{}' is blocked on an open interruption; resolve it \
+                         (ralph interruption resolve) and resume. Skipping {} \
+                         dependent plan(s) meanwhile: {}",
+                        plan.slug,
+                        blocked_slugs.len(),
+                        blocked_slugs.join(", ")
+                    );
+                    blocked.extend(newly_blocked);
+                }
             }
             _ => {
                 // InProgress — plan stopped cleanly but incomplete. Block
@@ -1158,13 +1833,26 @@ pub async fn resume_plan(
     let steps = storage::list_steps(conn, &plan.id)?;
     let resume_idx = find_resume_point(&steps)?;
 
-    // Reset the failed/in-progress step to pending.
+    // Defense-in-depth: `find_resume_point` no longer returns a `Failed`
+    // step (a Mark-Failed decision is a human fence we must honor across
+    // runs — see the doc comment on `find_resume_point`). Bail loudly if
+    // someone re-introduces a Failed branch upstream, rather than silently
+    // calling `reset_step` and un-doing the operator's choice.
     let step = &steps[resume_idx];
-    if step.status == StepStatus::Failed
-        || step.status == StepStatus::InProgress
-        || step.status == StepStatus::Aborted
-    {
-        storage::reset_step(conn, &step.id)?;
+    if step.status == StepStatus::Failed {
+        bail!(
+            "Step '{}' is Failed. Resume will not automatically reset a Failed step \
+             (the Mark-Failed decision is preserved across runs). To retry it, run \
+             `ralph step reset {}` first.",
+            step.title,
+            step.short_id,
+        );
+    }
+
+    // Reset the in-progress/aborted step to pending.
+    if step.status == StepStatus::InProgress || step.status == StepStatus::Aborted {
+        let parked = storage::reset_step(conn, &step.id)?;
+        discard_parked_worktree_state(workdir, parked)?;
     }
 
     let step_num = resume_idx + 1; // 1-based
@@ -1182,6 +1870,7 @@ pub async fn resume_plan(
     let options = RunOptions {
         from: Some(step_num),
         current_branch: true,
+        resume_target_short_id: Some(step.short_id.clone()),
         ..Default::default()
     };
 
@@ -1195,11 +1884,16 @@ pub async fn resume_plan(
 /// `ralph status -v` and `ralph log`.
 ///
 /// `changes` is the user's `--changes` choice. It only matters when the
-/// target step is *currently running in this process*: in that case the
-/// executor (reached through the cancel/kill ladder) parks the harness's
-/// uncommitted work per this strategy. For any non-running step the
-/// changes in the tree aren't causally tied to the skip, so the strategy
-/// is ignored and a one-line note is emitted.
+/// target step is currently running (live harness path via cancel registry
+/// or DB bridge) *or* when the step is stale `InProgress` (crashed runner,
+/// e.g. after pre-commit hook hard-exit) and `changes == Commit`: in the
+/// latter case we directly call `git::park_changes` with `ParkStrategy::Commit`
+/// using the step's `id` for the `Ralph-Skipped-Step` trailer and subject
+/// "[ralph wip] skipped step N: title (crashed runner residue)", after a
+/// conservative `has_uncommitted_changes` safety guard. Only performed if
+/// changes exist; on error we fall back to a note advising manual commit.
+/// For any other non-running step the strategy is ignored (a one-line note
+/// is emitted unless the Stash default).
 pub fn skip_step(
     conn: &Connection,
     plan: &Plan,
@@ -1227,8 +1921,12 @@ pub fn skip_step(
     let actual_num = idx + 1;
 
     // Only allow skipping pending, failed, or in_progress steps.
+    // `Blocked` is a derived overlay never stored on `steps.status` (its
+    // underlying state is Pending/InProgress, both skippable), but match it
+    // explicitly for exhaustiveness.
     match step.status {
-        StepStatus::Pending | StepStatus::Failed | StepStatus::InProgress => {}
+        StepStatus::Pending | StepStatus::Failed | StepStatus::InProgress | StepStatus::Blocked => {
+        }
         StepStatus::Complete => bail!("Step {} '{}' is already complete", actual_num, step.title),
         StepStatus::Skipped => bail!("Step {} '{}' is already skipped", actual_num, step.title),
         StepStatus::Aborted => {
@@ -1281,12 +1979,56 @@ pub fn skip_step(
         // No live run despite an InProgress status: this is a stale status
         // (e.g. a crashed prior run). Fall through to the synchronous
         // DB-flip below so the user's skip still takes effect.
+        //
+        // For the Commit strategy we now honor it here: capture any residue
+        // left by the dead runner (e.g. post-harness changes that never got
+        // committed because of a hook crash) as a WIP commit with trailer.
     }
 
-    // Not running here: the working tree's changes (if any) aren't causally
-    // tied to *this* step, so we deliberately don't touch them. Note that
-    // the --changes choice had no effect unless it was the (no-op) default.
-    if changes != crate::git::ParkStrategyKind::Stash {
+    // For a stale InProgress step + explicit --changes commit we (attempt to)
+    // park the crashed-runner residue (if any) using the step id for the
+    // trailer. We use a conservative has_uncommitted_changes guard (no
+    // pre_existing available for the crashed run) and fall back to a
+    // "commit manually" note on park error (be conservative on attribution
+    // and safety). We treat the Commit choice on stale InProgress as handled
+    // (suppress the generic "no effect" note) even if the tree was clean.
+    let handled_stale_commit =
+        step.status == StepStatus::InProgress && changes == crate::git::ParkStrategyKind::Commit;
+    if handled_stale_commit {
+        let workdir = Path::new(&plan.project);
+        let has_changes = git::has_uncommitted_changes(workdir).unwrap_or(false);
+        if has_changes {
+            let trailer_id = &step.id;
+            let subject = format!(
+                "[ralph wip] skipped step {}: {} (crashed runner residue)",
+                actual_num, step.title
+            );
+            let strategy = crate::git::ParkStrategy::Commit { subject };
+            match git::park_changes(workdir, strategy, &[], trailer_id) {
+                Ok(git::ParkOutcome::Committed { sha }) => {
+                    eprintln!(
+                        "Committed crashed-runner residue for step {} '{}' as {}",
+                        actual_num, step.title, sha
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!(
+                        "note: --changes commit could not capture residue for step {} '{}': {} — commit manually if needed",
+                        actual_num, step.title, e
+                    );
+                }
+            }
+        }
+        // (no generic note for this case)
+    }
+
+    // For genuinely non-running steps (or stale InProgress with non-Commit),
+    // the working tree's changes (if any) aren't causally tied to *this*
+    // skip, so we deliberately don't touch them. The --changes choice has
+    // no effect unless it was the (no-op) default. We skip this note when
+    // we just handled a stale-Commit park above.
+    if !handled_stale_commit && changes != crate::git::ParkStrategyKind::Stash {
         eprintln!(
             "note: --changes has no effect — step {} is not running, so its \
              working-tree changes are left untouched",
@@ -1294,13 +2036,22 @@ pub fn skip_step(
         );
     }
 
-    storage::mark_step_skipped(conn, &step.id, reason)?;
+    let dependent_count = storage::list_step_dependents(conn, &step.id)?.len();
+    let workdir = Path::new(&plan.project);
+    let parked = storage::mark_step_skipped(conn, &step.id, reason)?;
+    discard_parked_worktree_state(workdir, parked)?;
     match reason {
         Some(r) => eprintln!(
             "Skipped step {} '{}' (reason: {})",
             actual_num, step.title, r
         ),
         None => eprintln!("Skipped step {} '{}'", actual_num, step.title),
+    }
+    if dependent_count > 0 {
+        eprintln!(
+            "note: skipped step {} '{}' has {} dependent step(s); a Skipped step satisfies its outgoing edges, so that branch will proceed as if this step had completed",
+            actual_num, step.title, dependent_count
+        );
     }
 
     Ok(actual_num)
@@ -1333,13 +2084,13 @@ fn validate_plan_status(plan: &Plan) -> Result<()> {
             plan.slug,
             plan.slug
         ),
-        // `Question` is a derived status — `plans.status` is never written
-        // to "question" in the DB, so this arm is defensive. If a caller
-        // ever materializes a Plan with Question (e.g. a future helper that
-        // shadows status when unanswered questions exist), refuse to run:
-        // the user must answer first.
-        PlanStatus::Question => bail!(
-            "Plan '{}' is paused for an unanswered question. Answer it first.",
+        // `Interrupted` is a derived status — `plans.status` is never written
+        // to "interrupted" in the DB, so this arm is defensive. If a caller
+        // ever materializes a Plan with Interrupted (e.g. a future helper
+        // that shadows status when open interruptions exist), refuse to run:
+        // the human must resolve the interruption first.
+        PlanStatus::Interrupted => bail!(
+            "Plan '{}' is paused for an open interruption. Resolve it first.",
             plan.slug
         ),
     }
@@ -1357,16 +2108,102 @@ pub(crate) struct StashedState {
     pub staged_files: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReconcileAction {
+    CommitWip,
+    Stash,
+    Discard,
+    Cancel,
+}
+
+/// Tiny stdio prompt (CLI-friendly, no ratatui) for the four crash-reconcile
+/// choices. Used only on TTY after we have detected likely ralph residue.
+fn prompt_crash_reconcile(dirty_files: &[String], step_hint: &str) -> Result<ReconcileAction> {
+    eprintln!(
+        "\nWorking tree has uncommitted changes, and at least one of them \
+         overlaps files touched by recent Ralph-* commits for step '{}' \
+         (likely residue from a crashed InProgress step for this plan).",
+        step_hint
+    );
+    // Detection is overlap-only: a single overlapping file triggers this, but
+    // the dirty set below may also contain UNRELATED work. Commit/Discard act
+    // on the WHOLE tree, not just the residue — so list every dirty file and
+    // say so explicitly. The user makes an informed choice.
+    eprintln!(
+        "\nAll {} uncommitted file(s) below — NOT all are necessarily ralph \
+         residue:",
+        dirty_files.len()
+    );
+    for f in dirty_files {
+        eprintln!("  {}", f);
+    }
+    eprintln!(
+        "\n⚠  Commit and Discard act on ALL of the above, including any \
+         unrelated work. Use Stash if unsure (it is fully recoverable)."
+    );
+    eprintln!("\nReconcile before continuing the run/resume?");
+    eprintln!(
+        "  [c] Commit as [ralph wip]   — commit ALL listed changes as one [ralph wip] commit"
+    );
+    eprintln!("  [s] Stash                 — ralph auto-stash ALL changes (restored on teardown)");
+    eprintln!(
+        "  [d] Discard               — PERMANENTLY delete ALL listed changes (incl. unrelated)"
+    );
+    eprintln!("  [x] Cancel                — abort without touching the tree");
+    for _ in 0..5 {
+        eprint!("Choice [c/s/d/x]: ");
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_err() {
+            return Ok(ReconcileAction::Cancel);
+        }
+        match line.trim().to_ascii_lowercase().as_str() {
+            "c" | "commit" => return Ok(ReconcileAction::CommitWip),
+            "s" | "stash" => return Ok(ReconcileAction::Stash),
+            "d" | "discard" => return Ok(ReconcileAction::Discard),
+            "x" | "cancel" | "q" | "" => return Ok(ReconcileAction::Cancel),
+            other => eprintln!("Unrecognized choice {:?}. Enter c, s, d or x.", other),
+        }
+    }
+    Ok(ReconcileAction::Cancel)
+}
+
 /// If the working tree is dirty, stash it with a ralph-branded message and
 /// return the stash's commit SHA plus the list of files that were staged at
 /// stash time. Returns `Ok(None)` on a clean tree. Bails with a user-facing
 /// error when the tree is dirty and `auto_stash` is false.
+///
+/// When `plan_branch` and/or `resume_target_short_id` are supplied and the
+/// tree is dirty with `auto_stash=false`, we first attempt the "medium"
+/// crash-reconcile UX: if stdout is a TTY and
+/// `git::has_crash_residue_overlap_for_step` (or latest Ralph commit when no
+/// explicit target) reports that the dirty files overlap files touched by
+/// recent Ralph-* commits for the (crashed) step on the plan branch, we pop
+/// an interactive stdio choice (Commit as [ralph wip], Stash, Discard, Cancel).
+/// On Commit/Discard the tree is cleaned and we proceed (return None); on
+/// Stash we perform the stash ourselves and return it; on Cancel we bail.
+///
+/// If not TTY or detection uncertain, we emit a tailored error mentioning
+/// `ralph skip --changes commit` (or the resume step) plus manual options.
+///
+/// The reconcile "Commit as [ralph wip]" path resolves the candidate
+/// `short_id` to its step UUID via `conn`/`plan_id` and parks the changes
+/// through [`git::park_changes`] so the commit carries the standard
+/// `Ralph-Skipped-Step` trailer — making it discoverable by `ralph log` and
+/// revertable by `ralph step reset`, exactly like a `ralph skip --changes
+/// commit` WIP commit. If the UUID can't be resolved (no `conn`, or the
+/// short_id no longer maps to a step) it falls back to a plain trailerless
+/// commit so the reconcile still clears the tree.
 ///
 /// The stash message is `"ralph: auto-stash for plan '<slug>' at
 /// <ISO-8601>"` so teardown (or manual recovery) can locate it by subject.
 async fn stash_if_dirty(
     workdir: &Path,
     plan_slug: &str,
+    plan_branch: Option<&str>,
+    resume_target_short_id: Option<&str>,
+    conn: Option<&Connection>,
+    plan_id: Option<&str>,
     auto_stash: bool,
 ) -> Result<Option<StashedState>> {
     let workdir_owned = workdir.to_path_buf();
@@ -1378,6 +2215,178 @@ async fn stash_if_dirty(
     if !auto_stash {
         let workdir_owned = workdir.to_path_buf();
         let files = blocking_git(move || git::get_all_changed_files(&workdir_owned)).await?;
+
+        // --- crash-reconcile detection + interactive TTY prompt ---
+        let mut candidate: Option<String> = resume_target_short_id.map(|s| s.to_string());
+        let branch_owned = plan_branch.map(|b| b.to_string());
+        let wdir_clone = workdir.to_path_buf();
+
+        if candidate.is_none()
+            && let Some(ref br) = branch_owned
+        {
+            let br2 = br.clone();
+            let wd2 = wdir_clone.clone();
+            if let Ok(iter_cs) = blocking_git(move || git::list_iteration_commits(&wd2, &br2)).await
+                && let Some(l) = iter_cs.first()
+            {
+                candidate = Some(l.step_short_id.clone());
+            }
+        }
+
+        let mut reconciled_stash: Option<StashedState> = None;
+        let mut did_clean = false;
+
+        if let (Some(br), Some(tgt)) = (&branch_owned, &candidate) {
+            let wdir3 = wdir_clone.clone();
+            let br3 = br.clone();
+            let tgt3 = tgt.clone();
+            let is_residue =
+                blocking_git(move || git::has_crash_residue_overlap_for_step(&wdir3, &br3, &tgt3))
+                    .await
+                    .unwrap_or(false);
+
+            if is_residue {
+                // The prompt reads from stdin and writes to stderr, so gate
+                // on *those* streams — not stdout (which carries NDJSON under
+                // `--json` and is piped when a TUI spawns the runner). Keying
+                // on stdout would let a stdin-closed/non-interactive invocation
+                // enter the prompt, hit EOF, and silently Cancel the run.
+                let is_tty = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+                if is_tty {
+                    match prompt_crash_reconcile(&files, tgt) {
+                        Ok(ReconcileAction::CommitWip) => {
+                            let subject =
+                                format!("[ralph wip] crashed-residue before step {}", tgt);
+                            // Resolve the candidate short_id -> step UUID so the
+                            // WIP commit carries the standard Ralph-Skipped-Step
+                            // trailer (discoverable by `ralph log`, revertable by
+                            // `ralph step reset`). Synchronous DB read, done
+                            // before the blocking git call. Falls back to a
+                            // plain trailerless commit if unresolvable.
+                            let trailer_uuid: Option<String> = match (conn, plan_id) {
+                                (Some(c), Some(pid)) => {
+                                    storage::list_steps(c, pid).ok().and_then(|steps| {
+                                        steps.into_iter().find(|s| s.short_id == *tgt).map(|s| s.id)
+                                    })
+                                }
+                                _ => None,
+                            };
+                            let wdir_c = workdir.to_path_buf();
+                            let commit_res = blocking_git(move || match trailer_uuid {
+                                Some(uuid) => git::park_changes(
+                                    &wdir_c,
+                                    git::ParkStrategy::Commit { subject },
+                                    &[],
+                                    &uuid,
+                                )
+                                .map(|_| ()),
+                                None => git::commit_changes(&wdir_c, &subject),
+                            })
+                            .await;
+                            match commit_res {
+                                Ok(_) => {
+                                    eprintln!("Committed residue as [ralph wip] (clean tree).");
+                                    did_clean = true;
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "Warning: [ralph wip] commit failed ({e}); tree may still be dirty."
+                                    );
+                                }
+                            }
+                        }
+                        Ok(ReconcileAction::Stash) => {
+                            // Perform the exact same stash that auto=true path would do.
+                            let staged = blocking_git({
+                                let wd = workdir.to_path_buf();
+                                move || git::list_staged_files(&wd)
+                            })
+                            .await
+                            .unwrap_or_default();
+                            let ts = chrono::Utc::now()
+                                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                            let message = format!(
+                                "ralph: auto-stash for plan '{plan_slug}' at {ts} (reconcile)"
+                            );
+                            let wd_s = workdir.to_path_buf();
+                            let msg_s = message.clone();
+                            match blocking_git(move || {
+                                git::stash_push_with_untracked(&wd_s, &msg_s)
+                            })
+                            .await
+                            {
+                                Ok(Some(stash_ref)) => {
+                                    reconciled_stash = Some(StashedState {
+                                        stash_ref,
+                                        staged_files: staged,
+                                    });
+                                    eprintln!("Stashed (via reconcile choice).");
+                                }
+                                _ => {
+                                    eprintln!("Stash choice could not complete; will error below.");
+                                }
+                            }
+                        }
+                        Ok(ReconcileAction::Discard) => {
+                            let wdir_d = workdir.to_path_buf();
+                            blocking_git(move || git::rollback_except(&wdir_d, &[]))
+                                .await
+                                .context(
+                                    "Discard choice failed while cleaning the working tree; \
+                                     leaving tree untouched for manual recovery",
+                                )?;
+                            let still_dirty = {
+                                let wd = workdir.to_path_buf();
+                                blocking_git(move || git::has_uncommitted_changes(&wd)).await?
+                            };
+                            if still_dirty {
+                                bail!(
+                                    "Discard choice did not fully clean the working tree; \
+                                     resolve manually and retry"
+                                );
+                            }
+                            eprintln!("Discarded residue (clean tree).");
+                            did_clean = true;
+                        }
+                        Ok(ReconcileAction::Cancel) | Err(_) => {
+                            bail!(
+                                "User cancelled at crash-reconcile prompt. \
+                                 Working tree left dirty; resolve manually and re-invoke."
+                            );
+                        }
+                    }
+                } else {
+                    // Non-TTY or uncertain: improved, actionable error (points at skip --changes now that it works)
+                    let step_desc = if resume_target_short_id.is_some() {
+                        format!("resume target step {}", tgt)
+                    } else {
+                        format!("step {} (most recent Ralph-* on branch)", tgt)
+                    };
+                    bail!(
+                        "Working tree has uncommitted changes overlapping ralph-owned \
+                         files from {} (on plan branch '{}').\n\
+                         (stdin/stderr are not both TTYs — no interactive prompt offered.)\n\
+                         Quick fixes:\n\
+                         \n  ralph skip --changes commit\n    (parks the residue as a [ralph wip] commit with the step's trailer; \
+                         safe for the crashed InProgress case)\n\
+                         \n  git stash push --include-untracked\n  git add -A && git commit -m '[ralph wip] manual'\n  git checkout -- . && git clean -fd\n\
+                         \nThen retry `ralph resume` (or `ralph run`). Or set `auto_stash: true` in config.",
+                        step_desc,
+                        plan_branch.unwrap_or("(unknown)")
+                    );
+                }
+            }
+        }
+
+        if let Some(st) = reconciled_stash {
+            return Ok(Some(st));
+        }
+        if did_clean {
+            // We cleaned via commit or discard; proceed as if tree was clean.
+            return Ok(None);
+        }
+
+        // Fallthrough: no (or failed) reconcile — original generic refusal.
         let mut msg = format!(
             "Working tree has uncommitted changes; refusing to run with \
              auto_stash disabled and {} file(s) dirty:\n",
@@ -1425,8 +2434,11 @@ async fn stash_if_dirty(
 /// staged at stash time. Called once at the end of the top-level run
 /// regardless of outcome.
 ///
-/// On `stash pop` conflict, we leave the stash on the stack and return a
-/// non-zero error — the user pops manually.
+/// On `stash pop` conflict, git has already half-applied the stash into the
+/// working tree (with conflict markers) and left the stash on the stack. We
+/// surface an error telling the user to resolve the markers in place and then
+/// drop the now-redundant stash — re-running `git stash pop` against the
+/// conflicted tree would only fail or compound the conflict.
 async fn restore_working_tree(workdir: &Path, state: Option<&StashedState>) -> Result<()> {
     if let Some(state) = state {
         let workdir_owned = workdir.to_path_buf();
@@ -1460,12 +2472,15 @@ async fn restore_working_tree(workdir: &Path, state: Option<&StashedState>) -> R
             }
             StashPopOutcome::Conflicted(stderr) => {
                 bail!(
-                    "Pop of ralph's stash conflicts with committed work. \
-                     Your changes are preserved at {} — resolve manually with \
-                     `git stash pop {}`.\n{}",
-                    state.stash_ref.as_str(),
-                    state.stash_ref.as_str(),
-                    stderr,
+                    "Restoring your pre-run uncommitted changes conflicted with work \
+                     committed during the run. The changes are partially applied with \
+                     conflict markers already in the working tree, and the original \
+                     stash is preserved at {sha}. Resolve the conflict markers in place, \
+                     then run `git stash drop {sha}` to remove the now-redundant stash. \
+                     (Do not re-run `git stash pop` — it will fail against the conflicted \
+                     tree.)\n{stderr}",
+                    sha = state.stash_ref.as_str(),
+                    stderr = stderr,
                 );
             }
             StashPopOutcome::NotFound => {
@@ -1475,6 +2490,359 @@ async fn restore_working_tree(workdir: &Path, state: Option<&StashedState>) -> R
                 );
             }
         }
+    }
+
+    Ok(())
+}
+
+pub(crate) fn discard_parked_worktree_state(
+    workdir: &Path,
+    parked: Option<storage::ParkedWorktreeState>,
+) -> Result<bool> {
+    let Some(parked) = parked else {
+        return Ok(false);
+    };
+
+    git::drop_stash(workdir, &StashRef(parked.stash_sha))
+}
+
+/// Result of a parked-worktree restore attempt at the top of a scheduler
+/// tick. Per-step granularity: a single bad stash MUST NOT abort the whole
+/// run (Cluster 3 Fix #2). Branch B (independent of the affected step) keeps
+/// going.
+#[derive(Debug)]
+enum RestoreParkedOutcome {
+    /// No parked-worktree row for this step — nothing to do, proceed with
+    /// normal execution.
+    NotParked,
+    /// The parked stash was applied cleanly; the worktree carries the
+    /// resumed WIP and the bridge row was cleared.
+    Resumed,
+    /// The parked stash could not be applied: NotFound (admin `git stash
+    /// clear` / IDE plugin dropped it) or Conflicted (apply ran but left
+    /// conflict markers, or returned non-zero). A `kind=Blocker`
+    /// interruption was raised on the step so a human can decide whether
+    /// to mark it Failed or restart it from a clean slate; the now-stale
+    /// bridge row was dropped. The caller must skip this step and let the
+    /// scheduler tick another branch.
+    BlockedAfterFailure,
+}
+
+/// Remove the stash's own untracked files (the paths from `<stash>^3`) after a
+/// conflicted parked-restore has been reset to HEAD.
+///
+/// A `NotFound` error is expected and ignored — the conflicted `git stash
+/// apply` may not have written every file the stash carried. Any OTHER error
+/// (`PermissionDenied`, `IsADirectory`, …) means real stash residue is still
+/// on disk; it is collected and returned as an error so the caller's
+/// `cleanup_error` is populated and the blocker body stays honest (never
+/// claims "reset to a clean state" while leftover stash files remain).
+fn remove_stash_residue_files(workdir: &Path, rel_paths: &[String]) -> Result<()> {
+    let mut residue: Vec<String> = Vec::new();
+    for rel in rel_paths {
+        match std::fs::remove_file(workdir.join(rel)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => residue.push(format!("{rel}: {e}")),
+        }
+    }
+    if residue.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "failed to remove {} stash-owned file(s): {}",
+            residue.len(),
+            residue.join("; ")
+        )
+    }
+}
+
+async fn restore_parked_step_worktree(
+    conn: &Connection,
+    step: &Step,
+    workdir: &Path,
+    out: &OutputContext,
+) -> Result<RestoreParkedOutcome> {
+    let Some(parked) = storage::get_step_parked_worktree(conn, &step.id)? else {
+        return Ok(RestoreParkedOutcome::NotParked);
+    };
+
+    let workdir_owned = workdir.to_path_buf();
+    let stash_ref = StashRef(parked.stash_sha.clone());
+    let stash_ref_for_pop = stash_ref.clone();
+    let outcome = blocking_git(move || git::stash_pop(&workdir_owned, &stash_ref_for_pop)).await?;
+    match outcome {
+        StashPopOutcome::Clean => {
+            if !parked.staged_files.is_empty() {
+                let workdir_owned = workdir.to_path_buf();
+                let staged_owned = parked.staged_files.clone();
+                blocking_git(move || {
+                    git::restage_files(&workdir_owned, &staged_owned);
+                    Ok(())
+                })
+                .await?;
+            }
+            storage::clear_step_parked_worktree(conn, &step.id)?;
+            Ok(RestoreParkedOutcome::Resumed)
+        }
+        StashPopOutcome::Conflicted(_stderr) => {
+            // Cluster 3 Fix #2: per-step blocker, NOT a whole-run bail.
+            // Apply ran but conflicted, leaving the working tree with
+            // conflict markers / a partial apply / unmerged index entries —
+            // and, because the parked stash was pushed with
+            // `--include-untracked`, with any NEW untracked files the stash
+            // carried written into the tree. The executor does NOT clean the
+            // tree at step start, so leaving any of that in place would feed
+            // it to a re-run harness and a Mark-Pending re-run would never
+            // start clean — the blocker would re-fire forever (the loop bug).
+            // This runs inline on the single scheduler loop, before any
+            // `execute_step` is spawned, and reviews only ever touch their own
+            // isolated worktree (§9) — so no other task can be mutating the
+            // live tree here. This is the safe place to touch it.
+            //
+            // Cleanup, in two surgical steps that never snapshot-and-diff the
+            // untracked set (the prior approach's data-loss + extra-abort risk):
+            //
+            //   1. `git::reset_hard_to_head(workdir)` clears the unmerged index
+            //      entries and restores tracked files to HEAD content (dropping
+            //      the conflict markers), while leaving ALL untracked files in
+            //      place — so it can never delete anything the user, their
+            //      editor, or a concurrent tool created.
+            //   2. Remove EXACTLY the files the stash itself carried as new
+            //      untracked WIP, read from `<stash>^3` via
+            //      `git::list_stash_untracked_files`. Park excluded the user's
+            //      pre-existing untracked files from the stash, so `^3` lists
+            //      only the harness-created WIP — never the user's files and
+            //      never a concurrently-created file. A plain `git reset --hard`
+            //      alone would leave those stash-introduced untracked files
+            //      behind (the "fresh from scratch" regression we moved off
+            //      plain reset for); removing them by path restores that
+            //      guarantee without the snapshot's collateral damage.
+            //
+            // The stash itself stays on the stack (the WIP source of truth) and
+            // the bridge row is kept so the resolver can find + drop it.
+            //
+            // If the cleanup itself errors we log and continue to raise the
+            // blocker anyway — bailing here would resurrect the original
+            // whole-run-abort bug we are fixing — but the blocker body is made
+            // honest about the failure (BUG #2) so the user isn't told the
+            // tree is clean when it isn't.
+            let workdir_for_cleanup = workdir.to_path_buf();
+            let stash_sha_for_cleanup = parked.stash_sha.clone();
+            // `blocking_git` collapses the spawn-join error and the git
+            // error into one `Result`; we deliberately do NOT `?` it —
+            // any failure mode should be logged-and-continued so the
+            // blocker still gets raised (bailing here would resurrect the
+            // whole-run-abort bug this path fixes). The reset + list + remove
+            // all run inside ONE blocking closure (mirroring how the prior
+            // cleanup was wrapped) and fold into a single combined Result.
+            let cleanup_res = blocking_git(move || {
+                git::reset_hard_to_head(&workdir_for_cleanup)?;
+                let stash_untracked =
+                    git::list_stash_untracked_files(&workdir_for_cleanup, &stash_sha_for_cleanup)?;
+                remove_stash_residue_files(&workdir_for_cleanup, &stash_untracked)
+            })
+            .await;
+            let cleanup_error = match &cleanup_res {
+                Ok(()) => None,
+                Err(err) => Some(format!("{err:#}")),
+            };
+            if let Some(err) = &cleanup_error
+                && out.format != OutputFormat::Json
+            {
+                eprintln!(
+                    "Warning: could not clean the working tree after a conflicted parked-restore \
+                     for step {} '{}': {err}. Raising the blocker anyway; the tree may carry \
+                     conflict markers until you resolve it manually.",
+                    step.short_id, step.title,
+                );
+            }
+            let body = parked_restore_conflict_body(
+                stash_ref.as_str(),
+                &step.short_id,
+                cleanup_error.as_deref(),
+            );
+            raise_parked_restore_blocker(conn, step, &body, /*drop_bridge_row=*/ false, out)?;
+            Ok(RestoreParkedOutcome::BlockedAfterFailure)
+        }
+        StashPopOutcome::NotFound => {
+            // Cluster 3 Fix #2: per-step blocker, NOT a whole-run bail.
+            // The stash was dropped out from under us (admin `git stash
+            // clear`, IDE plugin) — the WIP is gone and we have no honest
+            // way to resume. Drop the orphaned bridge row so the next
+            // scheduler pass doesn't re-fire the same error, then raise a
+            // blocker with two recovery options that the interruption
+            // resolver actually wires through (Bug #2 fix — pre-fix the
+            // options were empty and resolution had no side-effect). The
+            // working tree is untouched here (no apply ran), so there is
+            // nothing to reset.
+            let body = format!(
+                "{PARKED_RESTORE_BLOCKER_MARKER}\n\
+                 Could not restore this step's parked work-in-progress: stash {sha} was not \
+                 found in `git stash list` — an admin may have run `git stash clear` or another \
+                 tool dropped it. The parked WIP is unrecoverable. Resolve with '{fail}' \
+                 (fence this step off — run `ralph step reset {short_id}` later to retry) or \
+                 '{pending}' (run the step fresh from scratch; the previous in-flight work is \
+                 already lost).",
+                sha = stash_ref.as_str(),
+                short_id = step.short_id,
+                fail = PARKED_RESTORE_OPTION_MARK_FAILED,
+                pending = PARKED_RESTORE_OPTION_MARK_PENDING,
+            );
+            raise_parked_restore_blocker(conn, step, &body, /*drop_bridge_row=*/ true, out)?;
+            Ok(RestoreParkedOutcome::BlockedAfterFailure)
+        }
+    }
+}
+
+/// Body-prefix marker on a parked-worktree-restore blocker. The
+/// `commands::interruption` resolver dispatches on this prefix to wire the
+/// two ranked options ([`PARKED_RESTORE_OPTION_MARK_FAILED`] /
+/// [`PARKED_RESTORE_OPTION_MARK_PENDING`]) to actual step-state side
+/// effects. Mirrors the retry-exhausted auto-blocker's option-content
+/// dispatch (`is_retry_exhausted_auto_blocker`), but uses a body marker
+/// because the parked-restore option set could plausibly drift while the
+/// retry-exhausted set is locked by `executor.rs`'s `pub const`.
+pub const PARKED_RESTORE_BLOCKER_MARKER: &str = "[ralph:parked-restore]";
+
+/// Priority-1 option on the parked-restore blocker — "give up on this
+/// step." Resolves the interruption AND flips status to `Failed`,
+/// terminating the step. The resolver clears any surviving bridge row and
+/// drops the preserved stash (Conflicted); on NotFound the bridge row was
+/// already dropped at raise time and there is no stash to drop.
+pub const PARKED_RESTORE_OPTION_MARK_FAILED: &str = "Skip and Mark Failed";
+
+/// Priority-2 option on the parked-restore blocker — "start the step
+/// fresh, abandoning the parked WIP." Resolves the interruption; the step
+/// stays `Pending` with attempts unchanged so the scheduler re-picks it on
+/// the next tick with a clean slate. The resolver clears any surviving
+/// bridge row and drops the preserved stash (Conflicted — the tree was
+/// already reset clean at raise time, so the re-run starts fresh); on
+/// NotFound the bridge row was already dropped at raise time.
+pub const PARKED_RESTORE_OPTION_MARK_PENDING: &str = "Skip and Mark Pending";
+
+/// Build the blocker body for a *conflicted* parked-restore (BUG #2).
+///
+/// The Conflicted branch tries to clean the working tree before raising the
+/// blocker, but that cleanup is log-and-continue: if the `git` op fails the
+/// tree may still carry conflict markers / leftover stash files. The body
+/// must tell the truth about which case happened so the user does not pick
+/// "Mark Pending" (which drops the preserved stash) while the tree is still
+/// dirty.
+///
+/// Both variants keep the [`PARKED_RESTORE_BLOCKER_MARKER`] prefix so the
+/// resolver (`apply_parked_restore_resolution`) still detects the subkind.
+fn parked_restore_conflict_body(
+    stash_sha: &str,
+    short_id: &str,
+    cleanup_error: Option<&str>,
+) -> String {
+    match cleanup_error {
+        None => format!(
+            "{PARKED_RESTORE_BLOCKER_MARKER}\n\
+             Could not restore this step's parked work-in-progress: applying stash {sha} \
+             conflicted with commits made since it was parked. The working tree has been \
+             reset to a clean state; the parked WIP is preserved in git stash {sha}. \
+             Resolve with '{fail}' (fence this step off — run `ralph step reset {short_id}` \
+             later to retry) or '{pending}' (re-run the step from scratch; the parked WIP \
+             in stash {sha} will be discarded). To salvage the WIP manually, inspect \
+             `git stash show -p {sha}` before resolving.",
+            sha = stash_sha,
+            short_id = short_id,
+            fail = PARKED_RESTORE_OPTION_MARK_FAILED,
+            pending = PARKED_RESTORE_OPTION_MARK_PENDING,
+        ),
+        Some(err) => format!(
+            "{PARKED_RESTORE_BLOCKER_MARKER}\n\
+             Could not restore this step's parked work-in-progress (stash {sha} conflicted \
+             with intervening commits), AND the automatic cleanup of the conflicted working \
+             tree ALSO FAILED ({err}). The working tree may still contain conflict markers \
+             or leftover files. Resolve them manually before resolving this blocker. The \
+             parked WIP is preserved in git stash {sha}. Resolve with '{fail}' (fence this \
+             step off — run `ralph step reset {short_id}` later to retry) or '{pending}' \
+             (note: Mark Pending will re-run the step and DROP stash {sha} — do NOT choose \
+             it until the tree is clean). To salvage the WIP manually, inspect \
+             `git stash show -p {sha}` before resolving.",
+            sha = stash_sha,
+            err = err,
+            short_id = short_id,
+            fail = PARKED_RESTORE_OPTION_MARK_FAILED,
+            pending = PARKED_RESTORE_OPTION_MARK_PENDING,
+        ),
+    }
+}
+
+/// Insert a `kind=Blocker` interruption on `step` for a parked-worktree
+/// restore failure. Optionally drops the bridge row first when the stash
+/// is gone (NotFound) so we don't re-trip the same error on the next
+/// scheduler pass; for Conflicted we leave the row alone (the stash is
+/// still recoverable). Best-effort NDJSON emit mirrors the existing
+/// review-loop / retry-exhausted patterns.
+///
+/// Bug #2 fix: this used to insert with `options = &[]`, which left the
+/// CLI/TUI resolver with nothing to dispatch on — resolution just closed
+/// the row and the scheduler re-fired the same restore error in a loop.
+/// We now insert the two ranked options
+/// [`PARKED_RESTORE_OPTION_MARK_FAILED`] (priority 1) /
+/// [`PARKED_RESTORE_OPTION_MARK_PENDING`] (priority 2) and prefix the body
+/// with [`PARKED_RESTORE_BLOCKER_MARKER`] so the resolver
+/// (`apply_parked_restore_resolution`) can detect the subkind and apply
+/// the matching side effect.
+fn raise_parked_restore_blocker(
+    conn: &Connection,
+    step: &Step,
+    body: &str,
+    drop_bridge_row: bool,
+    out: &OutputContext,
+) -> Result<()> {
+    // Raise + (optionally) clear the bridge row in one transaction so a
+    // racing scheduler tick can never see (bridge-cleared, blocker-not-yet-
+    // visible) — that window would let it re-enter `restore_parked_step_worktree`
+    // and silently re-pick the step with no parked row at all. The
+    // `attempt` value is `step.attempts` (matching the executor's
+    // retry-exhausted blocker which uses the *current* attempt counter as
+    // its `attempt` field).
+    let options = [
+        crate::plan::InterruptionOption {
+            text: PARKED_RESTORE_OPTION_MARK_FAILED.to_string(),
+            priority: 1,
+        },
+        crate::plan::InterruptionOption {
+            text: PARKED_RESTORE_OPTION_MARK_PENDING.to_string(),
+            priority: 2,
+        },
+    ];
+    let interruption_id = crate::db::with_tx(conn, |conn| {
+        let id = storage::insert_interruption(
+            conn,
+            &step.id,
+            step.attempts,
+            crate::plan::InterruptionKind::Blocker,
+            body,
+            &options,
+        )?;
+        if drop_bridge_row {
+            storage::clear_step_parked_worktree(conn, &step.id)?;
+        }
+        Ok(id)
+    })?;
+
+    output::emit_interruption_raised(
+        conn,
+        out.format == OutputFormat::Json,
+        &interruption_id,
+        &step.id,
+        crate::plan::InterruptionKind::Blocker.as_str(),
+        /*auto_raised=*/ true,
+        step.attempts,
+    );
+
+    if out.format != OutputFormat::Json {
+        eprintln!(
+            "Warning: could not restore parked worktree for step {} '{}' — raised a blocker; \
+             scheduler will move to other runnable branches.",
+            step.short_id, step.title,
+        );
     }
 
     Ok(())
@@ -1562,7 +2930,7 @@ where
 /// - If `from`/`to` are set, return that inclusive range.
 /// - Otherwise, return all remaining steps (the new default).
 ///
-/// `all_plans` is orthogonal to this function and is handled by the
+/// Running all plans is orthogonal to this function and is handled by the
 /// multi-plan orchestrator, not the step selector.
 ///
 /// As of the mid-run-insert fix, `run_plan` no longer calls this function
@@ -1624,7 +2992,16 @@ fn step_number_in_plan(all_steps: &[Step], step: &Step) -> usize {
 /// invoking this function, so in normal use no `InProgress` rows should ever
 /// be visible here. The `InProgress` arm is retained as a belt-and-suspenders
 /// guard in case the sweep is ever accidentally bypassed or reordered.
-/// Preference order: InProgress > Failed > Aborted > Pending.
+/// Preference order: InProgress > Aborted > Pending.
+///
+/// **Failed steps are NOT selected for resume.** A `Failed` row is a
+/// deliberate human decision (Mark Failed on the retry-exhausted auto-blocker
+/// — see [`is_actionable`] for the matching scheduler-side fence). Including
+/// it here would let `resume_plan` immediately call `reset_step` on it,
+/// flipping it back to `Pending` and silently un-doing the Mark-Failed
+/// choice on the very next run. The explicit recovery path is `ralph step
+/// reset <short_id>`, which calls `storage::reset_step` directly with the
+/// operator's opt-in.
 fn find_resume_point(steps: &[Step]) -> Result<usize> {
     // Belt-and-suspenders: sweep should have cleared any InProgress, but if
     // something skipped it, still prefer an in_progress step.
@@ -1632,11 +3009,6 @@ fn find_resume_point(steps: &[Step]) -> Result<usize> {
         .iter()
         .position(|s| s.status == StepStatus::InProgress)
     {
-        return Ok(idx);
-    }
-
-    // Then look for a failed step.
-    if let Some(idx) = steps.iter().position(|s| s.status == StepStatus::Failed) {
         return Ok(idx);
     }
 
@@ -1650,15 +3022,43 @@ fn find_resume_point(steps: &[Step]) -> Result<usize> {
         return Ok(idx);
     }
 
-    bail!("No failed, in-progress, or pending steps found to resume from")
+    // Note: `Failed` is deliberately excluded — see the doc comment above.
+    // A plan whose only remaining work is Failed (every other step Complete
+    // or Skipped) has no resumable work; the operator must `ralph step
+    // reset` the Failed rows first if they want to retry them.
+    bail!("No in-progress, aborted, or pending steps found to resume from")
 }
 
 /// True if a step is in a status that the runner loop will attempt to execute.
-/// Pre-existing Complete / Skipped steps are non-actionable.
+///
+/// Pre-existing Complete / Skipped steps are non-actionable, and as of Phase E
+/// Fix 2 **Failed is non-actionable too**. Pre-Phase-E, the scheduler would
+/// re-pick a Failed step (which is exactly what a `Mark Failed` resolution on
+/// the retry-exhausted auto-blocker leaves), `executor::execute_step`'s budget
+/// guard would bail with "already used all N attempts", and the whole run
+/// would terminate. The user-approved semantics are "plan continues, step
+/// stays Failed" — making Failed non-actionable here implements that:
+///
+///   - The scheduler skips the Failed step and runs any independent branches
+///     to completion.
+///   - Dependents of the Failed step stay `Pending` forever (the runnable
+///     filter requires every dep `Complete` — see `deps_satisfied`), so the
+///     plan finalizes as `InProgress` per the §3.5 terminal shapes (an
+///     incomplete plan with no open interruptions, not Complete and not
+///     Interrupted). That matches the design intent: a Failed branch fences
+///     off its dependents from the rest of the run without the run itself
+///     blowing up.
+///   - `ralph step reset` still transitions Failed → Pending explicitly,
+///     after which the scheduler picks it back up on the next run/resume.
+///
+/// `InProgress` and `Aborted` remain actionable: `InProgress` is the
+/// belt-and-suspenders for a row the stale-in-progress sweep missed (the
+/// sweep normally converts these to `Aborted`); `Aborted` is the post-Ctrl+C
+/// state that should retry transparently on the next run.
 fn is_actionable(status: StepStatus) -> bool {
     matches!(
         status,
-        StepStatus::Pending | StepStatus::Failed | StepStatus::InProgress | StepStatus::Aborted
+        StepStatus::Pending | StepStatus::InProgress | StepStatus::Aborted
     )
 }
 
@@ -1726,6 +3126,758 @@ fn resolve_window(all_steps: &[Step], options: &RunOptions) -> Result<RunWindow>
     let to_key = options.to.map(|n| all_steps[n - 1].sort_key.clone());
 
     Ok(RunWindow { from_key, to_key })
+}
+
+// ---------------------------------------------------------------------------
+// Topological scheduler (docs/dag-redesign.md §3.5)
+// ---------------------------------------------------------------------------
+//
+// A plan is a DAG of steps (§3.1). The runner no longer walks a flat
+// sort_key list; each tick it computes the *runnable set* and picks the
+// next step by a deterministic tie-break. Phase 1 implements scheduling
+// only — interruptions (Phase 2), reviews/concurrency (Phase 3) layer on
+// later. With no dependency edges every step has topological depth 0, so
+// the tie-break collapses to sort_key order and a linear plan executes
+// byte-identically to today.
+
+/// Topological depth of every step in `steps`.
+///
+/// `depth(s) = 0` when `s` has no in-scope dependencies; otherwise
+/// `1 + max(depth(d))` over the in-scope deps `d`. Edges pointing outside
+/// `steps` (e.g. a deleted prerequisite — `ON DELETE CASCADE` prevents
+/// this in the DB, but tests and defensive code may hit it) are ignored
+/// for depth. Memoized; the DAG-acyclicity hard invariant
+/// (`storage::would_create_step_cycle` on every edge mutation, V25
+/// backfill is a chain) guarantees termination, but a `visiting` guard
+/// still bounds recursion to 0 if acyclicity is ever violated.
+pub(crate) fn compute_step_depths(
+    steps: &[Step],
+    deps_of: &HashMap<String, Vec<String>>,
+) -> HashMap<String, usize> {
+    fn depth_of(
+        id: &str,
+        deps_of: &HashMap<String, Vec<String>>,
+        in_scope: &HashSet<String>,
+        memo: &mut HashMap<String, usize>,
+        visiting: &mut HashSet<String>,
+    ) -> usize {
+        if let Some(d) = memo.get(id) {
+            return *d;
+        }
+        if !visiting.insert(id.to_string()) {
+            // Cycle guard: acyclicity is a hard invariant; never recurse
+            // forever if it is somehow violated.
+            return 0;
+        }
+        let depth = deps_of
+            .get(id)
+            .map(|deps| {
+                deps.iter()
+                    .filter(|d| in_scope.contains(d.as_str()))
+                    .map(|d| 1 + depth_of(d, deps_of, in_scope, memo, visiting))
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        visiting.remove(id);
+        memo.insert(id.to_string(), depth);
+        depth
+    }
+
+    let in_scope: HashSet<String> = steps.iter().map(|s| s.id.clone()).collect();
+    let mut memo: HashMap<String, usize> = HashMap::new();
+    let mut visiting: HashSet<String> = HashSet::new();
+    for s in steps {
+        depth_of(&s.id, deps_of, &in_scope, &mut memo, &mut visiting);
+    }
+    memo
+}
+
+/// The deterministic scheduler tie-break ordering of two steps:
+/// `(topological depth, sort_key, short_id)` (docs/dag-redesign.md §3.5
+/// item 4). Depth first so a prerequisite always outranks its dependents,
+/// then the authored `sort_key`, then `short_id` as a stable final
+/// discriminator. With no edges depth is uniformly 0 and this collapses to
+/// "sort_key order" — the exact pre-DAG linear behavior.
+///
+/// This is the SINGLE definition of scheduler order. [`pick_next_step`]
+/// (execution) and the Phase-4 outline projection
+/// (`crate::tui::outline`, presentation) both call it so the drawn outline
+/// is byte-for-byte the execution order — there is no second, divergent
+/// sort anywhere in the codebase.
+pub(crate) fn step_schedule_cmp(
+    a: &Step,
+    b: &Step,
+    depths: &HashMap<String, usize>,
+) -> std::cmp::Ordering {
+    let da = depths.get(&a.id).copied().unwrap_or(0);
+    let db = depths.get(&b.id).copied().unwrap_or(0);
+    da.cmp(&db)
+        .then_with(|| a.sort_key.cmp(&b.sort_key))
+        .then_with(|| a.short_id.cmp(&b.short_id))
+}
+
+/// True when every dependency of `step_id` that is *in the run window* is
+/// `Complete`.
+///
+/// `window_status` holds only steps whose sort_key falls inside the run
+/// window. A dependency absent from it is treated as **satisfied** — that
+/// covers two cases that must both be non-blocking:
+///
+///  - The dep is outside the `--from`/`--to` window: the user explicitly
+///    bounded the run and is asserting the excluded steps' preconditions
+///    hold. This is exactly today's `--from`/`--to` behavior (the old
+///    linear loop never checked whether earlier steps were done) and is a
+///    hard parity requirement of this step.
+///  - The dep is out-of-scope / deleted: the graph must not deadlock on a
+///    prerequisite that no longer exists. `ON DELETE CASCADE` makes this
+///    unreachable from the DB; it only matters for the pure unit tests and
+///    as defense-in-depth.
+///
+/// (§3.1: runnable ⇔ every dependency satisfied. Reviews/§10 come in
+/// Phase 3 and are not consulted here. Both `Complete` and `Skipped`
+/// satisfy the edge: a `Skipped` dependency now unblocks its dependents
+/// so the branch keeps flowing (a skipped step isn't reviewed, so there's
+/// no review verdict to wait on). Without this, a `ralph skip` of a step
+/// with dependents would gate them forever and leave the plan stuck
+/// `InProgress`.)
+fn deps_satisfied(
+    step_id: &str,
+    deps_of: &HashMap<String, Vec<String>>,
+    window_status: &HashMap<&str, StepStatus>,
+) -> bool {
+    let Some(deps) = deps_of.get(step_id) else {
+        return true;
+    };
+    deps.iter().all(|d| match window_status.get(d.as_str()) {
+        Some(status) => matches!(*status, StepStatus::Complete | StepStatus::Skipped),
+        None => true,
+    })
+}
+
+/// The set of step ids in `plan_id` that currently have at least one open
+/// interruption — i.e. the steps the derived `Blocked` overlay shadows
+/// (docs/dag-redesign.md §3.4). Recomputed every scheduler tick so a
+/// cross-process resolution (a CLI/TUI in another process flipping the row
+/// to `resolved`) drops the step out of the blocked set and back into the
+/// runnable set at the very next tick — the bridge of §9 invariant 4.
+fn blocked_step_ids(conn: &Connection, plan_id: &str) -> Result<HashSet<String>> {
+    Ok(storage::list_open_interruptions_for_plan(conn, plan_id)?
+        .into_iter()
+        .map(|i| i.step_id)
+        .collect())
+}
+
+/// Max times the scheduler re-spawns a single step's review within one run
+/// before escalating to a needs-human blocker. A transient reviewer failure
+/// (mis-auth, flaky network, a one-off timeout) recovers by re-running the
+/// review against the already-committed work; a persistent one escalates
+/// rather than looping forever. Counted in-memory per run, so a fresh process
+/// — or a human resolving the escalation blocker — grants a fresh budget.
+const MAX_REVIEW_RESPAWNS: u32 = 3;
+
+/// Upper bound on the reviewer-error text carried into a review-failed
+/// escalation blocker body. Enough to show a stack/auth message without
+/// letting a pathological error bloat the interruption row.
+const REVIEW_ERROR_MAX_BYTES: usize = 2000;
+
+/// Byte-bound a reviewer-error string on a UTF-8 char boundary for inclusion
+/// in an escalation blocker body.
+fn truncate_review_error(msg: &str) -> String {
+    if msg.len() <= REVIEW_ERROR_MAX_BYTES {
+        return msg.to_string();
+    }
+    let mut end = REVIEW_ERROR_MAX_BYTES;
+    while end > 0 && !msg.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…(truncated)", &msg[..end])
+}
+
+/// Mark a committed step's review in flight (sole-writer DB write: Pending →
+/// InFlight), emit `ReviewStarted`, and spawn the detached read-only
+/// `run_review_subprocess` task into `reviews`.
+///
+/// Shared by the inline "step just committed" path and the recovery/retry
+/// scan ([`respawn_pending_reviews`]) so there is exactly one place that
+/// spawns a review. The task carries the step identity back even on `Err` so
+/// the sole-writer drain can reset `review_status` and let the scan re-run
+/// the review (never re-implement) — see [`drain_finished_reviews`].
+/// The review target for [`spawn_step_review`]: which plan/step at which
+/// committed `commit_sha` / `iteration` / 1-based `step_num`, plus the config
+/// (selects the review harness) and working dir. The DB handle, the reviews
+/// `JoinSet`, and the output sink stay separate lead arguments.
+struct ReviewSpawn<'a> {
+    plan: &'a Plan,
+    step: &'a Step,
+    config: &'a Config,
+    workdir: &'a Path,
+    commit_sha: String,
+    iteration: i32,
+    step_num: usize,
+}
+
+fn spawn_step_review(
+    conn: &Connection,
+    reviews: &mut tokio::task::JoinSet<crate::review::SpawnedReview>,
+    spawn: ReviewSpawn<'_>,
+    out: &OutputContext,
+) -> Result<()> {
+    let ReviewSpawn {
+        plan,
+        step,
+        config,
+        workdir,
+        commit_sha,
+        iteration,
+        step_num,
+    } = spawn;
+    // Orchestrator-side DB write (sole writer): Pending -> InFlight.
+    storage::update_step_review_status(conn, &step.id, crate::plan::ReviewStatus::InFlight)?;
+    if out.format == OutputFormat::Json {
+        output::emit_ndjson(&RunEvent::ReviewStarted {
+            step_id: step.id.clone(),
+            step_num,
+            commit_sha: commit_sha.clone(),
+            iteration,
+        })?;
+    }
+    // Owned clones so the detached task is `'static` and `Send`.
+    let plan_for_review = plan.clone();
+    let step_for_review = step.clone();
+    let config_for_review = config.clone();
+    let workdir_for_review = workdir.to_path_buf();
+    let review_step_id = step_for_review.id.clone();
+    reviews.spawn(async move {
+        let result = crate::review::run_review_subprocess(crate::review::ReviewSubprocessArgs {
+            plan: &plan_for_review,
+            step: &step_for_review,
+            config: &config_for_review,
+            workdir: &workdir_for_review,
+            commit_sha: &commit_sha,
+            iteration,
+            step_num,
+        })
+        .await;
+        crate::review::SpawnedReview {
+            step_id: review_step_id,
+            iteration,
+            result,
+        }
+    });
+    Ok(())
+}
+
+/// Recover and retry reviews for committed steps whose review is pending but
+/// not in flight, and return the set of every step currently *under review*
+/// (review pending or in flight) so the caller can exclude them from
+/// implementation picking.
+///
+/// A step is "awaiting review" when it is `InProgress`, its `review_status` is
+/// `Pending`/`InFlight`, and it has a durable committed execution-log row. Two
+/// situations leave such a step with `review_status = Pending` and no live
+/// reviewer task in this process:
+///
+///  - a hard crash mid-review (the stale sweep now keeps the step `InProgress`
+///    and resets `InFlight` → `Pending` instead of aborting + re-implementing
+///    it); or
+///  - a transient reviewer error (the drain reset it to `Pending`).
+///
+/// For each, this re-spawns the review against the durable committed SHA —
+/// **never** re-implementing — bounded by [`MAX_REVIEW_RESPAWNS`]. On budget
+/// exhaustion it raises a single needs-human blocker (the step then renders
+/// derived `Blocked`, gating its dependents and finalizing the plan
+/// `Interrupted`) and resets the in-memory budget, so resolving that blocker
+/// grants a fresh round of review attempts.
+///
+/// Returns an empty set for any linear / no-review plan, so that path stays
+/// byte-identical to before.
+/// Inputs to [`respawn_pending_reviews`] besides the lead `conn` / `reviews`
+/// JoinSet / `out` sink: the plan + its `all_steps`, the run `window`, the
+/// derived-`blocked` set, the in-memory respawn budget + last-error maps, and
+/// the config / working dir needed to (re)spawn a reviewer.
+struct RespawnReviews<'a> {
+    plan: &'a Plan,
+    all_steps: &'a [Step],
+    window: &'a RunWindow,
+    blocked: &'a HashSet<String>,
+    review_respawns: &'a mut HashMap<String, u32>,
+    last_review_error: &'a HashMap<String, String>,
+    config: &'a Config,
+    workdir: &'a Path,
+}
+
+fn respawn_pending_reviews(
+    conn: &Connection,
+    reviews: &mut tokio::task::JoinSet<crate::review::SpawnedReview>,
+    args: RespawnReviews<'_>,
+    out: &OutputContext,
+) -> Result<HashSet<String>> {
+    let RespawnReviews {
+        plan,
+        all_steps,
+        window,
+        blocked,
+        review_respawns,
+        last_review_error,
+        config,
+        workdir,
+    } = args;
+    let mut under_review: HashSet<String> = HashSet::new();
+    for step in all_steps {
+        // Respect the run window. A committed-but-unreviewed step outside the
+        // requested `--from`/`--to` range is not part of this run — the picker
+        // already excludes it from implementation, so recovering its review
+        // here would burn a review-harness invocation (and, on persistent
+        // failure, raise a needs-human blocker) for a step the user
+        // deliberately scoped out. `--one` keeps the full-plan window by
+        // design (`one_target_id` enforces single-step *implementation*, not
+        // review recovery), so this is a no-op for it and for any unwindowed
+        // run — preserving the linear/no-window behavior exactly.
+        if !window.contains_key(&step.sort_key) {
+            continue;
+        }
+        if step.status != StepStatus::InProgress {
+            continue;
+        }
+        if !matches!(
+            step.review_status,
+            Some(crate::plan::ReviewStatus::Pending) | Some(crate::plan::ReviewStatus::InFlight)
+        ) {
+            continue;
+        }
+        // The durable proof the implementation exists: the single committed
+        // attempt's SHA + iteration. Absent it, the step never committed
+        // (e.g. review-enabled but crashed mid-implementation) — it is NOT
+        // awaiting review and stays a normal runnable/implementable step.
+        let Some((commit_sha, iteration)) = storage::committed_review_target(conn, &step.id)?
+        else {
+            continue;
+        };
+        under_review.insert(step.id.clone());
+
+        // In flight in THIS process: a live reviewer task owns it; the drain
+        // will finalize or reset it. Don't double-spawn.
+        if step.review_status == Some(crate::plan::ReviewStatus::InFlight) {
+            continue;
+        }
+        // Pending + committed: needs a (re)spawn — unless it already carries
+        // an open interruption (e.g. a prior escalation blocker), in which
+        // case it is gated as derived-`Blocked` awaiting a human.
+        if blocked.contains(&step.id) {
+            continue;
+        }
+        let attempts = review_respawns.entry(step.id.clone()).or_insert(0);
+        if *attempts >= MAX_REVIEW_RESPAWNS {
+            // Persistent review failure: escalate to a human once, then reset
+            // the in-memory budget so resolving the blocker (which un-gates
+            // the step) grants a fresh round of attempts on the next tick.
+            raise_review_failed_blocker(
+                conn,
+                step,
+                iteration,
+                last_review_error.get(&step.id).map(String::as_str),
+                out,
+            )?;
+            *attempts = 0;
+            continue;
+        }
+        *attempts += 1;
+        let step_num = step_number_in_plan(all_steps, step);
+        spawn_step_review(
+            conn,
+            reviews,
+            ReviewSpawn {
+                plan,
+                step,
+                config,
+                workdir,
+                commit_sha,
+                iteration,
+                step_num,
+            },
+            out,
+        )?;
+    }
+    Ok(under_review)
+}
+
+/// Raise the single needs-human blocker for a committed step whose review has
+/// failed to run [`MAX_REVIEW_RESPAWNS`] times. The step stays `InProgress`
+/// with its commit intact; the open interruption shadows it as derived
+/// `Blocked`, gating dependents and finalizing the plan `Interrupted`.
+/// Resolving the blocker re-runs ONLY the review (the scan picks the step back
+/// up) — it never re-implements.
+fn raise_review_failed_blocker(
+    conn: &Connection,
+    step: &Step,
+    iteration: i32,
+    last_error: Option<&str>,
+    out: &OutputContext,
+) -> Result<()> {
+    if storage::get_step_by_id(conn, &step.id)?.is_none() {
+        return Ok(());
+    }
+    // Surface the last reviewer-subprocess error (captured by
+    // `drain_finished_reviews`) so the human can act on the actual cause —
+    // "review harness auth failed: 401", a timeout, etc. — instead of a
+    // generic "could not run".
+    let cause = match last_error {
+        Some(e) => format!("\n\nLast reviewer error:\n{e}"),
+        None => String::new(),
+    };
+    let interruption_id = storage::insert_interruption(
+        conn,
+        &step.id,
+        iteration,
+        crate::plan::InterruptionKind::Blocker,
+        &format!(
+            "review could not run for this step after {MAX_REVIEW_RESPAWNS} attempts. The \
+             implementation is committed but UNREVIEWED. Fix the review configuration (e.g. \
+             review-harness auth/model), then resolve this blocker — ralph will re-run ONLY \
+             the review against the existing commit (it will NOT re-implement the step). \
+             ralph does not continue on unreviewed work.{cause}"
+        ),
+        &[],
+    )?;
+    output::emit_interruption_raised(
+        conn,
+        out.format == OutputFormat::Json,
+        &interruption_id,
+        &step.id,
+        crate::plan::InterruptionKind::Blocker.as_str(),
+        false,
+        iteration,
+    );
+    Ok(())
+}
+
+/// One scheduler tick: pick the next step to execute, or `None` when the
+/// runnable set is empty.
+///
+/// Runnable ⇔ in the run window, an actionable status (not terminal —
+/// [`is_actionable`]), **not `Blocked`** (no open interruption shadows it —
+/// docs/dag-redesign.md §3.4/§3.5: a blocked branch is excluded from the
+/// runnable set so its dependents wait while the scheduler picks another
+/// branch), not already executed this invocation, and every dependency
+/// `Complete` ([`deps_satisfied`]). Among runnable steps the deterministic
+/// tie-break is `(topological depth, sort_key, short_id)` (§3.5 item 4):
+/// depth first so a prerequisite always outranks its dependents, then the
+/// authored sort_key, then short_id as a stable final discriminator.
+/// Concurrency (§3.5 items 2–3) is Phase 3 — this returns a single step.
+///
+/// `blocked_step_ids` is the set of step ids that currently have an open
+/// interruption. It is the *only* place the derived `Blocked` overlay
+/// gates scheduling: the stored status after a pause is `Pending`
+/// (actionable), so without this exclusion the scheduler would re-pick the
+/// blocked step forever. An empty set (no interruptions) reproduces the
+/// pre-interruption behavior exactly, so a linear plan is unaffected.
+fn pick_next_step<'a>(
+    all_steps: &'a [Step],
+    deps_of: &HashMap<String, Vec<String>>,
+    depths: &HashMap<String, usize>,
+    window: &RunWindow,
+    executed_step_ids: &HashSet<String>,
+    blocked_step_ids: &HashSet<String>,
+) -> Option<&'a Step> {
+    // Status of every step *inside the run window* only — deps outside the
+    // window must not gate (preserves `--from`/`--to`; see `deps_satisfied`).
+    let window_status: HashMap<&str, StepStatus> = all_steps
+        .iter()
+        .filter(|s| window.contains_key(&s.sort_key))
+        .map(|s| (s.id.as_str(), s.status))
+        .collect();
+
+    all_steps
+        .iter()
+        .filter(|s| {
+            window.contains_key(&s.sort_key)
+                && is_actionable(s.status)
+                && !blocked_step_ids.contains(&s.id)
+                && !executed_step_ids.contains(&s.id)
+                && deps_satisfied(&s.id, deps_of, &window_status)
+        })
+        .min_by(|a, b| step_schedule_cmp(a, b, depths))
+}
+
+/// Teardown helper for Ctrl+C / abort. Single non-blocking drain pass so
+/// every review whose subprocess already finished gets its verdict
+/// finalized (status + git-note + V29 corrective bridge), then
+/// `JoinSet::shutdown` aborts the rest so `kill_on_drop` fires on each
+/// review child. The two arms together close the §3.3 invariant on the
+/// abort path: no review verdict is silently discarded, and no review
+/// child is left orphaned. Failures inside the drain are logged but not
+/// propagated — the caller is already on the teardown path and the abort
+/// status set immediately after is the authoritative outcome.
+async fn drain_reviews_on_abort(
+    conn: &Connection,
+    plan: &Plan,
+    reviews: &mut tokio::task::JoinSet<crate::review::SpawnedReview>,
+    workdir: &Path,
+    out: &OutputContext,
+    abort_rx: &mut watch::Receiver<CancelState>,
+) {
+    let before = reviews.len();
+    // Non-blocking drain: absorb every verdict that is already finished.
+    // We deliberately pass `block=false` so the abort isn't held up by a
+    // still-in-flight reviewer.
+    // On the teardown path no escalation will run, so the captured reviewer
+    // errors are discarded into a throwaway map.
+    let mut discarded_review_errors = HashMap::new();
+    let drained_result = drain_finished_reviews(
+        conn,
+        reviews,
+        DrainReviews {
+            plan,
+            workdir,
+            block: false,
+            abort_rx,
+            last_review_error: &mut discarded_review_errors,
+        },
+        out,
+    )
+    .await;
+    if let Err(e) = drained_result {
+        eprintln!("Warning: failed to drain finished reviews on abort: {e:#}");
+    }
+    let aborted = reviews.len();
+    let drained = before.saturating_sub(aborted);
+    if before > 0 {
+        eprintln!(
+            "Reviews on abort: drained {} verdict(s), aborting {} still-in-flight reviewer(s).",
+            drained, aborted
+        );
+    }
+    // Shutdown the rest: aborts every still-running review task and waits
+    // for them to be cancelled. Each spawned review owns its
+    // `tokio::process::Child` via `kill_on_drop(true)`, so abort propagates
+    // through to the harness subprocess.
+    reviews.shutdown().await;
+}
+
+/// Drain finished concurrent reviews as the SOLE DAG writer
+/// (docs/dag-redesign.md §3.5 item 3 / §9-inv-3 / §10).
+///
+/// Called by the orchestrator (`run_plan`) at every scheduler tick. The
+/// review subprocesses run detached in `reviews` (a `JoinSet`) — `Send`,
+/// holding no `Connection` and no impl permit, so they overlap whatever the
+/// scheduler implements next. This is the *only* place review verdicts hit
+/// the DB / git-notes / the §10 DAG mutation, all serialized on the single
+/// scheduler loop so the §9-inv-3 single-writer guarantee holds even with a
+/// review in flight.
+///
+/// `block`:
+///  - `false` (mid-tick): non-blockingly reap *every already-finished*
+///    review (`try_join_next`), then return. Reviews still running are left
+///    in the set for a later tick — the scheduler keeps implementing
+///    unrelated work meanwhile (the §3.5-item-3 concurrency payoff).
+///  - `true` (runnable set empty / post-loop): the runnable set cannot grow
+///    without a review returning, so `await` the *next* finished review
+///    (`join_next`), drain it (and any other already-finished ones), then
+///    return. This is what lets a passed review un-gate dependents / a
+///    failed review's corrective step re-enter scheduling, and guarantees
+///    the plan is never finalized with a review pending (§3.3).
+///    The blocking wait is also abort-cancellable: a Ctrl+C that arrives
+///    while we are parked on `join_next` returns early so the orchestrator
+///    can hit the Aborted-branch drain instead of waiting on a reviewer
+///    that may have no built-in timeout (`config.review.timeout_secs` is
+///    `None` by default — without this select, Ctrl+C would be silently
+///    ignored until the reviewer naturally returns).
+///
+/// For each finished review it calls [`crate::review::finalize_review`] (the
+/// sole-writer verdict sink): `Pass` ⇒ promote the reviewed step
+/// `InProgress → Complete` (its dependents become runnable next tick);
+/// `Fail` ⇒ the V29 bridge row is written, then every open corrective
+/// request for the plan is consumed via
+/// [`crate::review::consume_corrective_request`] (§10 insert + re-parent +
+/// recursion cap), oldest-first for deterministic, reproducible scheduling
+/// (§3.5 item 4 / §11). Neither case ever silently passes un-reviewed work:
+/// a review **error** (e.g. the §9-inv-2 read-only invariant fired, or a
+/// misconfigured/timed-out review harness — the reviewer never produced a
+/// verdict) leaves the reviewed step non-terminal and raises a `kind=Blocker`
+/// interruption on it, exactly like an executor-raised blocker: the step
+/// renders derived `Blocked` (gating its dependents), the plan finalizes as
+/// derived `Interrupted`, and the run KEEPS GOING on other runnable branches
+/// rather than discarding healthy reviewed work — resolving the blocker
+/// re-runs that step from a clean state on the next run/resume. A task
+/// **panic** (the task died before handing back even its step id, so no
+/// targeted recovery is possible) is still fail-safe: the plan is marked
+/// `Failed` and `Some(PlanStatus::Failed)` is returned so the caller stops.
+///
+/// Returns `Ok(None)` on success (drained, or nothing to drain) and
+/// `Ok(Some(final_status))` when the run must terminate.
+/// Inputs to [`drain_finished_reviews`] besides the lead `conn` / `reviews`
+/// JoinSet / `out` sink: the plan, the working dir, whether to `block` on the
+/// first finished review, the abort receiver, and the mutable last-error map
+/// the drain records reviewer-subprocess failures into.
+struct DrainReviews<'a> {
+    plan: &'a Plan,
+    workdir: &'a Path,
+    block: bool,
+    abort_rx: &'a mut watch::Receiver<CancelState>,
+    last_review_error: &'a mut HashMap<String, String>,
+}
+
+async fn drain_finished_reviews(
+    conn: &Connection,
+    reviews: &mut tokio::task::JoinSet<crate::review::SpawnedReview>,
+    args: DrainReviews<'_>,
+    out: &OutputContext,
+) -> Result<Option<PlanStatus>> {
+    let DrainReviews {
+        plan,
+        workdir,
+        block,
+        abort_rx,
+        last_review_error,
+    } = args;
+    if reviews.is_empty() {
+        consume_open_corrective_requests(conn, plan, out)?;
+        return Ok(None);
+    }
+
+    // If asked to block, wait for the first one; otherwise reap only what is
+    // already done. After the (optional) blocking wait, greedily drain every
+    // other already-finished task in this same call.
+    //
+    // The blocking wait races on `abort_rx.changed()` so a Ctrl+C that
+    // arrives while we are parked on `join_next` returns early rather than
+    // waiting on a reviewer that may have no built-in timeout. The
+    // orchestrator's loop then re-checks `abort_rx` at the top of the next
+    // tick and falls into the Aborted-branch drain (which itself runs
+    // `drain_finished_reviews` with `block=false`).
+    let mut joined: Vec<std::result::Result<crate::review::SpawnedReview, tokio::task::JoinError>> =
+        Vec::new();
+    if block {
+        // Short-circuit if the abort signal is already latched: don't park
+        // on `join_next` at all. The caller will see `Ok(None)` and re-loop
+        // straight into its cancel check.
+        if matches!(
+            *abort_rx.borrow(),
+            Some(crate::signal::CancelReason::Aborted)
+        ) {
+            return Ok(None);
+        }
+        tokio::select! {
+            biased;
+            // If the abort signal changes (e.g. to Aborted) while we are
+            // parked, bail out so the caller can re-check and start the
+            // teardown drain. The reviewer task is left in the JoinSet for
+            // the caller to handle (shutdown / continue draining).
+            res = abort_rx.changed() => {
+                // `changed()` returns `Err` only when the sender was
+                // dropped — at run-teardown time. Either way we should not
+                // keep blocking on a reviewer that may never return.
+                let _ = res;
+                return Ok(None);
+            }
+            j_opt = reviews.join_next() => {
+                match j_opt {
+                    Some(j) => joined.push(j),
+                    None => return Ok(None), // emptied concurrently — nothing to do
+                }
+            }
+        }
+    }
+    while let Some(j) = reviews.try_join_next() {
+        joined.push(j);
+    }
+
+    for j in joined {
+        let crate::review::SpawnedReview {
+            step_id,
+            iteration: _iteration,
+            result,
+        } = match j {
+            Ok(sr) => sr,
+            Err(join_err) => {
+                // A panicked / aborted review task: the task died before it
+                // could hand back even its step id, so a targeted recovery
+                // isn't possible. Fail-safe — never pass un-reviewed work.
+                eprintln!("Review task failed to complete: {join_err}");
+                storage::update_plan_status(conn, &plan.id, PlanStatus::Failed)?;
+                return Ok(Some(PlanStatus::Failed));
+            }
+        };
+        let review = match result {
+            Ok(r) => r,
+            Err(e) => {
+                // The review SUBPROCESS errored (the §9-inv-2 read-only
+                // invariant fired, the review harness is misconfigured, or it
+                // timed out — see `ReviewConfig::effective_timeout_secs`) — the
+                // reviewer never produced a verdict. But the implementation
+                // itself SUCCEEDED and is committed; the step is `InProgress` +
+                // `review_status = InFlight`, with a durable committed SHA in
+                // its execution log.
+                //
+                // Reset `review_status` to `Pending` (KEEPING `InProgress` and
+                // the commit) so the scheduler RE-RUNS ONLY THE REVIEW against
+                // the existing commit on a later tick — it NEVER re-implements
+                // the step. The bounded respawn loop
+                // (`respawn_pending_reviews` / `MAX_REVIEW_RESPAWNS`) retries a
+                // transient failure and, only on a persistent one, escalates to
+                // a needs-human blocker. A committed-but-unreviewed step stays
+                // non-terminal and gates its dependents (`deps_satisfied`
+                // requires `Complete`), so no unreviewed work is ever promoted
+                // (§9-inv-2). The run keeps going on other runnable branches —
+                // a transient reviewer hiccup must not kill healthy work
+                // elsewhere in the DAG.
+                eprintln!("Review failed (will re-run the review): {e:#}");
+                // Remember the cause so the eventual needs-human escalation
+                // blocker (`respawn_pending_reviews` after MAX_REVIEW_RESPAWNS)
+                // can surface it — otherwise the only record is this stderr
+                // line, which is invisible in a TUI-spawned runner and scrolls
+                // away in a CLI run. Bounded so a pathological error can't bloat
+                // the blocker body.
+                last_review_error.insert(step_id.clone(), truncate_review_error(&format!("{e:#}")));
+                if storage::get_step_by_id(conn, &step_id)?.is_some() {
+                    storage::update_step_review_status(
+                        conn,
+                        &step_id,
+                        crate::plan::ReviewStatus::Pending,
+                    )?;
+                }
+                // Keep draining the remaining finished reviews and let the run
+                // continue (falls through to `Ok(None)` below). The reset step
+                // is picked up by `respawn_pending_reviews` on the next tick.
+                continue;
+            }
+        };
+
+        // SOLE DB writer: finalize the verdict (status + git-note +, on
+        // FAIL, the V29 bridge row).
+        match crate::review::finalize_review(conn, workdir, &review, out)? {
+            crate::review::ReviewOutcome::Passed => {}
+            crate::review::ReviewOutcome::Failed { .. } => {
+                // The reviewer only *requested* a corrective step (V29
+                // bridge row). Consumed just below as the sole writer.
+            }
+            crate::review::ReviewOutcome::Discarded => {
+                // The reviewed step was removed (CASCADE) while its review
+                // was in flight; the verdict is for a step that no longer
+                // exists. Nothing to promote, no corrective to request —
+                // skip it rather than failing the whole run.
+            }
+        }
+    }
+
+    consume_open_corrective_requests(conn, plan, out)?;
+    Ok(None)
+}
+
+/// Drain corrective-step requests for `plan` as the SOLE DAG writer
+/// (§9-inv-3 / §10). Called both after reviews finish and at the top of each
+/// scheduler tick so a restarted run cannot skip over a stranded request from
+/// a prior failed review.
+fn consume_open_corrective_requests(
+    conn: &Connection,
+    plan: &Plan,
+    out: &OutputContext,
+) -> Result<()> {
+    for req in storage::list_open_corrective_step_requests_for_plan(conn, &plan.id)? {
+        crate::review::consume_corrective_request(conn, plan, &req, out)?;
+    }
+    Ok(())
 }
 
 /// Sweep any stale InProgress step rows and emit a log line if the sweep
@@ -1822,6 +3974,9 @@ fn dry_run_report(plan: &Plan, all_steps: &[Step], steps_to_run: &[Step]) -> Res
             StepStatus::Failed => "WOULD RETRY",
             StepStatus::InProgress => "WOULD RESUME",
             StepStatus::Aborted => "WOULD RETRY",
+            // Derived overlay; never stored, so a dry run (which reads stored
+            // statuses) won't normally see it.
+            StepStatus::Blocked => "BLOCKED (open interruption)",
         };
         println!(
             "  [{}/{}] Step {}: {} [{}]",
@@ -1874,14 +4029,60 @@ mod tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
-            retry_strategy: None,
+            review_enabled: None,
+            max_review_corrections: None,
         }
+    }
+
+    /// Fix #4: source-shape proof that the orchestrator loop in
+    /// `run_plan_inner` clears `run_locks.step_id` immediately after
+    /// `execute_step` returns and BEFORE the next iteration's pick + execute.
+    /// Without this call, `run_locks.step_id` would still name the previous
+    /// step until the next step's first `write_phase` fires (COALESCE
+    /// semantics in `update_live_phase`), letting an orphan subprocess from
+    /// the prior step bind a question to the wrong step.
+    ///
+    /// The full integration drive (A→NULL→B transition observed in the DB)
+    /// lives in `storage::tests::test_clear_live_run_step_models_orchestrator_a_to_b_transition`
+    /// — wiring an end-to-end orchestrator-loop test would require a real
+    /// harness subprocess, multiple steps, and exec timing. This source-shape
+    /// test catches drift: a future refactor that drops the call (or moves
+    /// it to the wrong place) will trip here.
+    #[test]
+    fn test_orchestrator_clears_live_run_step_between_iterations() {
+        let src = include_str!("runner.rs");
+        // The clear must appear in the scheduler tick AFTER the `execute_step`
+        // await and BEFORE the impl-permit drop (so the next iteration's
+        // pick can't observe a stale step_id). Anchor on the unique
+        // `drop(_in_flight);` site that immediately follows the
+        // `execute_step(...).await?` — indentation-agnostic so a future
+        // re-extraction that changes the nesting level still passes as long as
+        // the ordering invariant holds.
+        let exec_step_pos = src
+            .find("drop(_in_flight);")
+            .expect("execute_step followed by drop(_in_flight) not found");
+        let after = &src[exec_step_pos..];
+        let clear_pos = after.find("storage::clear_live_run_step(").expect(
+            "clear_live_run_step must be called immediately after execute_step returns \
+                 (Fix #4: widen the run_locks.step_id window between consecutive steps)",
+        );
+        // And it must precede the impl_permit drop further down — the impl
+        // permit's drop is logically "we are leaving this step's slot", so the
+        // clear must happen first to make the "no live step" snapshot durable
+        // before another scheduler tick can run.
+        let permit_drop = after
+            .find("drop(impl_permit);")
+            .expect("impl_permit drop site not found");
+        assert!(
+            clear_pos < permit_drop,
+            "clear_live_run_step must precede `drop(impl_permit)` so the gap \
+             snapshot is durable before another scheduler tick observes it",
+        );
     }
 
     // -- validate_plan_status tests --
@@ -1940,6 +4141,7 @@ mod tests {
         (0..n)
             .map(|i| Step {
                 id: format!("s{i}"),
+                short_id: String::new(),
                 plan_id: "p1".to_string(),
                 sort_key: format!("a{i}"),
                 title: format!("Step {}", i + 1),
@@ -1956,7 +4158,9 @@ mod tests {
                 skipped_reason: None,
                 change_policy: crate::plan::ChangePolicy::Required,
                 tags: vec![],
-                retry_strategy: None,
+                review_enabled: None,
+                review_status: None,
+                corrects_step_id: None,
             })
             .collect()
     }
@@ -2071,21 +4275,41 @@ mod tests {
     }
 
     #[test]
-    fn test_find_resume_point_failed() {
+    fn test_find_resume_point_skips_failed() {
+        // Post-fix: a Failed row is a human Mark-Failed decision; resume
+        // must skip it (the explicit-recovery path is `ralph step reset`).
+        // Here we have Complete, Failed, Pending: resume targets the
+        // Pending row, not the Failed one.
         let mut steps = make_steps(3);
         steps[0].status = StepStatus::Complete;
         steps[1].status = StepStatus::Failed;
         let idx = find_resume_point(&steps).unwrap();
-        assert_eq!(idx, 1);
+        assert_eq!(idx, 2, "Failed step skipped; Pending step picked");
     }
 
     #[test]
-    fn test_find_resume_point_prefers_in_progress_over_failed() {
+    fn test_find_resume_point_in_progress_over_failed() {
+        // Post-fix: even when an InProgress row exists alongside Failed,
+        // the Failed row is ignored entirely (not just deprioritized) —
+        // InProgress is picked because it's the next non-Failed row, not
+        // because of any preference ordering vs Failed.
         let mut steps = make_steps(3);
         steps[0].status = StepStatus::Failed;
         steps[1].status = StepStatus::InProgress;
         let idx = find_resume_point(&steps).unwrap();
-        assert_eq!(idx, 1); // in_progress takes priority
+        assert_eq!(idx, 1, "Failed skipped; InProgress picked");
+    }
+
+    #[test]
+    fn test_find_resume_point_all_failed_errors() {
+        // Post-fix: a plan whose only non-Complete work is Failed has no
+        // resumable work. `find_resume_point` returns an error and
+        // `resume_plan` surfaces it as "no work to resume."
+        let mut steps = make_steps(2);
+        steps[0].status = StepStatus::Failed;
+        steps[1].status = StepStatus::Failed;
+        let result = find_resume_point(&steps);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -2108,34 +4332,50 @@ mod tests {
     #[test]
     fn test_resume_resets_aborted_step_to_pending() {
         let conn = setup();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
         let (s2, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Second",
-            "d2",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Second",
+                description: "d2",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::update_step_status(&conn, &s2.id, StepStatus::Aborted).unwrap();
@@ -2147,16 +4387,228 @@ mod tests {
         let step = &steps[resume_idx];
         assert_eq!(step.status, StepStatus::Aborted);
 
-        // Replicate the reset condition from resume_plan
-        if step.status == StepStatus::Failed
-            || step.status == StepStatus::InProgress
-            || step.status == StepStatus::Aborted
-        {
+        // Replicate the (post-fix) reset condition from resume_plan: only
+        // InProgress / Aborted are reset; Failed is preserved.
+        if step.status == StepStatus::InProgress || step.status == StepStatus::Aborted {
             storage::reset_step(&conn, &step.id).unwrap();
         }
 
         let refreshed = storage::list_steps(&conn, &plan.id).unwrap();
         assert_eq!(refreshed[resume_idx].status, StepStatus::Pending);
+    }
+
+    /// BUG #1: `ralph resume` must NOT call `reset_step` on a Failed row.
+    /// Pre-fix, `find_resume_point` returned the Failed step and
+    /// `resume_plan` immediately reset it to Pending, silently un-doing the
+    /// operator's Mark-Failed decision. Post-fix, the Failed row is
+    /// excluded from the resumable set and the Pending sibling is picked
+    /// for resumption instead. We assert (a) the Failed step is untouched
+    /// (status / attempts / execution-logs preserved) and (b) the Pending
+    /// sibling is what resume picks.
+    #[test]
+    fn test_resume_skips_failed_steps() {
+        let conn = setup();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "rsf",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let (failed_step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            crate::storage::NewStep {
+                title: "Will fail",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+        // Simulate the post-Mark-Failed shape: attempts at max, status
+        // Failed, an audit log row recording the exhausted cycle.
+        storage::set_step_attempts(&conn, &failed_step.id, 3).unwrap();
+        storage::update_step_status(&conn, &failed_step.id, StepStatus::Failed).unwrap();
+        storage::create_execution_log(&conn, &failed_step.id, 1, Some("attempt that failed"), None)
+            .unwrap();
+
+        let (pending_step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            crate::storage::NewStep {
+                title: "Independent",
+                description: "d2",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+        // pending_step is left Pending by create_step.
+
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        let resume_idx = find_resume_point(&steps).unwrap();
+        // Resume must pick the Pending sibling, not the Failed step.
+        assert_eq!(steps[resume_idx].id, pending_step.id);
+
+        // The Failed step is unchanged: status / attempts / logs all
+        // preserved. (`resume_plan` would now route to the Pending step;
+        // we verify Failed was not reset by checking its state directly.)
+        let after = storage::list_steps(&conn, &plan.id).unwrap();
+        let failed_after = after.iter().find(|s| s.id == failed_step.id).unwrap();
+        assert_eq!(
+            failed_after.status,
+            StepStatus::Failed,
+            "Failed step must not be flipped to Pending by resume"
+        );
+        assert_eq!(failed_after.attempts, 3, "Failed step attempts preserved");
+        let logs = storage::list_execution_logs_for_step(&conn, &failed_step.id).unwrap();
+        assert_eq!(
+            logs.len(),
+            1,
+            "Failed step execution logs preserved (not wiped by reset)"
+        );
+    }
+
+    /// BUG #1: a plan whose only remaining work is Failed has no resumable
+    /// work — `find_resume_point` errors and the resume CLI surfaces it.
+    /// The Failed step is left untouched (no silent reset).
+    #[test]
+    fn test_resume_with_only_failed_steps_does_nothing() {
+        let conn = setup();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "rof",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let (s1, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            crate::storage::NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+        storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
+        let (s2, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            crate::storage::NewStep {
+                title: "Second",
+                description: "d2",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+        storage::set_step_attempts(&conn, &s2.id, 3).unwrap();
+        storage::update_step_status(&conn, &s2.id, StepStatus::Failed).unwrap();
+
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        let result = find_resume_point(&steps);
+        assert!(
+            result.is_err(),
+            "no resumable work when only Complete + Failed remain"
+        );
+
+        // Failed step still Failed; reset never fired.
+        let after = storage::list_steps(&conn, &plan.id).unwrap();
+        let s2_after = after.iter().find(|s| s.id == s2.id).unwrap();
+        assert_eq!(s2_after.status, StepStatus::Failed);
+        assert_eq!(s2_after.attempts, 3);
+    }
+
+    /// BUG #1 defense-in-depth: `ralph step reset` (the explicit human
+    /// opt-in) MUST still flip a Failed step to Pending and clear its
+    /// execution-logs. The fix narrowed `resume_plan`'s automatic reset
+    /// path; the explicit-recovery path is untouched.
+    #[test]
+    fn test_explicit_step_reset_still_works_on_failed() {
+        let conn = setup();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "esr",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            crate::storage::NewStep {
+                title: "Failed step",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+        storage::set_step_attempts(&conn, &step.id, 3).unwrap();
+        storage::update_step_status(&conn, &step.id, StepStatus::Failed).unwrap();
+        storage::create_execution_log(&conn, &step.id, 1, Some("a1"), None).unwrap();
+        storage::create_execution_log(&conn, &step.id, 2, Some("a2"), None).unwrap();
+
+        // Explicit reset (the path `ralph step reset` uses).
+        let parked = storage::reset_step(&conn, &step.id).unwrap();
+        assert!(parked.is_none(), "no parked worktree on this step");
+
+        let after = storage::list_steps(&conn, &plan.id).unwrap();
+        let step_after = after.iter().find(|s| s.id == step.id).unwrap();
+        assert_eq!(step_after.status, StepStatus::Pending);
+        assert_eq!(step_after.attempts, 0);
+        let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
+        assert!(
+            logs.is_empty(),
+            "explicit reset still clears execution logs"
+        );
     }
 
     // -- find_current_step tests --
@@ -2184,33 +4636,49 @@ mod tests {
     #[test]
     fn test_skip_step_by_number() {
         let conn = setup();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-        storage::create_step(
+        let plan = storage::create_plan(
             &conn,
-            &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         storage::create_step(
             &conn,
             &plan.id,
-            "Second",
-            "d2",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+        storage::create_step(
+            &conn,
+            &plan.id,
+            crate::storage::NewStep {
+                title: "Second",
+                description: "d2",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -2231,33 +4699,49 @@ mod tests {
     #[test]
     fn test_skip_step_current() {
         let conn = setup();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::create_step(
             &conn,
             &plan.id,
-            "Second",
-            "d2",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Second",
+                description: "d2",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -2295,19 +4779,33 @@ mod tests {
         let _guard = crate::signal::lock_exit_cleanup_test();
 
         let conn = setup();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::InProgress).unwrap();
@@ -2351,19 +4849,33 @@ mod tests {
         crate::signal::set_step_in_flight(false);
 
         let conn = setup();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::InProgress).unwrap();
@@ -2393,22 +4905,46 @@ mod tests {
 
         let conn = setup();
         let project = "/p";
-        let plan =
-            storage::create_plan(&conn, "target", project, "b", "d", None, None, &[]).unwrap();
-        let other =
-            storage::create_plan(&conn, "other", project, "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "target",
+                project,
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let other = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "other",
+                project,
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::InProgress).unwrap();
@@ -2419,12 +4955,16 @@ mod tests {
         )
         .unwrap();
 
+        // Use Commit here so the test exercises the new stale-InProgress +
+        // Commit fallthrough (has_uncommitted_changes returns false on the
+        // non-repo /p project, so we take the safe no-op arm but still cover
+        // the branch and the "no DB request left" assertions).
         let skipped = skip_step(
             &conn,
             &plan,
             Some(1),
             None,
-            crate::git::ParkStrategyKind::Stash,
+            crate::git::ParkStrategyKind::Commit,
         )
         .unwrap();
         assert_eq!(skipped, 1);
@@ -2446,19 +4986,33 @@ mod tests {
     #[test]
     fn test_skip_step_rejects_complete() {
         let conn = setup();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
@@ -2476,19 +5030,33 @@ mod tests {
     #[test]
     fn test_skip_step_out_of_range() {
         let conn = setup();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         storage::create_step(
             &conn,
             &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -2505,19 +5073,33 @@ mod tests {
     #[test]
     fn test_skip_step_persists_reason() {
         let conn = setup();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         storage::create_step(
             &conn,
             &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -2542,19 +5124,33 @@ mod tests {
     #[test]
     fn test_skip_step_no_reason_stores_null() {
         let conn = setup();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         storage::create_step(
             &conn,
             &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -2575,19 +5171,33 @@ mod tests {
     #[test]
     fn test_reset_clears_skipped_reason() {
         let conn = setup();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -2609,19 +5219,33 @@ mod tests {
     #[test]
     fn test_skip_step_allows_failed() {
         let conn = setup();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::Failed).unwrap();
@@ -2659,27 +5283,31 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(
             &conn,
-            "s",
-            &dir.to_string_lossy(),
-            "b",
-            "d",
-            None,
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "s",
+                project: &dir.to_string_lossy(),
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         let (s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         // Pending (NOT in-flight). request_skip_in_flight will be a no-op
@@ -2755,7 +5383,6 @@ mod tests {
     #[test]
     fn test_run_options_default() {
         let opts = RunOptions::default();
-        assert!(!opts.all_plans);
         assert!(!opts.one);
         assert!(opts.from.is_none());
         assert!(opts.to.is_none());
@@ -2769,7 +5396,19 @@ mod tests {
     #[test]
     fn test_plan_status_transitions_in_storage() {
         let conn = setup();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         // planning -> ready
         storage::update_plan_status(&conn, &plan.id, PlanStatus::Ready).unwrap();
@@ -2796,7 +5435,19 @@ mod tests {
     #[test]
     fn test_plan_status_failed_transition() {
         let conn = setup();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         storage::update_plan_status(&conn, &plan.id, PlanStatus::InProgress).unwrap();
         storage::update_plan_status(&conn, &plan.id, PlanStatus::Failed).unwrap();
@@ -2811,19 +5462,33 @@ mod tests {
     #[test]
     fn test_step_status_transitions() {
         let conn = setup();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -2841,19 +5506,33 @@ mod tests {
     #[test]
     fn test_step_status_failed_and_skipped() {
         let conn = setup();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -2975,10 +5654,32 @@ mod tests {
         use tokio::sync::watch;
 
         let conn = setup();
-        let p1 =
-            storage::create_plan(&conn, "cyc-a", "/tmp/cyc", "b1", "d1", None, None, &[]).unwrap();
-        let p2 =
-            storage::create_plan(&conn, "cyc-b", "/tmp/cyc", "b2", "d2", None, None, &[]).unwrap();
+        let p1 = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "cyc-a",
+                project: "/tmp/cyc",
+                branch_name: "b1",
+                description: "d1",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let p2 = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "cyc-b",
+                project: "/tmp/cyc",
+                branch_name: "b2",
+                description: "d2",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         // Mark both as Ready so they're runnable.
         storage::update_plan_status(&conn, &p1.id, PlanStatus::Ready).unwrap();
@@ -3001,7 +5702,6 @@ mod tests {
         let (_tx, rx) = watch::channel(None);
         let workdir = std::path::Path::new("/tmp");
         let options = RunOptions {
-            all_plans: true,
             dry_run: true,
             current_branch: true,
             ..Default::default()
@@ -3029,7 +5729,6 @@ mod tests {
         let (_tx, rx) = watch::channel(None);
         let workdir = std::path::Path::new("/tmp");
         let options = RunOptions {
-            all_plans: true,
             current_branch: true,
             ..Default::default()
         };
@@ -3043,6 +5742,104 @@ mod tests {
             .unwrap();
 
         assert!(results.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_run_all_plans_keeps_aborted_upstream_in_scope() {
+        let (_tmp, dir) = init_git_repo();
+        let ext = tempfile::TempDir::new().unwrap();
+        let project = dir.to_string_lossy().to_string();
+        let script = ext.path().join("impl.sh");
+        std::fs::write(&script, "f=change_$$.txt\necho work > \"$f\"\n").unwrap();
+
+        let conn = setup();
+        seed_run_lock_row(&conn, &project);
+
+        let parent = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "parent",
+                project: &project,
+                branch_name: "feat/parent",
+                description: "d",
+                harness: Some("impl"),
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let child = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "child",
+                project: &project,
+                branch_name: "feat/child",
+                description: "d",
+                harness: Some("impl"),
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        storage::update_plan_status(&conn, &parent.id, PlanStatus::Aborted).unwrap();
+        storage::update_plan_status(&conn, &child.id, PlanStatus::Ready).unwrap();
+        storage::add_plan_dependency(&conn, &child.id, &parent.id).unwrap();
+
+        storage::create_step(
+            &conn,
+            &parent.id,
+            crate::storage::NewStep {
+                title: "Parent step",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+        storage::create_step(
+            &conn,
+            &child.id,
+            crate::storage::NewStep {
+                title: "Child step",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.harnesses.insert(
+            "impl".to_string(),
+            sh_stub_harness(&script.to_string_lossy()),
+        );
+
+        let (_tx, rx) = tokio::sync::watch::channel(None);
+        let out = OutputContext::from_cli(false, true, true);
+        let options = RunOptions {
+            current_branch: true,
+            ..Default::default()
+        };
+
+        let results = run_all_plans(&conn, &project, &config, &dir, &options, rx, &out)
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 2, "aborted upstream plan must stay in-scope");
+        assert_eq!(results[0].plan_slug, "parent");
+        assert_eq!(results[1].plan_slug, "child");
+        assert_eq!(results[0].final_status, PlanStatus::Complete);
+        assert_eq!(results[1].final_status, PlanStatus::Complete);
     }
 
     // -- transitive_dependents (L9 helper) --
@@ -3149,6 +5946,19 @@ mod tests {
         (tmp, dir)
     }
 
+    /// Seed a `run_locks` row so the executor's `write_phase` has a row to
+    /// update (mirrors `run_lock::acquire` in production; the same helper
+    /// the executor tests use). Required by any test that drives a real
+    /// `execute_step` through `run_plan`.
+    #[cfg(test)]
+    fn seed_run_lock_row(conn: &Connection, project: &str) {
+        conn.execute(
+            "INSERT INTO run_locks (project, pid, plan_id, plan_slug) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![project, 1i64, "p-test", "slug"],
+        )
+        .unwrap();
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn test_setup_branch_with_parent_sha() {
         use std::fs;
@@ -3173,13 +5983,13 @@ mod tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
-            retry_strategy: None,
+            review_enabled: None,
+            max_review_corrections: None,
         };
 
         // Should create feat/rooted rooted at initial_sha.
@@ -3213,13 +6023,13 @@ mod tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
-            retry_strategy: None,
+            review_enabled: None,
+            max_review_corrections: None,
         };
 
         // Concurrent ticker that increments a counter every few ms. On a
@@ -3257,38 +6067,53 @@ mod tests {
         let project = dir.to_string_lossy().to_string();
 
         let conn = setup();
-        let plan =
-            storage::create_plan(&conn, "s", &project, "feat/x", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: &project,
+                branch_name: "feat/x",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         storage::update_plan_status(&conn, &plan.id, PlanStatus::Ready).unwrap();
 
         // Two pre-completed steps from an earlier run.
         let (s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
         let (s2, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Second",
-            "d2",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Second",
+                description: "d2",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::update_step_status(&conn, &s2.id, StepStatus::Complete).unwrap();
@@ -3330,8 +6155,19 @@ mod tests {
         let project = dir.to_string_lossy().to_string();
 
         let conn = setup();
-        let plan =
-            storage::create_plan(&conn, "p", &project, "feat/p", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "p",
+                project: &project,
+                branch_name: "feat/p",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         storage::update_plan_status(&conn, &plan.id, PlanStatus::InProgress).unwrap();
 
         // Three steps. Mark step 1 Complete so the runner enters the loop
@@ -3342,15 +6178,17 @@ mod tests {
             let (s, _) = storage::create_step(
                 &conn,
                 &plan.id,
-                title,
-                "d",
-                None,
-                None,
-                &[],
-                None,
-                None,
-                None,
-                None,
+                crate::storage::NewStep {
+                    title,
+                    description: "d",
+                    agent: None,
+                    harness: None,
+                    acceptance_criteria: &[],
+                    max_retries: None,
+                    model: None,
+                    change_policy: None,
+                    tags: None,
+                },
             )
             .unwrap();
             if i == 0 {
@@ -3408,38 +6246,53 @@ mod tests {
         let project = dir.to_string_lossy().to_string();
 
         let conn = setup();
-        let plan =
-            storage::create_plan(&conn, "p", &project, "feat/p", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "p",
+                project: &project,
+                branch_name: "feat/p",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         storage::update_plan_status(&conn, &plan.id, PlanStatus::InProgress).unwrap();
 
         // Two steps — step 1 already complete, step 2 pending.
         let (s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "first",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "first",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
         let (_s2, _) = storage::create_step(
             &conn,
             &plan.id,
-            "second",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "second",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -3495,13 +6348,15 @@ mod tests {
         // runner records `branch_name` instead of the workdir's HEAD.
         let plan = storage::create_plan(
             &conn,
-            "s",
-            &project,
-            "would-be-branch",
-            "d",
-            None,
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "s",
+                project: &project,
+                branch_name: "would-be-branch",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         storage::update_plan_status(&conn, &plan.id, PlanStatus::Ready).unwrap();
@@ -3510,15 +6365,17 @@ mod tests {
         let (s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Done",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Done",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
@@ -3565,22 +6422,34 @@ mod tests {
         let source_branch = git::get_current_branch(&dir).unwrap();
 
         let conn = setup();
-        let plan =
-            storage::create_plan(&conn, "s", &project, "feat/run-here", "d", None, None, &[])
-                .unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: &project,
+                branch_name: "feat/run-here",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         storage::update_plan_status(&conn, &plan.id, PlanStatus::Ready).unwrap();
         let (s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Done",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Done",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
@@ -3622,9 +6491,11 @@ mod tests {
         let (_tmp, dir) = init_git_repo();
         fs::write(dir.join("scratch.txt"), "wip").unwrap();
 
-        let err = stash_if_dirty(&dir, "demo", /*auto_stash=*/ false)
-            .await
-            .expect_err("dirty tree with auto_stash=false must bail");
+        let err = stash_if_dirty(
+            &dir, "demo", None, None, None, None, /*auto_stash=*/ false,
+        )
+        .await
+        .expect_err("dirty tree with auto_stash=false must bail");
         let msg = format!("{err}");
         assert!(
             msg.contains("scratch.txt"),
@@ -3660,13 +6531,15 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(
             &conn,
-            "demo",
-            &project,
-            "would-be-branch",
-            "d",
-            None,
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "demo",
+                project: &project,
+                branch_name: "would-be-branch",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         storage::update_plan_status(&conn, &plan.id, PlanStatus::Ready).unwrap();
@@ -3675,15 +6548,17 @@ mod tests {
         let (s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Done",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Done",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
@@ -3744,7 +6619,7 @@ mod tests {
         let staged_before = git::list_staged_files(&dir).unwrap();
         assert_eq!(staged_before, vec!["staged.txt".to_string()]);
 
-        let stashed = stash_if_dirty(&dir, "demo", true)
+        let stashed = stash_if_dirty(&dir, "demo", Some("demo"), None, None, None, true)
             .await
             .unwrap()
             .expect("expected a stash");
@@ -3764,6 +6639,544 @@ mod tests {
         assert!(!staged_after.contains(&"unstaged.txt".to_string()));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_restore_parked_step_worktree_reapplies_stash_and_clears_row() {
+        use std::fs;
+
+        let (_tmp, dir) = init_git_repo();
+        let conn = setup();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "demo",
+                project: &dir.to_string_lossy(),
+                branch_name: "demo",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+
+        fs::write(
+            dir.join("README.md"),
+            "# staged change
+",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("scratch.txt"),
+            "park me
+",
+        )
+        .unwrap();
+        git::stage_except(&dir, &["scratch.txt".to_string()]).unwrap();
+        let staged_files = git::list_staged_files(&dir).unwrap();
+        assert_eq!(staged_files, vec!["README.md".to_string()]);
+
+        let stash_ref = git::stash_push_with_untracked(&dir, "ralph: parked-step-test")
+            .unwrap()
+            .expect("expected parked stash");
+        assert!(!git::has_uncommitted_changes(&dir).unwrap());
+
+        storage::set_step_parked_worktree(&conn, &step.id, stash_ref.as_str(), &staged_files)
+            .unwrap();
+
+        let out = OutputContext::from_cli(false, false, false);
+        let restored = restore_parked_step_worktree(&conn, &step, &dir, &out)
+            .await
+            .unwrap();
+        assert!(
+            matches!(restored, RestoreParkedOutcome::Resumed),
+            "a parked row must be restored cleanly; got {restored:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("README.md")).unwrap(),
+            "# staged change
+"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("scratch.txt")).unwrap(),
+            "park me
+"
+        );
+        assert_eq!(
+            git::list_staged_files(&dir).unwrap(),
+            vec!["README.md".to_string()],
+            "restored parked work must restore the prior staged/unstaged split"
+        );
+        assert!(
+            storage::get_step_parked_worktree(&conn, &step.id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Cluster 3 Fix #2 — NotFound branch.
+    ///
+    /// Pre-fix: a stale `step_parked_worktrees` row (admin ran `git stash
+    /// clear`, IDE plugin dropped it, etc.) made
+    /// `restore_parked_step_worktree` bail with `anyhow!(...)`. The call
+    /// site at the top of the scheduler loop used `?` propagation, so a
+    /// single bad row killed the entire `run_plan_inner` and abandoned
+    /// every other branch in the DAG.
+    ///
+    /// Post-fix: per-step blocker, no bail. The function returns
+    /// `BlockedAfterFailure`, the bridge row is dropped (so a re-tick
+    /// can't re-fire the same error), and an `InterruptionKind::Blocker`
+    /// row is inserted on the step. The caller (`run_plan_inner`) treats
+    /// `BlockedAfterFailure` like the harness raising a blocker mid-step:
+    /// skip this step, let the scheduler pick another runnable branch.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_restore_parked_step_worktree_notfound_raises_blocker_no_bail() {
+        let (_tmp, dir) = init_git_repo();
+        let conn = setup();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "demo",
+                project: &dir.to_string_lossy(),
+                branch_name: "demo",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+
+        // Persist a parked-worktree row pointing at a SHA that does NOT
+        // exist on the stash stack. Mirrors the post-admin-`git stash
+        // clear` state exactly.
+        let bogus_sha = "deadbeef0000000000000000000000000000beef";
+        storage::set_step_parked_worktree(&conn, &step.id, bogus_sha, &[]).unwrap();
+
+        let out = OutputContext::from_cli(false, false, false);
+        let outcome = restore_parked_step_worktree(&conn, &step, &dir, &out)
+            .await
+            .expect("must not bail — the per-step blocker is the new failure shape");
+        assert!(
+            matches!(outcome, RestoreParkedOutcome::BlockedAfterFailure),
+            "NotFound must yield BlockedAfterFailure; got {outcome:?}",
+        );
+
+        // The orphaned bridge row was dropped so the next scheduler pass
+        // doesn't re-trip the same error.
+        assert!(
+            storage::get_step_parked_worktree(&conn, &step.id)
+                .unwrap()
+                .is_none(),
+            "NotFound branch must drop the orphaned parked-worktree row",
+        );
+
+        // A `kind=Blocker` interruption is open on the step.
+        let opens = storage::list_open_interruptions_for_plan(&conn, &plan.id).unwrap();
+        assert_eq!(opens.len(), 1, "exactly one blocker interruption raised");
+        assert_eq!(opens[0].step_id, step.id);
+        assert_eq!(opens[0].kind, crate::plan::InterruptionKind::Blocker);
+        assert!(
+            opens[0].body.contains("was not found"),
+            "blocker body must explain the failure: {:?}",
+            opens[0].body,
+        );
+
+        // The blocker's open interruption makes the step appear in the
+        // scheduler's `blocked_step_ids` set, which `pick_next_step`
+        // excludes — so the scheduler picks ANOTHER branch on the next
+        // tick instead of the broken one.
+        let blocked = blocked_step_ids(&conn, &plan.id).unwrap();
+        assert!(
+            blocked.contains(&step.id),
+            "the step must appear in blocked_step_ids so the scheduler skips it",
+        );
+    }
+
+    /// Cluster 3 Fix #2 — Conflicted branch.
+    ///
+    /// Same per-step-blocker disposition as the NotFound branch, with one
+    /// difference: the parked stash is still on the stack (the user can
+    /// `git stash pop` it manually), so we KEEP the bridge row. That way
+    /// the user has both the recovery instructions in the blocker body
+    /// AND a working bridge row a future restart could retry.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_restore_parked_step_worktree_conflict_raises_blocker_keeps_bridge() {
+        use std::fs;
+
+        let (_tmp, dir) = init_git_repo();
+        let conn = setup();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "demo",
+                project: &dir.to_string_lossy(),
+                branch_name: "demo",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+
+        // Build a stash whose pop will conflict with HEAD AND carries a NEW
+        // untracked file the harness created (`new.txt`), exactly as park does
+        // (`git stash push --include-untracked`), while a pre-existing
+        // untracked user file (`preexisting.txt`) is excluded so it stays in
+        // the tree. Write version A + the new untracked file, stash everything
+        // except the pre-existing file; then COMMIT a divergent version B so
+        // the parked stash can't apply cleanly.
+        fs::write(dir.join("preexisting.txt"), "user pre-existing\n").unwrap();
+        fs::write(dir.join("README.md"), "version-A\n").unwrap();
+        fs::write(dir.join("new.txt"), "harness-created untracked\n").unwrap();
+        let stash_ref = git::stash_push_with_untracked_except(
+            &dir,
+            "ralph: conflict-park-test",
+            &["preexisting.txt".to_string()],
+        )
+        .unwrap()
+        .expect("expected parked stash");
+        // The stash excluded the pre-existing file, so it is still on disk;
+        // the new untracked file went into the stash.
+        assert!(dir.join("preexisting.txt").exists());
+        assert!(!dir.join("new.txt").exists());
+        fs::write(dir.join("README.md"), "version-B\n").unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-am", "divergent"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+
+        storage::set_step_parked_worktree(&conn, &step.id, stash_ref.as_str(), &[]).unwrap();
+
+        // Regression for the snapshot-based-cleanup data-loss bug: simulate a
+        // file created "after the (old) snapshot" — concurrently, by the
+        // user/editor/another tool — in the window before the cleanup runs. It
+        // is NOT in the stash and NOT the pre-existing file, so the old
+        // snapshot-diff cleanup (`rollback_except` with a pre-pop snapshot)
+        // would have treated it as stash residue and DELETED it. The
+        // stash-object cleanup removes only `<stash>^3`'s exact paths, so it
+        // must survive.
+        fs::write(dir.join("concurrent.txt"), "created concurrently\n").unwrap();
+
+        let out = OutputContext::from_cli(false, false, false);
+        let outcome = restore_parked_step_worktree(&conn, &step, &dir, &out)
+            .await
+            .expect("conflicted apply must not bail the whole run");
+        assert!(
+            matches!(outcome, RestoreParkedOutcome::BlockedAfterFailure),
+            "Conflicted apply must yield BlockedAfterFailure; got {outcome:?}",
+        );
+
+        // Fix #1(a): the working tree is cleaned at raise time so a re-run
+        // harness never sees the conflict markers. No unmerged paths; the
+        // committed (version-B) content is restored.
+        let porcelain_out = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let porcelain = String::from_utf8(porcelain_out.stdout).unwrap();
+        // BUG #1: the stash's NEW untracked file (`new.txt`) must be gone, and
+        // there must be no unmerged / dirty tracked paths. The residual
+        // untracked entries permitted are the user's pre-existing file AND the
+        // concurrently-created file (which the cleanup must not touch).
+        let mut residual: Vec<&str> = porcelain.lines().map(str::trim).collect();
+        residual.sort_unstable();
+        assert_eq!(
+            residual,
+            vec!["?? concurrent.txt", "?? preexisting.txt"],
+            "Conflicted cleanup must clear the tracked conflict and the stash's \
+             new untracked file, while leaving the user's pre-existing AND any \
+             concurrently-created untracked file in place: {porcelain:?}",
+        );
+        assert!(
+            !dir.join("new.txt").exists(),
+            "the stash's new untracked file must be removed by the cleanup (BUG #1)",
+        );
+        assert!(
+            dir.join("preexisting.txt").exists(),
+            "the user's pre-existing untracked file must survive the cleanup",
+        );
+        assert!(
+            dir.join("concurrent.txt").exists(),
+            "a concurrently-created untracked file (not in the stash) must \
+             survive the cleanup — the snapshot-diff approach would have deleted it",
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("README.md")).unwrap(),
+            "version-B\n",
+            "the cleanup must restore the committed content, discarding the partial apply",
+        );
+
+        // Bridge row is KEPT so the stash on disk has a pointer the user
+        // can follow / the resolver can find + drop.
+        assert!(
+            storage::get_step_parked_worktree(&conn, &step.id)
+                .unwrap()
+                .is_some(),
+            "Conflicted branch must preserve the parked-worktree row \
+             (the stash is still recoverable on disk)",
+        );
+
+        // The stash itself is still on the stack (the WIP source of truth).
+        assert!(
+            git::find_stash_by_message(&dir, "ralph: conflict-park-test")
+                .unwrap()
+                .is_some(),
+            "the conflicted stash must survive on the stack so the user can recover",
+        );
+
+        let opens = storage::list_open_interruptions_for_plan(&conn, &plan.id).unwrap();
+        assert_eq!(opens.len(), 1);
+        assert_eq!(opens[0].kind, crate::plan::InterruptionKind::Blocker);
+        assert!(
+            opens[0].body.contains("conflicted"),
+            "blocker body must explain the conflict: {:?}",
+            opens[0].body,
+        );
+        // Fix #2: the body must NOT recommend a manual `git stash pop`
+        // (re-running the just-conflicted pop compounds the conflict).
+        assert!(
+            !opens[0].body.contains("git stash pop"),
+            "blocker body must not recommend `git stash pop`: {:?}",
+            opens[0].body,
+        );
+    }
+
+    /// Fix #1(b): resolving a Conflicted parked-restore blocker with "Mark
+    /// Pending" must clear the bridge row AND drop the preserved stash, so a
+    /// subsequent scheduler tick finds no parked row and re-runs the step
+    /// fresh (no re-raise loop).
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_resolve_conflicted_parked_restore_mark_pending_clears_row_and_stash() {
+        use std::fs;
+
+        let (_tmp, dir) = init_git_repo();
+        let conn = setup();
+        let project = dir.to_string_lossy().to_string();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "demo",
+                project: &project,
+                branch_name: "demo",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+
+        // Build a conflicting parked stash, exactly as the conflict test does.
+        fs::write(dir.join("README.md"), "version-A\n").unwrap();
+        let stash_ref = git::stash_push_with_untracked(&dir, "ralph: conflict-resolve-test")
+            .unwrap()
+            .expect("expected parked stash");
+        fs::write(dir.join("README.md"), "version-B\n").unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-am", "divergent"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        storage::set_step_parked_worktree(&conn, &step.id, stash_ref.as_str(), &[]).unwrap();
+
+        let out = OutputContext::from_cli(false, false, false);
+        let outcome = restore_parked_step_worktree(&conn, &step, &dir, &out)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, RestoreParkedOutcome::BlockedAfterFailure));
+
+        // Resolve the open blocker with Mark Pending.
+        let opens = storage::list_open_interruptions_for_plan(&conn, &plan.id).unwrap();
+        assert_eq!(opens.len(), 1);
+        let blocker_id = opens[0].id.clone();
+        crate::commands::interruption::resolve_interruption_with_retry_handling(
+            &conn,
+            &project,
+            &blocker_id,
+            crate::runner::PARKED_RESTORE_OPTION_MARK_PENDING,
+            None,
+        )
+        .unwrap();
+
+        // Bridge row cleared (no loop) ...
+        assert!(
+            storage::get_step_parked_worktree(&conn, &step.id)
+                .unwrap()
+                .is_none(),
+            "Mark-Pending resolution must clear the bridge row",
+        );
+        // ... stash dropped ...
+        assert!(
+            git::find_stash_by_message(&dir, "ralph: conflict-resolve-test")
+                .unwrap()
+                .is_none(),
+            "Mark-Pending resolution must drop the preserved stash",
+        );
+        // ... step Pending ...
+        let refreshed = storage::get_step_by_id(&conn, &step.id).unwrap().unwrap();
+        assert_eq!(refreshed.status, StepStatus::Pending);
+
+        // ... and a subsequent restore returns NotParked (no re-raise loop).
+        let again = restore_parked_step_worktree(&conn, &refreshed, &dir, &out)
+            .await
+            .unwrap();
+        assert!(
+            matches!(again, RestoreParkedOutcome::NotParked),
+            "after resolution there is no parked row, so restore is a no-op; got {again:?}",
+        );
+    }
+
+    /// Fix #1(b): resolving a Conflicted parked-restore blocker with "Mark
+    /// Failed" must also clear the bridge row + drop the stash and flip the
+    /// step to terminal Failed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_resolve_conflicted_parked_restore_mark_failed_clears_row_and_stash() {
+        use std::fs;
+
+        let (_tmp, dir) = init_git_repo();
+        let conn = setup();
+        let project = dir.to_string_lossy().to_string();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "demo",
+                project: &project,
+                branch_name: "demo",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+
+        fs::write(dir.join("README.md"), "version-A\n").unwrap();
+        let stash_ref = git::stash_push_with_untracked(&dir, "ralph: conflict-fail-test")
+            .unwrap()
+            .expect("expected parked stash");
+        fs::write(dir.join("README.md"), "version-B\n").unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-am", "divergent"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        storage::set_step_parked_worktree(&conn, &step.id, stash_ref.as_str(), &[]).unwrap();
+
+        let out = OutputContext::from_cli(false, false, false);
+        restore_parked_step_worktree(&conn, &step, &dir, &out)
+            .await
+            .unwrap();
+
+        let opens = storage::list_open_interruptions_for_plan(&conn, &plan.id).unwrap();
+        let blocker_id = opens[0].id.clone();
+        crate::commands::interruption::resolve_interruption_with_retry_handling(
+            &conn,
+            &project,
+            &blocker_id,
+            crate::runner::PARKED_RESTORE_OPTION_MARK_FAILED,
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            storage::get_step_parked_worktree(&conn, &step.id)
+                .unwrap()
+                .is_none(),
+            "Mark-Failed resolution must clear the bridge row",
+        );
+        assert!(
+            git::find_stash_by_message(&dir, "ralph: conflict-fail-test")
+                .unwrap()
+                .is_none(),
+            "Mark-Failed resolution must drop the preserved stash",
+        );
+        let refreshed = storage::get_step_by_id(&conn, &step.id).unwrap().unwrap();
+        assert_eq!(refreshed.status, StepStatus::Failed);
+    }
+
     /// Default (auto_stash=true) stash-push + stash-pop round trip: the
     /// dirty file survives a fake run and reappears with identical
     /// contents once teardown runs.
@@ -3778,10 +7191,18 @@ mod tests {
 
         let source_branch = git::get_current_branch(&dir).unwrap();
 
-        let stash = stash_if_dirty(&dir, "demo", /*auto_stash=*/ true)
-            .await
-            .unwrap()
-            .expect("expected a stash SHA");
+        let stash = stash_if_dirty(
+            &dir,
+            "demo",
+            Some("demo"),
+            None,
+            None,
+            None,
+            /*auto_stash=*/ true,
+        )
+        .await
+        .unwrap()
+        .expect("expected a stash SHA");
 
         // Tree is clean; scratch.txt is gone; tracked file is reverted.
         assert!(!git::has_uncommitted_changes(&dir).unwrap());
@@ -3802,13 +7223,13 @@ mod tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
-            retry_strategy: None,
+            review_enabled: None,
+            max_review_corrections: None,
         };
         setup_branch(&dir, &plan, None).await.unwrap();
         assert_eq!(
@@ -3847,10 +7268,21 @@ mod tests {
     async fn test_clean_tree_no_stash_needed() {
         let (_tmp, dir) = init_git_repo();
 
-        let result_off = stash_if_dirty(&dir, "demo", false).await.unwrap();
+        let result_off = stash_if_dirty(&dir, "demo", Some("feat/clean"), None, None, None, false)
+            .await
+            .unwrap();
         assert!(result_off.is_none());
-        let result_on = stash_if_dirty(&dir, "demo", true).await.unwrap();
+        let result_on = stash_if_dirty(&dir, "demo", Some("feat/clean"), None, None, None, true)
+            .await
+            .unwrap();
         assert!(result_on.is_none());
+
+        // Exercise the new conservative detection helper (no trailers => no residue).
+        assert!(
+            !git::has_crash_residue_overlap_for_step(&dir, "feat/clean", "no-such-short")
+                .unwrap_or(false),
+            "detection must be conservative (false) when no matching Ralph commits exist"
+        );
 
         let plan = Plan {
             id: "p1".to_string(),
@@ -3865,13 +7297,13 @@ mod tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
-            retry_strategy: None,
+            review_enabled: None,
+            max_review_corrections: None,
         };
         setup_branch(&dir, &plan, None).await.unwrap();
         assert_eq!(git::get_current_branch(&dir).unwrap(), "feat/clean");
@@ -3894,7 +7326,7 @@ mod tests {
 
         // Pre-stash: README has version A queued up.
         fs::write(dir.join("README.md"), "# version A\n").unwrap();
-        let stash = stash_if_dirty(&dir, "demo", true)
+        let stash = stash_if_dirty(&dir, "demo", Some("demo"), None, None, None, true)
             .await
             .unwrap()
             .expect("sha");
@@ -3938,9 +7370,19 @@ mod tests {
         // A plan with zero steps will hit `bail!("Plan ... has no steps")`
         // inside run_plan_inner — i.e. after the stash + branch setup.
         let conn = setup();
-        let plan =
-            storage::create_plan(&conn, "empty", &project, "feat/empty", "d", None, None, &[])
-                .unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "empty",
+                project: &project,
+                branch_name: "feat/empty",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         storage::update_plan_status(&conn, &plan.id, PlanStatus::Ready).unwrap();
         let plan = storage::get_plan_by_slug(&conn, "empty", &project)
             .unwrap()
@@ -4009,13 +7451,15 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(
             &conn,
-            "bad",
-            &project,
-            "feat/bad..branch",
-            "d",
-            None,
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "bad",
+                project: &project,
+                branch_name: "feat/bad..branch",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         storage::update_plan_status(&conn, &plan.id, PlanStatus::Ready).unwrap();
@@ -4075,7 +7519,7 @@ mod tests {
         let (_tmp, dir) = init_git_repo();
         fs::write(dir.join("scratch.txt"), "wip").unwrap();
 
-        let stash = stash_if_dirty(&dir, "crashy", true)
+        let stash = stash_if_dirty(&dir, "crashy", Some("crashy"), None, None, None, true)
             .await
             .unwrap()
             .expect("sha");
@@ -4096,33 +7540,49 @@ mod tests {
     #[test]
     fn test_stale_in_progress_swept_on_run_start() {
         let conn = setup();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let (s2, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Second",
-            "d2",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Second",
+                description: "d2",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -4145,33 +7605,49 @@ mod tests {
     #[test]
     fn test_stale_sweep_noop_without_in_progress() {
         let conn = setup();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let (s2, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Second",
-            "d2",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Second",
+                description: "d2",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
@@ -4192,19 +7668,33 @@ mod tests {
     #[test]
     fn test_sweep_and_log_wrapper_flips_and_returns_rows() {
         let conn = setup();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::InProgress).unwrap();
@@ -4219,6 +7709,121 @@ mod tests {
 
         let after = storage::list_steps(&conn, &plan.id).unwrap();
         assert_eq!(after[0].status, StepStatus::Aborted);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_run_plan_consumes_stranded_corrective_request_before_rerun() {
+        let (_tmp, dir) = init_git_repo();
+        let ext = tempfile::TempDir::new().unwrap();
+        let project = dir.to_string_lossy().to_string();
+        let script = ext.path().join("impl.sh");
+        std::fs::write(&script, "f=change_$$.txt\necho work > \"$f\"\n").unwrap();
+
+        let conn = setup();
+        seed_run_lock_row(&conn, &project);
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "resume-corrective",
+                project: &project,
+                branch_name: "feat/resume-corrective",
+                description: "d",
+                harness: Some("impl"),
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        storage::update_plan_status(&conn, &plan.id, PlanStatus::Ready).unwrap();
+
+        let (reviewed, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            crate::storage::NewStep {
+                title: "Original",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+        storage::update_step_status(&conn, &reviewed.id, StepStatus::Aborted).unwrap();
+        storage::update_step_review_status(&conn, &reviewed.id, crate::plan::ReviewStatus::Failed)
+            .unwrap();
+        storage::insert_corrective_step_request(
+            &conn,
+            &reviewed.id,
+            1,
+            "deadbeef",
+            1,
+            Some("missing fix"),
+            false,
+        )
+        .unwrap();
+
+        let plan = storage::get_plan_by_slug(&conn, "resume-corrective", &project)
+            .unwrap()
+            .unwrap();
+        let mut config = Config::default();
+        config.harnesses.insert(
+            "impl".to_string(),
+            sh_stub_harness(&script.to_string_lossy()),
+        );
+
+        let (_tx, rx) = tokio::sync::watch::channel(None);
+        let out = OutputContext::from_cli(false, true, true);
+        let options = RunOptions {
+            current_branch: true,
+            ..Default::default()
+        };
+
+        let result = run_plan(&conn, &plan, &config, &dir, &options, rx, &out)
+            .await
+            .unwrap();
+
+        assert_eq!(result.final_status, PlanStatus::Complete);
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(
+            steps.len(),
+            2,
+            "corrective step must be materialized on restart"
+        );
+        let reviewed_after = storage::get_step(&conn, &reviewed.id).unwrap();
+        assert_eq!(reviewed_after.status, StepStatus::Complete);
+        assert_eq!(
+            reviewed_after.review_status,
+            Some(crate::plan::ReviewStatus::Failed)
+        );
+        assert!(
+            storage::list_execution_logs_for_step(&conn, &reviewed.id)
+                .unwrap()
+                .is_empty(),
+            "the original reviewed step must not be re-executed before its stranded request is drained"
+        );
+
+        let corrective = steps
+            .iter()
+            .find(|s| s.corrects_step_id.as_deref() == Some(reviewed.id.as_str()))
+            .expect("corrective step inserted");
+        assert_eq!(corrective.status, StepStatus::Complete);
+        assert_eq!(
+            storage::list_execution_logs_for_step(&conn, &corrective.id)
+                .unwrap()
+                .len(),
+            1,
+            "the restarted run should execute only the corrective step"
+        );
+        assert!(
+            storage::list_open_corrective_step_requests_for_plan(&conn, &plan.id)
+                .unwrap()
+                .is_empty(),
+            "stranded corrective requests must be drained before scheduling"
+        );
     }
 
     // -- RunWindow / resolve_window tests --
@@ -4313,6 +7918,7 @@ mod tests {
         let mut grown = steps.clone();
         let new_step = Step {
             id: "s_new".to_string(),
+            short_id: String::new(),
             plan_id: "p1".to_string(),
             sort_key: "a05".to_string(), // between s0=a0 and s1=a1
             title: "Inserted".to_string(),
@@ -4329,7 +7935,9 @@ mod tests {
             skipped_reason: None,
             change_policy: crate::plan::ChangePolicy::Required,
             tags: vec![],
-            retry_strategy: None,
+            review_enabled: None,
+            review_status: None,
+            corrects_step_id: None,
         };
         grown.insert(1, new_step.clone());
         // The inserted step becomes step 2; what was step 2 (s1) is now
@@ -4351,33 +7959,49 @@ mod tests {
         use std::collections::HashSet;
 
         let conn = setup();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let (s2, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Second",
-            "d2",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Second",
+                description: "d2",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -4406,15 +8030,17 @@ mod tests {
             &conn,
             &plan.id,
             &mid_key,
-            "Inserted",
-            "dN",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Inserted",
+                description: "dN",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -4451,10 +8077,1554 @@ mod tests {
     #[test]
     fn test_is_actionable_statuses() {
         assert!(is_actionable(StepStatus::Pending));
-        assert!(is_actionable(StepStatus::Failed));
         assert!(is_actionable(StepStatus::InProgress));
         assert!(is_actionable(StepStatus::Aborted));
+        // Phase E Fix 2: Failed is non-actionable. A user-requested `Mark
+        // Failed` resolution on the retry-exhausted auto-blocker leaves a
+        // Failed step at `attempts == max`; if the scheduler re-picked it,
+        // `executor::execute_step`'s budget guard would bail and terminate
+        // the run. The "plan continues, step stays Failed" semantics are
+        // implemented here by excluding Failed from the actionable set.
+        assert!(!is_actionable(StepStatus::Failed));
         assert!(!is_actionable(StepStatus::Complete));
         assert!(!is_actionable(StepStatus::Skipped));
+    }
+
+    // -- Bug #2: parked-restore blocker insertion shape --
+
+    /// Source-shape proof that `raise_parked_restore_blocker` inserts the
+    /// two ranked options and prefixes the body with
+    /// `PARKED_RESTORE_BLOCKER_MARKER`. The interruption resolver
+    /// (`apply_parked_restore_resolution`) detects the subkind via this
+    /// marker; pre-fix the function inserted with empty options and the
+    /// resolver had no branch to dispatch on.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_raise_parked_restore_blocker_inserts_marker_and_options() {
+        let conn = setup();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "prb",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            crate::storage::NewStep {
+                title: "s",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+
+        let body = format!(
+            "{PARKED_RESTORE_BLOCKER_MARKER}\nbody text mentioning '{}' and '{}'",
+            PARKED_RESTORE_OPTION_MARK_FAILED, PARKED_RESTORE_OPTION_MARK_PENDING,
+        );
+        let out = OutputContext::from_cli(false, true, false);
+        raise_parked_restore_blocker(&conn, &step, &body, /*drop_bridge_row=*/ false, &out)
+            .unwrap();
+
+        let rows = storage::list_interruptions_for_step(&conn, &step.id).unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.kind, crate::plan::InterruptionKind::Blocker);
+        assert!(
+            row.body.starts_with(PARKED_RESTORE_BLOCKER_MARKER),
+            "body must start with the marker so the resolver can dispatch: {}",
+            row.body,
+        );
+        assert_eq!(
+            row.options.len(),
+            2,
+            "must insert both ranked recovery options",
+        );
+        assert_eq!(row.options[0].text, PARKED_RESTORE_OPTION_MARK_FAILED);
+        assert_eq!(row.options[0].priority, 1);
+        assert_eq!(row.options[1].text, PARKED_RESTORE_OPTION_MARK_PENDING);
+        assert_eq!(row.options[1].priority, 2);
+    }
+
+    /// BUG #2: the conflicted-restore blocker body must be honest about
+    /// whether the automatic cleanup succeeded. The Conflicted branch's
+    /// cleanup is log-and-continue; if the `git` op fails the tree may still
+    /// carry conflict markers, so a "reset to a clean state" claim would be a
+    /// lie that could lead the user to Mark-Pending (dropping the stash) over
+    /// a dirty tree. `parked_restore_conflict_body` has two branches keyed on
+    /// `cleanup_error`.
+    #[test]
+    fn test_parked_restore_conflict_body_honest_on_cleanup_outcome() {
+        let sha = "deadbeef";
+        let short_id = "ab12cd34";
+
+        // Success: claims the tree was reset clean; keeps the marker.
+        let ok = parked_restore_conflict_body(sha, short_id, None);
+        assert!(ok.starts_with(PARKED_RESTORE_BLOCKER_MARKER));
+        assert!(
+            ok.contains("reset to a clean state"),
+            "success body should state the tree is clean: {ok}",
+        );
+        assert!(
+            !ok.contains("ALSO FAILED") && !ok.contains("may still contain conflict markers"),
+            "success body must not warn of a failed cleanup: {ok}",
+        );
+
+        // Failure: must warn the tree may still be dirty, surface the error,
+        // and keep the marker — never claim the tree is clean.
+        let failed = parked_restore_conflict_body(sha, short_id, Some("git reset failed: boom"));
+        assert!(failed.starts_with(PARKED_RESTORE_BLOCKER_MARKER));
+        assert!(
+            failed.contains("ALSO FAILED"),
+            "failure body must say the cleanup ALSO FAILED: {failed}",
+        );
+        assert!(
+            failed.contains("git reset failed: boom"),
+            "failure body must surface the cleanup error: {failed}",
+        );
+        assert!(
+            failed.contains("may still contain conflict markers"),
+            "failure body must warn the tree may still be dirty: {failed}",
+        );
+        assert!(
+            !failed.contains("reset to a clean state"),
+            "failure body must NOT claim the tree was reset clean: {failed}",
+        );
+    }
+
+    #[test]
+    fn test_remove_stash_residue_files_error_handling() {
+        // A real deletion failure must surface (so cleanup_error is populated
+        // and the blocker body stays honest); a NotFound is expected and
+        // ignored; a present file is removed cleanly.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Present file → removed, no error.
+        std::fs::write(root.join("present.txt"), b"x").unwrap();
+        // Missing file → NotFound, must be ignored.
+        // Directory at a stash-owned path → remove_file errors (IsADirectory
+        // on Linux); must be reported as residue.
+        std::fs::create_dir(root.join("isadir")).unwrap();
+        std::fs::write(root.join("isadir").join("inner"), b"y").unwrap();
+
+        // Only present.txt + missing.txt → all handled, no residue error.
+        remove_stash_residue_files(root, &["present.txt".into(), "missing.txt".into()]).unwrap();
+        assert!(
+            !root.join("present.txt").exists(),
+            "present file should have been removed",
+        );
+
+        // A path that can't be removed as a file must surface as an error.
+        let err = remove_stash_residue_files(root, &["isadir".into()])
+            .expect_err("a non-removable stash-owned path must error, not be silently ignored");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("isadir") && msg.contains("stash-owned file"),
+            "error must name the offending path: {msg}",
+        );
+    }
+
+    // -- topological scheduler (docs/dag-redesign.md §3.5) --
+
+    /// Unbounded run window (no `--from`/`--to`).
+    fn full_window() -> RunWindow {
+        RunWindow {
+            from_key: None,
+            to_key: None,
+        }
+    }
+
+    /// Build `deps_of` from index edges. `(a, b)` ⇒ `steps[a]` depends on
+    /// `steps[b]` (matches `add_step_dependency(step, depends_on)`).
+    fn deps_map(steps: &[Step], edges: &[(usize, usize)]) -> HashMap<String, Vec<String>> {
+        let mut m: HashMap<String, Vec<String>> = HashMap::new();
+        for &(a, b) in edges {
+            m.entry(steps[a].id.clone())
+                .or_default()
+                .push(steps[b].id.clone());
+        }
+        m
+    }
+
+    /// Drive the scheduler to quiescence: each tick pick the next step,
+    /// mark it `Complete`, and record the order. Mirrors the real runner
+    /// loop (re-derives depths every tick, tracks `executed_step_ids`).
+    fn schedule_order(
+        steps: &mut [Step],
+        edges: &[(usize, usize)],
+        window: &RunWindow,
+    ) -> Vec<String> {
+        schedule_order_blocked(steps, edges, window, &HashSet::new())
+    }
+
+    /// `schedule_order` with a fixed set of `Blocked` step ids that are
+    /// never runnable (simulates open interruptions the scheduler must
+    /// route around — docs/dag-redesign.md §3.4/§3.5).
+    fn schedule_order_blocked(
+        steps: &mut [Step],
+        edges: &[(usize, usize)],
+        window: &RunWindow,
+        blocked: &HashSet<String>,
+    ) -> Vec<String> {
+        let deps_of = deps_map(steps, edges);
+        let mut order: Vec<String> = Vec::new();
+        let mut executed: HashSet<String> = HashSet::new();
+        loop {
+            let depths = compute_step_depths(steps, &deps_of);
+            let pick = pick_next_step(steps, &deps_of, &depths, window, &executed, blocked)
+                .map(|s| s.id.clone());
+            let Some(id) = pick else { break };
+            order.push(id.clone());
+            for s in steps.iter_mut() {
+                if s.id == id {
+                    s.status = StepStatus::Complete;
+                }
+            }
+            executed.insert(id);
+        }
+        order
+    }
+
+    #[test]
+    fn test_scheduler_linear_chain() {
+        // s0 <- s1 <- s2 <- s3 (each depends on the previous).
+        let mut steps = make_steps(4);
+        let edges = [(1, 0), (2, 1), (3, 2)];
+        let deps_of = deps_map(&steps, &edges);
+
+        // Depth grows along the chain.
+        let depths = compute_step_depths(&steps, &deps_of);
+        assert_eq!(depths["s0"], 0);
+        assert_eq!(depths["s1"], 1);
+        assert_eq!(depths["s2"], 2);
+        assert_eq!(depths["s3"], 3);
+
+        // Only the root is runnable until it completes.
+        let executed = HashSet::new();
+        let pick = pick_next_step(
+            &steps,
+            &deps_of,
+            &depths,
+            &full_window(),
+            &executed,
+            &HashSet::new(),
+        );
+        assert_eq!(pick.unwrap().id, "s0");
+
+        // Full walk reproduces the authored order.
+        let order = schedule_order(&mut steps, &edges, &full_window());
+        assert_eq!(order, vec!["s0", "s1", "s2", "s3"]);
+    }
+
+    // ---- Phase E Fix 2: Failed is non-actionable ----
+
+    /// `pick_next_step` must NOT return a step in `StepStatus::Failed`. Pre-Phase-E
+    /// Failed was actionable, and a `Mark Failed` resolution on the
+    /// retry-exhausted auto-blocker left a step at `attempts == max` — the
+    /// scheduler would re-pick the Failed step, the executor's budget guard
+    /// would bail, and the whole run would terminate.
+    #[test]
+    fn test_pick_next_step_skips_failed_step() {
+        let mut steps = make_steps(2);
+        steps[0].status = StepStatus::Failed;
+        steps[0].attempts = 3;
+        let deps_of: HashMap<String, Vec<String>> = HashMap::new();
+        let depths = compute_step_depths(&steps, &deps_of);
+
+        let executed = HashSet::new();
+        let blocked = HashSet::new();
+        // s1 (Pending, no deps) must be picked, NOT s0 (Failed).
+        let pick = pick_next_step(
+            &steps,
+            &deps_of,
+            &depths,
+            &full_window(),
+            &executed,
+            &blocked,
+        );
+        assert_eq!(
+            pick.map(|s| s.id.as_str()),
+            Some("s1"),
+            "scheduler must skip the Failed root and pick the independent Pending step",
+        );
+    }
+
+    /// End-to-end scheduler walk: a plan with one Failed root and one
+    /// independent Pending branch must drain the Pending branch and stop —
+    /// the Failed step is fenced off (never picked), and its dependents (if
+    /// any) starve naturally on `deps_satisfied` (the Failed dep is not
+    /// Complete).
+    #[test]
+    fn test_scheduler_walks_around_failed_step() {
+        // Two independent branches: branch A is just s0 (Failed); branch B
+        // is s1 -> s2 (s2 depends on s1).
+        let mut steps = make_steps(3);
+        steps[0].status = StepStatus::Failed;
+        steps[0].attempts = 3;
+        let edges = [(2, 1)]; // s2 depends on s1
+
+        let order = schedule_order(&mut steps, &edges, &full_window());
+
+        // Branch B drained; Failed s0 was never picked.
+        assert_eq!(
+            order,
+            vec!["s1".to_string(), "s2".to_string()],
+            "scheduler runs the independent Pending branch around the Failed root",
+        );
+        assert!(
+            !order.contains(&"s0".to_string()),
+            "Failed step must not be re-picked",
+        );
+    }
+
+    /// Dependents of a Failed step starve (their dep is not Complete). The
+    /// plan finalizes via the §3.5 "InProgress" terminal shape (incomplete
+    /// + no open interruptions).
+    #[test]
+    fn test_dependents_of_failed_step_starve() {
+        // s0 Failed; s1 depends on s0. s1 must not be picked.
+        let mut steps = make_steps(2);
+        steps[0].status = StepStatus::Failed;
+        steps[0].attempts = 3;
+        let edges = [(1, 0)];
+
+        let order = schedule_order(&mut steps, &edges, &full_window());
+        assert!(
+            order.is_empty(),
+            "dependent of a Failed step is starved (not picked); got: {order:?}",
+        );
+    }
+
+    // ---- STEP 25: scheduler interruption integration (§3.4/§3.5) ----
+
+    #[test]
+    fn test_blocked_branch_does_not_starve_an_independent_branch() {
+        // Two independent branches off no shared root:
+        //   branch A: s0 -> s1   branch B: s2 -> s3
+        // s0 is Blocked (open interruption). The §1 payoff: branch B must
+        // still run to completion even though branch A is fully stalled
+        // (s1 waits on the blocked s0 and is therefore never reached).
+        let mut steps = make_steps(4);
+        let edges = [(1, 0), (3, 2)]; // s1<-s0, s3<-s2
+        let mut blocked = HashSet::new();
+        blocked.insert("s0".to_string());
+
+        let order = schedule_order_blocked(&mut steps, &edges, &full_window(), &blocked);
+
+        // Branch B ran fully; branch A produced nothing (s0 blocked, s1
+        // gated on the non-Complete s0).
+        assert_eq!(
+            order,
+            vec!["s2".to_string(), "s3".to_string()],
+            "the blocked branch must not prevent the independent branch"
+        );
+        assert!(!order.contains(&"s0".to_string()), "s0 is Blocked");
+        assert!(
+            !order.contains(&"s1".to_string()),
+            "s1 waits on the blocked s0 (its dependency is not Complete)"
+        );
+    }
+
+    #[test]
+    fn test_linear_plan_with_one_blocked_step_pauses_like_before() {
+        // §1 no-regression: a *linear* plan gets zero benefit. s0<-s1<-s2;
+        // s0 Blocked ⇒ NOTHING is runnable (s1/s2 gated on s0), so the
+        // scheduler stalls exactly as the pre-DAG loop did when the head
+        // step paused for a question.
+        let mut steps = make_steps(3);
+        let edges = [(1, 0), (2, 1)];
+        let mut blocked = HashSet::new();
+        blocked.insert("s0".to_string());
+
+        let order = schedule_order_blocked(&mut steps, &edges, &full_window(), &blocked);
+        assert!(
+            order.is_empty(),
+            "a linear plan whose head step is blocked produces no progress \
+             (same whole-plan pause as before — no regression)"
+        );
+
+        // And once the interruption is resolved (blocked set empties), the
+        // very next scheduler pass runs the whole chain in authored order —
+        // the cross-process re-queue (§9 invariant 4).
+        let resumed = schedule_order_blocked(&mut steps, &edges, &full_window(), &HashSet::new());
+        assert_eq!(resumed, vec!["s0", "s1", "s2"]);
+    }
+
+    /// Regression for the same-run re-queue bug: the scheduler loop adds
+    /// every picked step to `executed_step_ids` (runner.rs ~695) so it is
+    /// never re-picked this run. A step that paused for an interruption must
+    /// be dropped back out of that set in the `PausedForQuestion` arm —
+    /// otherwise a *same-run* resolution (a human answers while the loop
+    /// keeps ticking on another branch — the §1 payoff / §9-inv-4 bridge)
+    /// clears `blocked` but the step is still permanently excluded and never
+    /// resumes until a fresh process. This models the loop's exact
+    /// executed/blocked transitions across a pause→resolve.
+    #[test]
+    fn test_paused_step_requeues_within_same_run_after_resolution() {
+        // Two independent branches so the loop keeps ticking while one
+        // branch is paused: A: s0   B: s1->s2. s0 pauses on its first pick
+        // (raises an interruption); branch B keeps the loop alive; then the
+        // interruption is resolved mid-run and s0 must run *this run*.
+        let mut steps = make_steps(3);
+        let edges = [(2, 1)]; // s2 <- s1 ; s0 independent
+        let deps_of = deps_map(&steps, &edges);
+
+        let mut executed: HashSet<String> = HashSet::new();
+        let mut blocked: HashSet<String> = HashSet::new();
+        let mut order: Vec<String> = Vec::new();
+        let mut s0_paused_once = false;
+
+        // Drive the scheduler exactly as run_plan_inner does: pick, then
+        // either "execute" (mark Complete + insert into executed) or, for
+        // s0's first pick, take the PausedForQuestion path (insert into
+        // executed at ~695 THEN the arm's `executed.remove`, leaving an open
+        // interruption in `blocked`).
+        let mut ticks = 0;
+        loop {
+            ticks += 1;
+            assert!(ticks < 50, "scheduler must not busy-spin");
+            let depths = compute_step_depths(&steps, &deps_of);
+            let pick = pick_next_step(
+                &steps,
+                &deps_of,
+                &depths,
+                &full_window(),
+                &executed,
+                &blocked,
+            )
+            .map(|s| s.id.clone());
+            let Some(id) = pick else { break };
+
+            // runner.rs:695 — every picked step enters executed_step_ids.
+            executed.insert(id.clone());
+
+            if id == "s0" && !s0_paused_once {
+                // PausedForQuestion arm: leaves an open interruption AND
+                // (the fix) drops the step back out of executed_step_ids.
+                s0_paused_once = true;
+                blocked.insert("s0".to_string());
+                executed.remove("s0"); // <-- the fix under test
+                // Simulate branch B keeping the loop alive, then a human
+                // resolving s0's interruption out of band.
+                continue;
+            }
+
+            order.push(id.clone());
+            for s in steps.iter_mut() {
+                if s.id == id {
+                    s.status = StepStatus::Complete;
+                }
+            }
+            // Resolve s0's interruption once branch B has made progress,
+            // proving the resolution lands mid-run (loop still alive).
+            if id == "s1" {
+                blocked.remove("s0");
+            }
+        }
+
+        assert!(
+            order.contains(&"s0".to_string()),
+            "a paused step whose interruption is resolved mid-run MUST run \
+             in the same run (got order {order:?})"
+        );
+        // Deterministic interleave: s0 pauses; s1 runs (branch B); on
+        // resolution s0 (depth 0) re-queues ahead of the still-gated depth-1
+        // s2; then s2. The point is s0 runs *this run* — not the exact spot.
+        assert_eq!(
+            order,
+            vec!["s1".to_string(), "s0".to_string(), "s2".to_string()],
+            "branch B runs while s0 is paused; s0 resumes after resolution"
+        );
+    }
+
+    #[test]
+    fn test_resolved_interruption_requeues_step_at_next_tick() {
+        // A blocked root excludes itself and its dependents this pass;
+        // clearing the block (a cross-process resolve) makes it runnable
+        // again with no other state change — proving the re-queue is purely
+        // a function of the recomputed blocked set.
+        let steps = make_steps(2);
+        let edges = [(1, 0)];
+        let deps_of = deps_map(&steps, &edges);
+        let depths = compute_step_depths(&steps, &deps_of);
+
+        let mut blocked = HashSet::new();
+        blocked.insert("s0".to_string());
+        let pick_blocked = pick_next_step(
+            &steps,
+            &deps_of,
+            &depths,
+            &full_window(),
+            &HashSet::new(),
+            &blocked,
+        );
+        assert!(
+            pick_blocked.is_none(),
+            "blocked root + gated dependent ⇒ nothing runnable"
+        );
+
+        // Resolution: blocked set no longer contains s0.
+        let pick_after = pick_next_step(
+            &steps,
+            &deps_of,
+            &depths,
+            &full_window(),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+        assert_eq!(
+            pick_after.unwrap().id,
+            "s0",
+            "resolving the interruption re-queues the step at the next tick"
+        );
+    }
+
+    #[test]
+    fn test_scheduler_no_edges_is_authored_sort_key_order() {
+        // The linear-plan parity claim: with no dependency edges every
+        // step has depth 0, so the tie-break collapses to sort_key — a
+        // linear plan executes byte-identically to the pre-DAG loop.
+        let mut steps = make_steps(5);
+        let deps_of = deps_map(&steps, &[]);
+        let depths = compute_step_depths(&steps, &deps_of);
+        assert!(steps.iter().all(|s| depths[&s.id] == 0));
+
+        let order = schedule_order(&mut steps, &[], &full_window());
+        assert_eq!(order, vec!["s0", "s1", "s2", "s3", "s4"]);
+    }
+
+    #[test]
+    fn test_scheduler_multi_root_dag() {
+        // Two roots; s2 depends on s0, s3 on s1, s4 on both s2 and s3.
+        //   s0 ──► s2 ─┐
+        //   s1 ──► s3 ─┴► s4
+        let mut steps = make_steps(5);
+        let edges = [(2, 0), (3, 1), (4, 2), (4, 3)];
+        let deps_of = deps_map(&steps, &edges);
+
+        let depths = compute_step_depths(&steps, &deps_of);
+        assert_eq!(depths["s0"], 0);
+        assert_eq!(depths["s1"], 0);
+        assert_eq!(depths["s2"], 1);
+        assert_eq!(depths["s3"], 1);
+        assert_eq!(depths["s4"], 2);
+
+        // Only the two roots are runnable initially (all Pending).
+        let win_status: HashMap<&str, StepStatus> =
+            steps.iter().map(|s| (s.id.as_str(), s.status)).collect();
+        let runnable_now: Vec<&str> = steps
+            .iter()
+            .filter(|s| deps_satisfied(&s.id, &deps_of, &win_status))
+            .map(|s| s.id.as_str())
+            .collect();
+        assert_eq!(runnable_now, vec!["s0", "s1"]);
+
+        let order = schedule_order(&mut steps, &edges, &full_window());
+        // Roots first (depth 0, by sort_key), then depth-1, then the sink.
+        assert_eq!(order, vec!["s0", "s1", "s2", "s3", "s4"]);
+    }
+
+    #[test]
+    fn test_scheduler_diamond() {
+        // s0 ─┬► s1 ─┐
+        //     └► s2 ─┴► s3
+        let mut steps = make_steps(4);
+        let edges = [(1, 0), (2, 0), (3, 1), (3, 2)];
+        let deps_of = deps_map(&steps, &edges);
+
+        let depths = compute_step_depths(&steps, &deps_of);
+        assert_eq!(depths["s0"], 0);
+        assert_eq!(depths["s1"], 1);
+        assert_eq!(depths["s2"], 1);
+        assert_eq!(depths["s3"], 2); // 1 + max(depth(s1), depth(s2))
+
+        // The sink stays blocked until BOTH mid steps are Complete.
+        let mut work = steps.clone();
+        for s in work.iter_mut() {
+            if s.id == "s0" || s.id == "s1" {
+                s.status = StepStatus::Complete;
+            }
+        }
+        let win_status: HashMap<&str, StepStatus> =
+            work.iter().map(|s| (s.id.as_str(), s.status)).collect();
+        assert!(
+            !deps_satisfied("s3", &deps_of, &win_status),
+            "s3 must wait for s2 even though s1 is Complete"
+        );
+
+        let order = schedule_order(&mut steps, &edges, &full_window());
+        assert_eq!(order, vec!["s0", "s1", "s2", "s3"]);
+    }
+
+    #[test]
+    fn test_deps_satisfied_only_complete_unblocks() {
+        let steps = make_steps(2);
+        let deps_of = deps_map(&steps, &[(1, 0)]); // s1 depends on s0
+
+        // Non-terminal / failed deps still block their dependent.
+        for blocking in [
+            StepStatus::Pending,
+            StepStatus::InProgress,
+            StepStatus::Failed,
+            StepStatus::Aborted,
+        ] {
+            let win_status: HashMap<&str, StepStatus> = [("s0", blocking)].into_iter().collect();
+            assert!(
+                !deps_satisfied("s1", &deps_of, &win_status),
+                "{blocking:?} dep must block its dependent"
+            );
+        }
+
+        // Both Complete and Skipped satisfy the edge: a skipped step isn't
+        // reviewed, so there's no verdict to wait on, and its dependents
+        // must become runnable rather than being gated forever.
+        for unblocking in [StepStatus::Complete, StepStatus::Skipped] {
+            let win_status: HashMap<&str, StepStatus> = [("s0", unblocking)].into_iter().collect();
+            assert!(
+                deps_satisfied("s1", &deps_of, &win_status),
+                "{unblocking:?} dep must satisfy its dependent's edge"
+            );
+        }
+
+        // A dep absent from window_status (out of window / deleted) does
+        // not block — keeps the graph from deadlocking and preserves
+        // `--from`/`--to`.
+        assert!(deps_satisfied("s1", &deps_of, &HashMap::new()));
+    }
+
+    #[test]
+    fn test_skipped_dep_makes_dependent_runnable() {
+        // s1 depends on s0; s0 was skipped. s1 must become runnable so the
+        // branch keeps flowing instead of stranding the plan `InProgress`.
+        let mut steps = make_steps(2);
+        let edges = [(1, 0)];
+        let deps_of = deps_map(&steps, &edges);
+
+        steps[0].status = StepStatus::Skipped;
+
+        let depths = compute_step_depths(&steps, &deps_of);
+        let pick = pick_next_step(
+            &steps,
+            &deps_of,
+            &depths,
+            &full_window(),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+        assert_eq!(
+            pick.map(|s| s.id.clone()),
+            Some("s1".to_string()),
+            "a Skipped dependency must make its dependent the next runnable step"
+        );
+    }
+
+    // ---- STEP 38: concurrency model (§9-inv-1/2, §3.5 item 2/3) ----
+
+    // -- honest, scheduler-driven concurrency proofs --
+    //
+    // These drive the REAL `run_plan` scheduler on a 2-independent-branch
+    // DAG with stub implementation + a deliberately slow stub review. Each
+    // stub appends a wall-clock-timestamped phase marker to a shared event
+    // log; we parse that log to prove (i) real wall-clock overlap of an
+    // unrelated implementation with an outstanding review and (ii) that two
+    // implementations never overlap (semaphore=1 still holds). They replace
+    // two earlier tests that hand-poked a bare `tokio::sync::Semaphore` and
+    // never drove `run_plan` (so they could not have caught the inline-
+    // review serialization defect this commit fixes).
+
+    /// One parsed phase marker: `(phase, pid, t_ns)`. `phase` is one of
+    /// `IMPL_START`/`IMPL_END`/`REV_START`/`REV_END`; `pid` correlates a
+    /// START with its matching END (multiple reviews can be in flight at
+    /// once — they share no semaphore — so START/END pairs can nest and a
+    /// single-slot stack is wrong; the pid disambiguates).
+    #[cfg(test)]
+    fn parse_event_log(path: &std::path::Path) -> Vec<(String, String, u128)> {
+        let raw = std::fs::read_to_string(path).unwrap_or_default();
+        let mut ev: Vec<(String, String, u128)> = raw
+            .lines()
+            .filter_map(|l| {
+                let mut it = l.split_whitespace();
+                let phase = it.next()?.to_string();
+                let pid = it.next()?.to_string();
+                let ts: u128 = it.next()?.parse().ok()?;
+                Some((phase, pid, ts))
+            })
+            .collect();
+        ev.sort_by_key(|(_, _, t)| *t);
+        ev
+    }
+
+    /// Reconstruct `(start_ns, end_ns)` intervals for `phase_start` /
+    /// `phase_end` markers, correlating by pid so nested/overlapping
+    /// intervals of the same phase are reconstructed correctly.
+    #[cfg(test)]
+    fn intervals(
+        ev: &[(String, String, u128)],
+        phase_start: &str,
+        phase_end: &str,
+    ) -> Vec<(u128, u128)> {
+        use std::collections::HashMap;
+        let mut open: HashMap<String, u128> = HashMap::new();
+        let mut out: Vec<(u128, u128)> = Vec::new();
+        for (phase, pid, t) in ev {
+            if phase == phase_start {
+                open.insert(pid.clone(), *t);
+            } else if phase == phase_end
+                && let Some(s) = open.remove(pid)
+            {
+                out.push((s, *t));
+            }
+        }
+        out
+    }
+
+    /// Build a stub harness `HarnessConfig` that runs `sh <script>` (the
+    /// CLAUDE.md ETXTBSY-safe invocation).
+    #[cfg(test)]
+    fn sh_stub_harness(script: &str) -> crate::config::HarnessConfig {
+        crate::config::HarnessConfig {
+            command: "sh".to_string(),
+            args: vec![script.to_string()],
+            plan_args: vec![],
+            supports_agent_file: false,
+            supports_json_output: false,
+            json_output_args: vec![],
+            agent_file_env: None,
+            agent_file_args: vec![],
+            model_args: vec![],
+            default_model: None,
+            auth_env_vars: vec![],
+            auth_probe_args: vec![],
+            prompt_input: crate::config::PromptInputMode::Stdin,
+            argv_overflow: crate::config::ArgvOverflowBehavior::SpillToTempFile,
+            color: None,
+        }
+    }
+
+    /// HONEST PROOF (§2 Decision 3 / §3.5 item 3 / §9-inv-1/2): driving the
+    /// real `run_plan` scheduler on TWO independent root steps with a slow
+    /// stub review proves that (i) the unrelated branch's IMPLEMENTATION
+    /// actually starts and finishes while the first step's review is still
+    /// in flight (true wall-clock overlap), and (ii) the two
+    /// implementations never overlap (impl semaphore = 1 still holds).
+    ///
+    /// What this proves: under the fixed runner, some implementation
+    /// interval *intersects* some review interval on the wall clock (and
+    /// because a step's own review is spawned only after its own impl ends,
+    /// that intersection is necessarily cross-step — an UNRELATED branch
+    /// implemented while another step's review was in flight) AND no two
+    /// IMPL intervals overlap (impl semaphore=1). Under the pre-fix
+    /// inline-review code the scheduler `await`ed the review before picking
+    /// the next step, so every impl interval was strictly disjoint from
+    /// every review interval and this test would fail — which is exactly
+    /// why it is the honest replacement.
+    ///
+    /// What this does NOT prove: it does not assert a specific scheduler
+    /// pick order beyond "both independent steps run", nor anything about
+    /// review *correctness* (covered by review.rs unit tests); only the
+    /// concurrency *shape*.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_run_plan_overlaps_unrelated_impl_with_in_flight_review() {
+        use std::fs;
+        use tokio::sync::watch;
+
+        let (_tmp, dir) = init_git_repo();
+        let project = dir.to_string_lossy().to_string();
+
+        // Scripts + the shared event log live OUTSIDE the git workdir so
+        // they are never seen as a tracked/untracked "change".
+        let ext = tempfile::TempDir::new().unwrap();
+        let evlog = ext.path().join("events.log");
+        let evlog_s = evlog.to_string_lossy().into_owned();
+
+        // Implementation stub: timestamp IMPL_START, create a UNIQUE file
+        // (so every step produces a real change to commit), timestamp
+        // IMPL_END, exit 0. `date +%s%N` is nanosecond wall-clock.
+        let impl_sh = ext.path().join("impl.sh");
+        fs::write(
+            &impl_sh,
+            format!(
+                "#!/bin/sh\n\
+                 echo \"IMPL_START $$ $(date +%s%N)\" >> {log}\n\
+                 f=\"change_$$_$(date +%s%N).txt\"\n\
+                 echo work > \"$f\"\n\
+                 sleep 0.15\n\
+                 echo \"IMPL_END $$ $(date +%s%N)\" >> {log}\n",
+                log = evlog_s
+            ),
+        )
+        .unwrap();
+
+        // Review stub: timestamp REV_START, sleep LONG (so an unrelated
+        // impl has ample time to start+finish during it), timestamp
+        // REV_END, then PASS.
+        let rev_sh = ext.path().join("rev.sh");
+        fs::write(
+            &rev_sh,
+            format!(
+                "#!/bin/sh\n\
+                 echo \"REV_START $$ $(date +%s%N)\" >> {log}\n\
+                 sleep 0.8\n\
+                 echo \"REV_END $$ $(date +%s%N)\" >> {log}\n\
+                 echo 'REVIEW PASS'\n",
+                log = evlog_s
+            ),
+        )
+        .unwrap();
+
+        let conn = setup();
+        seed_run_lock_row(&conn, &project);
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "concurrent",
+                project: &project,
+                branch_name: "feat/concurrent",
+                description: "d",
+                harness: Some("impl"),
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        storage::update_plan_status(&conn, &plan.id, PlanStatus::Ready).unwrap();
+        // Two INDEPENDENT root steps (no edges between them): both runnable
+        // from the start, so the scheduler is FREE to pick the second while
+        // the first is under review.
+        for title in ["Alpha", "Beta"] {
+            storage::create_step(
+                &conn,
+                &plan.id,
+                crate::storage::NewStep {
+                    title,
+                    description: "d",
+                    agent: None,
+                    harness: None,
+                    acceptance_criteria: &[],
+                    max_retries: Some(0),
+                    model: None,
+                    change_policy: None,
+                    tags: None,
+                },
+            )
+            .unwrap();
+        }
+
+        let plan = storage::get_plan_by_slug(&conn, "concurrent", &project)
+            .unwrap()
+            .unwrap();
+
+        let mut config = Config::default();
+        config.harnesses.insert(
+            "impl".to_string(),
+            sh_stub_harness(&impl_sh.to_string_lossy()),
+        );
+        config.harnesses.insert(
+            "reviewer".to_string(),
+            sh_stub_harness(&rev_sh.to_string_lossy()),
+        );
+        config.review.enabled = Some(true);
+        config.review.harness = "reviewer".to_string();
+
+        let (_tx, rx) = watch::channel(None);
+        let out = OutputContext::from_cli(false, false, false);
+        let options = RunOptions {
+            current_branch: true,
+            ..Default::default()
+        };
+
+        let result = run_plan(&conn, &plan, &config, &dir, &options, rx, &out)
+            .await
+            .unwrap();
+
+        // Both steps ran and the plan finished cleanly (both reviews PASS,
+        // both promoted to Complete, drained before terminal status).
+        assert_eq!(result.steps_succeeded, 2, "both independent steps ran");
+        assert_eq!(result.final_status, PlanStatus::Complete);
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert!(
+            steps.iter().all(|s| s.status == StepStatus::Complete
+                && s.review_status == Some(crate::plan::ReviewStatus::Passed)),
+            "every step Complete + review Passed (no review left pending — §3.3)"
+        );
+
+        let ev = parse_event_log(&evlog);
+        // Reconstruct interval lists (pid-correlated so overlapping reviews
+        // are reconstructed correctly).
+        let impls = intervals(&ev, "IMPL_START", "IMPL_END");
+        let revs = intervals(&ev, "REV_START", "REV_END");
+        assert_eq!(
+            impls.len(),
+            2,
+            "two implementations ran (one per step); events: {ev:?}"
+        );
+        assert_eq!(
+            revs.len(),
+            2,
+            "two reviews ran (one per step); events: {ev:?}"
+        );
+
+        // (i) REAL OVERLAP: some implementation interval intersects some
+        // review interval on the wall clock (`is < re && rs < ie`). Because
+        // a step's own review is spawned only AFTER its implementation has
+        // ended (the executor commits, then the runner spawns the review),
+        // an impl∩review intersection is necessarily *cross-step* — i.e. an
+        // UNRELATED branch implemented while another step's review was in
+        // flight. This is the property the pre-fix inline-review code
+        // structurally CANNOT satisfy: it `await`ed `run_review` before
+        // picking the next step, so every impl interval was strictly
+        // disjoint from every review interval.
+        let overlap = impls
+            .iter()
+            .any(|&(is, ie)| revs.iter().any(|&(rs, re)| is < re && rs < ie));
+        assert!(
+            overlap,
+            "an unrelated implementation MUST overlap an in-flight review \
+             on the wall clock (§2 Decision 3 / §3.5 item 3); events: {ev:?}"
+        );
+
+        // (ii) SEMAPHORE = 1: no two implementation intervals overlap.
+        for (i, &(s1, e1)) in impls.iter().enumerate() {
+            for &(s2, e2) in impls.iter().skip(i + 1) {
+                assert!(
+                    e1 <= s2 || e2 <= s1,
+                    "two implementations overlapped — impl semaphore=1 \
+                     violated (§9-inv-1); events: {ev:?}"
+                );
+            }
+        }
+    }
+
+    /// §3.5 item 3 / §3.1: a step's DIRECT DEPENDENTS are not runnable until
+    /// that step is `Complete`. While review keeps the reviewed step
+    /// `InProgress` (executor's review gate), `deps_satisfied` (which
+    /// requires `Complete`) excludes its dependents from the runnable set —
+    /// so concurrency never starts work on un-reviewed output.
+    #[test]
+    fn test_direct_dependents_gated_until_reviewed_step_complete() {
+        let steps = make_steps(3); // s0, s1, s2
+        // s1 and s2 both directly depend on s0 (the reviewed step).
+        let deps_of = deps_map(&steps, &[(1, 0), (2, 0)]);
+        let depths = compute_step_depths(&steps, &deps_of);
+
+        // s0 is `InProgress` — exactly the state the executor leaves a
+        // review-gated step in (NOT `Complete`) until its review returns.
+        let mut steps_ip = steps.clone();
+        steps_ip[0].status = StepStatus::InProgress;
+        let win: HashMap<&str, StepStatus> =
+            steps_ip.iter().map(|s| (s.id.as_str(), s.status)).collect();
+        assert!(
+            !deps_satisfied("s1", &deps_of, &win),
+            "a direct dependent must NOT be runnable while the reviewed \
+             step is still InProgress (review not yet returned)"
+        );
+        assert!(!deps_satisfied("s2", &deps_of, &win));
+        // The scheduler therefore picks neither dependent (only s0 is
+        // actionable, and it's already executing/being reviewed).
+        let pick = pick_next_step(
+            &steps_ip,
+            &deps_of,
+            &depths,
+            &full_window(),
+            &["s0".to_string()].into_iter().collect(),
+            &HashSet::new(),
+        );
+        assert!(
+            pick.is_none(),
+            "no dependent may start on un-reviewed work (§3.5 item 3)"
+        );
+
+        // Once review returns and the orchestrator promotes s0 to Complete,
+        // its dependents become runnable on the very next tick.
+        let mut steps_done = steps;
+        steps_done[0].status = StepStatus::Complete;
+        let win2: HashMap<&str, StepStatus> = steps_done
+            .iter()
+            .map(|s| (s.id.as_str(), s.status))
+            .collect();
+        assert!(deps_satisfied("s1", &deps_of, &win2));
+        assert!(deps_satisfied("s2", &deps_of, &win2));
+    }
+
+    /// LINEAR-PARITY PROOF (§9-inv-5 / §1): with no review config and no
+    /// edges (or a degenerate chain), the scheduler tie-break still
+    /// reproduces the authored sort_key order EXACTLY — a linear plan
+    /// serializes and behaves exactly as today. (The review pipeline is
+    /// `needs_review = None` for every step when review is not
+    /// effective-enabled, so the loop never spawns a review at all.)
+    #[test]
+    fn test_linear_plan_serializes_exactly_as_today_under_review_code() {
+        // A degenerate chain s0<-s1<-s2<-s3 (the V25 backfill shape).
+        let mut steps = make_steps(4);
+        let order = schedule_order(&mut steps, &[(1, 0), (2, 1), (3, 2)], &full_window());
+        assert_eq!(
+            order,
+            vec!["s0", "s1", "s2", "s3"],
+            "a linear chain must execute in authored order, byte-identical \
+             to the pre-review behavior"
+        );
+        // And review being OFF by default means a no-review Plan/Step never
+        // sets the executor's review gate. Assert the default config.
+        let cfg = crate::config::Config::default();
+        assert_eq!(
+            cfg.review.enabled, None,
+            "review is OFF by default — linear/no-config plans never review"
+        );
+    }
+
+    #[test]
+    fn test_scheduler_short_id_breaks_sort_key_ties() {
+        // Force a depth + sort_key tie; short_id is the final, stable
+        // discriminator (§3.5 item 4).
+        let mut steps = make_steps(2);
+        steps[0].sort_key = "a0".to_string();
+        steps[1].sort_key = "a0".to_string();
+        steps[0].short_id = "zzzzzzzz".to_string();
+        steps[1].short_id = "aaaaaaaa".to_string();
+        let deps_of = deps_map(&steps, &[]);
+        let depths = compute_step_depths(&steps, &deps_of);
+
+        let pick = pick_next_step(
+            &steps,
+            &deps_of,
+            &depths,
+            &full_window(),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+        assert_eq!(pick.unwrap().id, "s1"); // lower short_id wins the tie
+    }
+
+    #[test]
+    fn test_scheduler_window_excludes_out_of_window_dep() {
+        // `--from`-style window on a V25-style linear chain: the excluded
+        // prerequisite must NOT gate the first in-window step, so the
+        // windowed steps run in chain order exactly as the pre-DAG loop.
+        let mut steps = make_steps(4); // s0<-s1<-s2<-s3, sort_keys a0..a3
+        let edges = [(1, 0), (2, 1), (3, 2)];
+        // Window starts at s2 (sort_key "a2"); s0/s1 are excluded.
+        let window = RunWindow {
+            from_key: Some("a2".to_string()),
+            to_key: None,
+        };
+
+        let deps_of = deps_map(&steps, &edges);
+        let depths = compute_step_depths(&steps, &deps_of);
+        // s2's dep (s1) is out of window ⇒ s2 is the first pick.
+        let pick = pick_next_step(
+            &steps,
+            &deps_of,
+            &depths,
+            &window,
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+        assert_eq!(pick.unwrap().id, "s2");
+
+        let order = schedule_order(&mut steps, &edges, &window);
+        assert_eq!(order, vec!["s2", "s3"]);
+    }
+
+    #[test]
+    fn test_scheduler_skips_executed_and_is_deterministic() {
+        let steps = make_steps(3);
+        let deps_of = deps_map(&steps, &[]);
+        let depths = compute_step_depths(&steps, &deps_of);
+
+        // Determinism: repeated ticks on identical state pick the same step.
+        let a = pick_next_step(
+            &steps,
+            &deps_of,
+            &depths,
+            &full_window(),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+        let b = pick_next_step(
+            &steps,
+            &deps_of,
+            &depths,
+            &full_window(),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+        assert_eq!(a.unwrap().id, "s0");
+        assert_eq!(b.unwrap().id, "s0");
+
+        // A step already executed this invocation is not re-picked.
+        let mut executed = HashSet::new();
+        executed.insert("s0".to_string());
+        let pick = pick_next_step(
+            &steps,
+            &deps_of,
+            &depths,
+            &full_window(),
+            &executed,
+            &HashSet::new(),
+        );
+        assert_eq!(pick.unwrap().id, "s1");
+
+        // Nothing runnable ⇒ None.
+        let mut done = make_steps(2);
+        for s in done.iter_mut() {
+            s.status = StepStatus::Complete;
+        }
+        let deps_of = deps_map(&done, &[]);
+        let depths = compute_step_depths(&done, &deps_of);
+        assert!(
+            pick_next_step(
+                &done,
+                &deps_of,
+                &depths,
+                &full_window(),
+                &HashSet::new(),
+                &HashSet::new()
+            )
+            .is_none()
+        );
+    }
+
+    // -- linear-plan parity regression (docs/dag-redesign.md §1, §3.5
+    //    item 4, §13.1) --
+    //
+    // Phase-1 hard invariant: a plan whose only edges are the V25
+    // linear-chain backfill must execute in EXACTLY today's `sort_key`
+    // order, and any DAG must execute in EXACTLY the documented
+    // `(depth, sort_key, short_id)` order — stable and reproducible
+    // given identical inputs. The §3.5 tests above assert specific
+    // orders against hand-computed expectations; these instead compare
+    // the scheduler's emission against an *independent oracle* (the
+    // steps sorted by the documented key) and prove the emission is a
+    // pure function of the DAG + tie-break tuple, never of the order
+    // the steps happen to arrive in or of how many times the scheduler
+    // is run. That is the precise byte-identical-to-pre-DAG claim.
+
+    /// Apply a fixed, deterministic, fixed-point-free permutation (for
+    /// `n >= 2`) to a step vec: reverse, then rotate left by one. No
+    /// `rand` dependency, so the "reproducible given identical inputs"
+    /// assertions stay deterministic. Used to prove the scheduler's
+    /// emission order does not depend on input-slice position.
+    fn scrambled(steps: &[Step]) -> Vec<Step> {
+        let mut v: Vec<Step> = steps.iter().rev().cloned().collect();
+        v.rotate_left(1);
+        v
+    }
+
+    /// Translate id-keyed `(dependent_id, dependency_id)` pairs into the
+    /// index-edge form `deps_map`/`schedule_order` expect, resolved
+    /// against *this* slice ordering. Lets a test scramble the step vec
+    /// while keeping the same logical DAG.
+    fn edges_for(steps: &[Step], id_pairs: &[(&str, &str)]) -> Vec<(usize, usize)> {
+        let pos = |id: &str| steps.iter().position(|s| s.id == id).unwrap();
+        id_pairs.iter().map(|&(a, b)| (pos(a), pos(b))).collect()
+    }
+
+    /// The documented deterministic emission order (§3.5 item 4): every
+    /// step sorted by `(topological depth, sort_key, short_id)`, using
+    /// the same `compute_step_depths` the scheduler uses. For an
+    /// all-`Pending`, full-window DAG the scheduler emits exactly this
+    /// total order: a dependency always has strictly smaller depth —
+    /// hence a strictly smaller tuple — than its dependents, so the
+    /// global tuple-minimum unexecuted step is always runnable. This is
+    /// the independent oracle, not a re-derivation of the scheduler.
+    fn tie_break_order(steps: &[Step], id_pairs: &[(&str, &str)]) -> Vec<String> {
+        let mut deps_of: HashMap<String, Vec<String>> = HashMap::new();
+        for &(a, b) in id_pairs {
+            deps_of
+                .entry(a.to_string())
+                .or_default()
+                .push(b.to_string());
+        }
+        let depths = compute_step_depths(steps, &deps_of);
+        let mut ranked: Vec<&Step> = steps.iter().collect();
+        ranked.sort_by(|a, b| {
+            depths[&a.id]
+                .cmp(&depths[&b.id])
+                .then_with(|| a.sort_key.cmp(&b.sort_key))
+                .then_with(|| a.short_id.cmp(&b.short_id))
+        });
+        ranked.into_iter().map(|s| s.id.clone()).collect()
+    }
+
+    /// Run the scheduler on the original input order and on several
+    /// fixed permutations of it, repeatedly, asserting every run emits
+    /// `expected`. This is the "stable and reproducible given identical
+    /// inputs" guarantee of §3.5 item 4.
+    fn assert_reproducible(steps: &[Step], id_pairs: &[(&str, &str)], expected: &[String]) {
+        let orderings: Vec<Vec<Step>> = vec![
+            steps.to_vec(),
+            scrambled(steps),
+            scrambled(&scrambled(steps)),
+            steps.iter().rev().cloned().collect(),
+        ];
+        for _ in 0..3 {
+            for ord in &orderings {
+                let mut s = ord.clone();
+                let edges = edges_for(&s, id_pairs);
+                let order = schedule_order(&mut s, &edges, &full_window());
+                assert_eq!(
+                    order, expected,
+                    "scheduler emission must be stable & reproducible \
+                     regardless of input-slice order or run count"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_linear_chain_is_byte_identical_to_sort_key_order() {
+        // V25 backfill: order a plan's steps by `sort_key`, then chain
+        // each onto its sort_key-predecessor. The scheduler must emit
+        // them in EXACTLY `sort_key` order — byte-identical to the
+        // pre-DAG loop, which iterated `list_steps` (`ORDER BY
+        // sort_key`) — no matter what order the rows arrive in.
+        let mut steps = make_steps(5);
+        // sort_keys deliberately NOT in `s{i}`/input order, so the
+        // oracle is a non-trivial permutation and the assertion bites.
+        let keys = ["a30", "a10", "a40", "a00", "a20"];
+        for (s, k) in steps.iter_mut().zip(keys) {
+            s.sort_key = k.to_string();
+        }
+        // Realistic V25: every step carries a distinct minted short_id.
+        for (i, s) in steps.iter_mut().enumerate() {
+            s.short_id = format!("h{i}");
+        }
+
+        // Independent oracle: the steps sorted by `sort_key` — exactly
+        // what `list_steps` yields, hence exactly the pre-DAG order.
+        let mut by_key: Vec<&Step> = steps.iter().collect();
+        by_key.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
+        let expected: Vec<String> = by_key.iter().map(|s| s.id.clone()).collect();
+        assert_eq!(
+            expected,
+            vec!["s3", "s1", "s4", "s0", "s2"],
+            "sanity: sort_key order is the intended non-trivial permutation"
+        );
+
+        // V25 backfill edges: each step depends on its sort_key
+        // predecessor (the linear chain).
+        let chain: Vec<&str> = expected.iter().map(|s| s.as_str()).collect();
+        let id_pairs: Vec<(&str, &str)> =
+            (1..chain.len()).map(|i| (chain[i], chain[i - 1])).collect();
+
+        // The chain's topological depth ranking equals its sort_key
+        // ranking, so `(depth, sort_key, short_id)` collapses to
+        // sort_key — i.e. the DAG oracle agrees with the parity oracle.
+        assert_eq!(tie_break_order(&steps, &id_pairs), expected);
+
+        // Emission equals the sort_key oracle, regardless of input
+        // order and repeated runs.
+        assert_reproducible(&steps, &id_pairs, &expected);
+    }
+
+    #[test]
+    fn test_multi_root_dag_order_is_oracle_stable() {
+        //   s0 ──► s2 ─┐
+        //   s1 ──► s3 ─┴► s4
+        // sort_keys interleave the two roots / two mids so the
+        // expected order is not the `s{i}` order — proving the
+        // `(depth, sort_key, …)` ranking, not authored index, decides.
+        let mut steps = make_steps(5);
+        let keys = ["a50", "a10", "a40", "a20", "a99"];
+        for (s, k) in steps.iter_mut().zip(keys) {
+            s.sort_key = k.to_string();
+        }
+        for (i, s) in steps.iter_mut().enumerate() {
+            s.short_id = format!("k{i}");
+        }
+        let id_pairs = [("s2", "s0"), ("s3", "s1"), ("s4", "s2"), ("s4", "s3")];
+
+        let expected = tie_break_order(&steps, &id_pairs);
+        // depth0 {s1@a10, s0@a50} → s1,s0 ; depth1 {s3@a20, s2@a40} →
+        // s3,s2 ; depth2 s4.
+        assert_eq!(
+            expected,
+            vec!["s1", "s0", "s3", "s2", "s4"],
+            "multi-root order is determined by (depth, sort_key)"
+        );
+        assert_reproducible(&steps, &id_pairs, &expected);
+    }
+
+    #[test]
+    fn test_diamond_dag_short_id_is_stable_final_discriminator() {
+        // s0 ─┬► s1 ─┐
+        //     └► s2 ─┴► s3
+        // s1 and s2 share a sort_key (same depth too): the
+        // tie-break must fall through to `short_id` and stay stable
+        // and reproducible across runs and input orderings.
+        let mut steps = make_steps(4);
+        let keys = ["a05", "a10", "a10", "a90"]; // s1 / s2 sort_key tie
+        for (s, k) in steps.iter_mut().zip(keys) {
+            s.sort_key = k.to_string();
+        }
+        let short_ids = ["m0", "zzz", "aaa", "m3"];
+        for (s, sid) in steps.iter_mut().zip(short_ids) {
+            s.short_id = sid.to_string();
+        }
+        let id_pairs = [("s1", "s0"), ("s2", "s0"), ("s3", "s1"), ("s3", "s2")];
+
+        let expected = tie_break_order(&steps, &id_pairs);
+        // depth1 tie on sort_key "a10" broken by short_id: "aaa"(s2) <
+        // "zzz"(s1) ⇒ s2 before s1.
+        assert_eq!(
+            expected,
+            vec!["s0", "s2", "s1", "s3"],
+            "short_id is the stable final discriminator under a sort_key tie"
+        );
+        assert_reproducible(&steps, &id_pairs, &expected);
+    }
+
+    /// Source-shape assertions for the abort-path / review-pipeline
+    /// teardown wiring. The behavioral path (a real Ctrl+C while a review
+    /// is parked) needs a live tokio runtime + spawned review harnesses,
+    /// which can't be cleanly constructed in a unit test — so we assert
+    /// the source shape: the abort branches must call
+    /// `drain_reviews_on_abort` (FIX #1) and the blocking
+    /// `drain_finished_reviews` call must race on `abort_rx.changed()`
+    /// (FIX #2).
+    #[test]
+    fn test_abort_branch_drains_reviews_before_returning() {
+        let src = include_str!("runner.rs");
+        // The in-loop Aborted branch in `run_plan_inner`.
+        let sig = "async fn run_plan_inner(";
+        let start = src.find(sig).expect("run_plan_inner must exist");
+        let after = &src[start..];
+        // Bound at the next top-level async/fn item.
+        let end_rel = after[sig.len()..]
+            .find("\n// ---")
+            .or_else(|| after[sig.len()..].find("\nasync fn "))
+            .or_else(|| after[sig.len()..].find("\nfn "))
+            .expect("expected a sibling item after run_plan_inner");
+        let body = &after[..sig.len() + end_rel];
+        // The top-of-loop between-steps abort check.
+        assert!(
+            body.contains("drain_reviews_on_abort("),
+            "the Aborted branch in run_plan_inner must call \
+             drain_reviews_on_abort before returning so finished review \
+             verdicts aren't silently discarded and still-in-flight \
+             reviewers are aborted (kill_on_drop fires on the child)"
+        );
+        // Tighten: the in-loop `StepOutcome::Aborted =>` arm (fired when the
+        // executor observes the abort *inside* a step) must ALSO drain. Scope
+        // the search to that arm specifically (from its match marker up to the
+        // next `StepOutcome::Skipped =>` arm) so a drain that only lives in the
+        // between-steps check doesn't satisfy this assertion.
+        let arm_start = body
+            .find("StepOutcome::Aborted => {")
+            .expect("the in-loop StepOutcome::Aborted arm must exist");
+        let arm = &body[arm_start..];
+        let arm_end = arm
+            .find("StepOutcome::Skipped => {")
+            .expect("expected a StepOutcome::Skipped arm after the Aborted arm");
+        let aborted_arm = &arm[..arm_end];
+        assert!(
+            aborted_arm.contains("drain_reviews_on_abort("),
+            "the in-loop StepOutcome::Aborted arm must call \
+             drain_reviews_on_abort before returning so finished review \
+             verdicts aren't silently discarded when the executor aborts \
+             mid-step"
+        );
+    }
+
+    #[test]
+    fn test_drain_finished_reviews_blocking_wait_is_abort_cancellable() {
+        let src = include_str!("runner.rs");
+        // The abort receiver is now threaded through the `DrainReviews` param
+        // struct; the blocking arm still races `join_next` against it.
+        assert!(
+            src.contains("abort_rx: &'a mut watch::Receiver<CancelState>"),
+            "drain_finished_reviews must accept an abort_rx (via DrainReviews) \
+             so its blocking join_next call can race on the cancel signal"
+        );
+        let sig = "async fn drain_finished_reviews(";
+        let start = src.find(sig).expect("drain_finished_reviews must exist");
+        let after = &src[start..];
+        // Take enough to cover the blocking arm.
+        let body = &after[..after.len().min(8192)];
+        assert!(
+            body.contains("tokio::select!") && body.contains("abort_rx.changed()"),
+            "drain_finished_reviews(block=true) must race join_next against \
+             abort_rx.changed() — otherwise Ctrl+C is silently ignored \
+             until the reviewer naturally returns"
+        );
+    }
+
+    /// BEHAVIORAL coverage for the abort-path review drain (closes the
+    /// "source-shape only" gap left by
+    /// `test_abort_branch_drains_reviews_before_returning`).
+    ///
+    /// We don't drive a full Ctrl+C through `run_plan_inner` with live
+    /// review subprocesses (that needs a multi-thread runtime, real review
+    /// harnesses, and exec timing — inherently flaky). Instead we exercise
+    /// `drain_reviews_on_abort` directly with a `reviews` JoinSet seeded so
+    /// that:
+    ///   - one task is ALREADY FINISHED with a `Pass` verdict ready to
+    ///     drain (just an async block returning a `SpawnedReview` — no real
+    ///     subprocess), and
+    ///   - one task is STILL IN FLIGHT (parks forever).
+    ///
+    /// The abort drain must (a) apply the finished verdict to the DB
+    /// (`review_status` InFlight → Passed, status InProgress → Complete via
+    /// `finalize_review`) rather than silently lose it, and (b) shut down
+    /// the in-flight task without hanging, leaving the JoinSet empty.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_drain_reviews_on_abort_applies_finished_verdict_and_aborts_inflight() {
+        use crate::review::{ReviewTaskResult, ReviewVerdict, SpawnedReview};
+        use std::time::Duration;
+
+        let conn = setup();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "abrt",
+                project: "/tmp/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        // The reviewed step is mid-review: InProgress + review_status =
+        // InFlight, exactly the state the runner leaves it in after spawning
+        // a detached review (see run_plan_inner around line 742).
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            crate::storage::NewStep {
+                title: "Reviewed",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+        storage::update_step_status(&conn, &step.id, StepStatus::InProgress).unwrap();
+        storage::update_step_review_status(&conn, &step.id, crate::plan::ReviewStatus::InFlight)
+            .unwrap();
+
+        let out = OutputContext {
+            format: OutputFormat::Plain,
+            quiet: true,
+            color: false,
+        };
+        let (_abort_tx, mut abort_rx) = watch::channel::<CancelState>(None);
+        let workdir = std::path::PathBuf::from("/tmp/proj");
+
+        let mut reviews: tokio::task::JoinSet<SpawnedReview> = tokio::task::JoinSet::new();
+
+        // (1) A FINISHED review: a Pass verdict ready to drain. No real
+        // subprocess — just an async block that returns the struct the
+        // spawnable reviewer would have produced.
+        let finished_step_id = step.id.clone();
+        reviews.spawn(async move {
+            SpawnedReview {
+                step_id: finished_step_id.clone(),
+                iteration: 1,
+                result: Ok(ReviewTaskResult {
+                    step_id: finished_step_id,
+                    step_num: 1,
+                    // `/tmp/proj` isn't a git repo, so the best-effort
+                    // git-note annotation just warns; the DB verdict (the
+                    // source of truth) still lands.
+                    commit_sha: "deadbeef".to_string(),
+                    iteration: 1,
+                    short_sha: "deadbee".to_string(),
+                    verdict: ReviewVerdict::Pass,
+                    verdict_body: Some("looks good".to_string()),
+                }),
+            }
+        });
+
+        // (2) A STILL-IN-FLIGHT review that would never return on its own.
+        // The abort drain must shut it down rather than block forever.
+        reviews.spawn(async move {
+            // Park effectively forever; only JoinSet::shutdown should end it.
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            unreachable!("the in-flight review must be aborted by shutdown, not run to completion");
+        });
+
+        // Make sure the finished task has actually completed before we drain,
+        // so the non-blocking pass reaps it deterministically (not racing the
+        // scheduler). Yielding repeatedly lets the spawned async block run.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+
+        // The behavior under test: must not hang, and must drain the finished
+        // verdict. Wrap in a timeout so a regression that reintroduces a
+        // blocking wait surfaces as a test failure rather than a hung suite.
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            drain_reviews_on_abort(&conn, &plan, &mut reviews, &workdir, &out, &mut abort_rx),
+        )
+        .await
+        .expect("drain_reviews_on_abort must not hang on a still-in-flight reviewer");
+
+        // The finished Pass verdict was applied: InFlight → Passed and the
+        // reviewed step promoted InProgress → Complete (finalize_review).
+        let refreshed = storage::get_step_by_id(&conn, &step.id).unwrap().unwrap();
+        assert_eq!(
+            refreshed.review_status,
+            Some(crate::plan::ReviewStatus::Passed),
+            "the finished review verdict must be drained to the DB on abort, not lost"
+        );
+        assert_eq!(
+            refreshed.status,
+            StepStatus::Complete,
+            "a passed review must promote the reviewed step to Complete even on abort"
+        );
+
+        // The in-flight reviewer was aborted and the set fully drained.
+        assert!(
+            reviews.is_empty(),
+            "drain_reviews_on_abort must shut down the still-in-flight reviewer, \
+             leaving the JoinSet empty"
+        );
+    }
+
+    #[test]
+    fn test_drain_reviews_on_abort_uses_joinset_shutdown() {
+        let src = include_str!("runner.rs");
+        let sig = "async fn drain_reviews_on_abort(";
+        let start = src.find(sig).expect("drain_reviews_on_abort must exist");
+        let after = &src[start..];
+        // Bound at the next `async fn`.
+        let end_rel = after[sig.len()..]
+            .find("\nasync fn ")
+            .expect("expected a sibling async fn after drain_reviews_on_abort");
+        let body = &after[..sig.len() + end_rel];
+        assert!(
+            body.contains("drain_finished_reviews(") && body.contains("false"),
+            "drain_reviews_on_abort must do a non-blocking drain pass \
+             (block=false) so finished verdicts are absorbed before \
+             aborting the rest"
+        );
+        assert!(
+            body.contains("reviews.shutdown()"),
+            "drain_reviews_on_abort must call JoinSet::shutdown so \
+             still-in-flight review tasks are aborted (and kill_on_drop \
+             fires on each review child)"
+        );
     }
 }

@@ -527,7 +527,6 @@ pub fn install_and_spawn() -> watch::Receiver<CancelState> {
 /// [`ShutdownHandle`] (for programmatic shutdown) and the abort receiver.
 ///
 /// Must be called from within an active tokio runtime.
-#[allow(dead_code)]
 pub fn install_and_spawn_with_handle() -> (ShutdownHandle, watch::Receiver<CancelState>) {
     ShutdownController::new().spawn_signal_listener()
 }

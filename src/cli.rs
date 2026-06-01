@@ -1,11 +1,11 @@
 // CLI argument parsing (clap)
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use clap_complete::Shell;
 use std::path::PathBuf;
 
 use crate::hook_library::Lifecycle;
-use crate::plan::{ChangePolicy, PlanStatus, RetryStrategy};
+use crate::plan::{ChangePolicy, PlanStatus};
 
 /// Authoring tip surfaced via `--help` on plan/step creation commands and
 /// the top-level binary, so plan authors learn ralph's commit-ownership
@@ -307,13 +307,38 @@ pub enum Command {
         lines: Option<usize>,
     },
 
-    /// Ask the user a question or list/answer outstanding questions on a plan.
+    /// Record a harness-asked question mid-step (`ralph question ask`).
     ///
-    /// `ralph question ask` is invoked by the harness mid-step to pause for
-    /// clarification on a per-plan opt-in question feature. See TUI-plan.md
-    /// §17 for the full design.
+    /// Invoked by the harness mid-step to pause for clarification on a
+    /// per-plan opt-in question feature (binds via the run lock). See
+    /// TUI-plan.md §17 for the full design. Human-side management of open
+    /// questions/blockers uses the `interruption` subcommands.
     #[command(subcommand)]
     Question(QuestionCommand),
+
+    /// Raise a blocker the agent cannot clear on its own (needs sudo, needs
+    /// access, needs information).
+    ///
+    /// Invoked by the harness mid-step, exactly like `ralph question ask`:
+    /// binds to the live `ralph run` for this project via the run lock,
+    /// writes an open `interruptions` row (`kind=blocker`, no options), then
+    /// the agent exits cleanly. The orchestrator marks the branch `Blocked`
+    /// (no retry budget consumed) and the scheduler moves on
+    /// (docs/dag-redesign.md §3.4/§7). Rejected outside a run, or when the
+    /// plan/step question feature is off, exactly like `question ask`.
+    Block {
+        /// The blocker explanation (what the agent cannot do and why). If
+        /// omitted, read from stdin.
+        text: Option<String>,
+    },
+
+    /// List, inspect, and resolve open interruptions (questions + blockers).
+    ///
+    /// The human-side counterpart to the harness's `ralph question ask` /
+    /// `ralph block`. The TUI inbox is the primary path; this command group
+    /// is the scriptable equivalent (docs/dag-redesign.md §7).
+    #[command(subcommand)]
+    Interruption(InterruptionCommand),
 
     /// List and manage agent file templates.
     #[command(subcommand)]
@@ -375,6 +400,39 @@ pub enum ConfigCommand {
         /// IANA timezone name.
         tz: String,
     },
+
+    /// Manage the global nondeterministic-review configuration block
+    /// (docs/dag-redesign.md §6/§7).
+    #[command(subcommand)]
+    Review(ConfigReviewCommand),
+}
+
+/// `ralph config review …` — the global `"review"` config block (the
+/// bottom of the precedence chain step > plan > config > false).
+#[derive(Debug, Subcommand)]
+pub enum ConfigReviewCommand {
+    /// Set one or more fields of the global review block. Every argument is
+    /// independently optional — only the fields you pass are written; the
+    /// rest are left untouched (so `--enabled true` alone flips the global
+    /// default without disturbing a previously-configured harness/model).
+    Set {
+        /// Review harness name (the harness the read-only reviewer
+        /// subprocess invokes, e.g. `codex`). Global config, never plan or
+        /// export data — a bundle stays portable across machines whose
+        /// review harness differs (docs/dag-redesign.md §13.2).
+        #[arg(long)]
+        harness: Option<String>,
+
+        /// Model the reviewer subprocess uses (empty = harness default).
+        #[arg(long)]
+        model: Option<String>,
+
+        /// Global default for whether a step is reviewed. The bottom of the
+        /// precedence chain (step.review_enabled ?? plan.review_enabled ??
+        /// config.review.enabled ?? false).
+        #[arg(long)]
+        enabled: Option<bool>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -431,18 +489,15 @@ pub enum PlanCommand {
         #[arg(long)]
         agent: Option<String>,
 
-        /// Plan-level default retry strategy for failed step attempts.
-        /// Effective value is resolved step > plan > default `keep`:
-        /// a step's own `--retry-strategy` wins, then this plan-level
-        /// default, then the built-in default (`keep`). `keep` = a failed
-        /// attempt leaves the working tree as-is so the next attempt
-        /// builds on it directly; `rollback` = a failed attempt rolls the
-        /// working tree back and feeds the prior diff into the next
-        /// attempt's prompt instead. Omit to leave the plan with no
-        /// override (steps then fall through to the global `keep`
-        /// default).
-        #[arg(long, value_name = "STRATEGY")]
-        retry_strategy: Option<RetryStrategy>,
+        /// Cap the review→correction→review recursion depth for this plan
+        /// (docs/dag-redesign.md §10 item 4 / §14.5). When a corrective
+        /// step's own review keeps failing past this many corrections, ralph
+        /// raises a `kind=blocker` interruption ("review loop — needs
+        /// human") instead of spawning corrective steps indefinitely. Omit
+        /// to use the built-in default (3). The per-plan way to configure the
+        /// review recursion bound.
+        #[arg(long, value_name = "N")]
+        max_review_corrections: Option<i32>,
 
         /// Deterministic test command(s) to validate each step.
         #[arg(long = "test")]
@@ -544,13 +599,16 @@ pub enum PlanCommand {
     #[command(subcommand)]
     Harness(PlanHarnessCommand),
 
-    /// Toggle the pause-for-question feature for a plan.
+    /// Toggle the built-in nondeterministic review pipeline for a plan
+    /// (docs/dag-redesign.md §3.3/§6/§7).
     ///
-    /// `ralph plan questions on <slug>` enables the feature; off disables it.
-    /// Mirrors the `Q` keybinding in the TUI plan list.
-    Questions {
-        /// `on` to enable, `off` to disable.
-        state: QuestionsState,
+    /// `ralph plan review on <slug>` sets the plan-level `review_enabled`
+    /// override to true; `off` sets it to false. The per-plan value wins
+    /// over the global `config.review.enabled` and is itself overridden by
+    /// a per-step `--review` (precedence step > plan > config > false).
+    Review {
+        /// `on` to force review on for the plan, `off` to force it off.
+        state: OnOffState,
 
         /// Plan slug.
         slug: String,
@@ -610,12 +668,31 @@ pub enum StepCommand {
 
     /// Add a new step to a plan.
     ///
-    /// The single-step form takes a positional title plus per-field flags.
-    /// For bulk insertion use `--import-json <FILE|->` to read an array of
-    /// step objects (or a single object) from a file or stdin; the per-field
-    /// flags are mutually exclusive with `--import-json`. When `--import-json`
-    /// is used, the first positional is interpreted as the plan slug (since
-    /// no title is meaningful for a bulk import).
+    /// Every step's place in the dependency DAG is **explicit**. On a
+    /// non-empty plan you must pass exactly one placement:
+    ///
+    ///   --after <S>    the new step depends on S (a new branch off S)
+    ///   --before <S>   the new step takes over S's incoming edges; S then
+    ///                   depends only on the new step (insert *before* S; if
+    ///                   S was a root the new step becomes the new root)
+    ///   --after <X> --before <Y>
+    ///                   splice the new step between X and Y (it depends on
+    ///                   X; the X→Y edge is rerouted so Y depends on it)
+    ///   --depends-on <S>...  the general/join form: depend on each S (use
+    ///                   this for a step that needs *several* prior steps)
+    ///   --root         an explicit independent root (deliberate extra root)
+    ///
+    /// The very first step of an empty plan is the implied root and needs no
+    /// flag. `--after`/`--before` are **dependency** edges, not list
+    /// position — there is no positional-only insert any more (that
+    /// ambiguity silently produced edge-less DAGs).
+    ///
+    /// For bulk insertion use `--import-json <FILE|->` (a JSON array, or one
+    /// object) from a file or stdin; it carries the DAG via a per-object
+    /// readable `id` + `depends_on` (validated like `ralph import`; the
+    /// persisted `short_id` is minted, not hand-written). The single-step
+    /// flags are mutually exclusive with `--import-json`; with
+    /// `--import-json` a single positional is the plan slug.
     #[command(after_help = AUTHORING_TIP_COMMITS)]
     Add {
         /// Step title. Required unless `--import-json` is used. With
@@ -631,9 +708,35 @@ pub enum StepCommand {
         #[arg(long, short, conflicts_with = "import_json")]
         description: Option<String>,
 
-        /// Position to insert at (1-based). Defaults to end.
-        #[arg(long, conflicts_with = "import_json")]
-        after: Option<usize>,
+        /// Placement: the new step DEPENDS ON this step (a new branch off
+        /// it), identified by 1-based number or 8-char short id. This is a
+        /// dependency edge, NOT list position. With `--before`, splices the
+        /// new step between this step and the `--before` step.
+        #[arg(
+            long,
+            value_name = "SHORT_ID|NUM",
+            conflicts_with_all = ["import_json", "root", "depends_on"]
+        )]
+        after: Option<String>,
+
+        /// Placement: insert the new step BEFORE this step — the new step
+        /// takes over all of this step's incoming dependency edges and this
+        /// step then depends only on the new step (if it was a root, the new
+        /// step becomes the new root). Identified by number or short id.
+        #[arg(
+            long,
+            value_name = "SHORT_ID|NUM",
+            conflicts_with_all = ["import_json", "root", "depends_on"]
+        )]
+        before: Option<String>,
+
+        /// Placement: add the new step as an explicit independent root (no
+        /// dependencies — a deliberate additional root of the DAG).
+        #[arg(
+            long,
+            conflicts_with_all = ["import_json", "after", "before", "depends_on"]
+        )]
+        root: bool,
 
         /// Agent/model override for this step.
         #[arg(long, conflicts_with = "import_json")]
@@ -666,17 +769,6 @@ pub enum StepCommand {
         #[arg(long, value_name = "POLICY", conflicts_with = "import_json")]
         change_policy: Option<ChangePolicy>,
 
-        /// Step-level retry strategy for failed attempts. Effective value
-        /// is resolved step > plan > default `keep`: this step-level
-        /// override wins, then the plan's `--retry-strategy`, then the
-        /// built-in default (`keep`). `keep` = a failed attempt leaves the
-        /// working tree as-is so the next attempt builds on it directly;
-        /// `rollback` = a failed attempt rolls the working tree back and
-        /// feeds the prior diff into the next attempt's prompt instead.
-        /// Omit to inherit the plan/global value.
-        #[arg(long, value_name = "STRATEGY", conflicts_with = "import_json")]
-        retry_strategy: Option<RetryStrategy>,
-
         /// Attach a free-form tag to the new step (repeatable). Tags are
         /// user-defined labels for filtering with `ralph step list --tag`;
         /// they carry no execution-model semantics today. Empty/whitespace
@@ -685,24 +777,52 @@ pub enum StepCommand {
         #[arg(long = "tag", value_name = "TAG", conflicts_with = "import_json")]
         tags: Vec<String>,
 
+        /// Placement (general / join form): make the new step depend on
+        /// each of these existing steps, by 1-based number or 8-char short
+        /// id. **Repeat the flag once per parent** (`--depends-on a
+        /// --depends-on b`); space-separated multi-value (`--depends-on a
+        /// b`) is *not* supported here because it would silently swallow
+        /// the trailing `<plan>` positional. Use this when a step needs
+        /// *several* prior steps (a fan-in / integration step) —
+        /// `--after`/`--before` are the single-parent tree sugar; this is
+        /// the multi-parent primitive. Self-edges and cycles are rejected.
+        /// Mutually exclusive with the other placement flags.
+        #[arg(
+            long = "depends-on",
+            value_name = "SHORT_ID|NUM",
+            conflicts_with_all = ["import_json", "after", "before", "root"]
+        )]
+        depends_on: Vec<String>,
+
         /// Bulk-insert steps from a JSON file or stdin (use `-` for stdin).
         /// Accepts a JSON array of step objects, or a single object. Each
         /// object requires `title`; `description`, `acceptance_criteria`,
-        /// `agent`, `harness`, and `max_retries` are optional. Steps are
-        /// appended in array order; the whole batch is atomic.
+        /// `agent`, `harness`, `model`, `max_retries`, `change_policy`,
+        /// `review_enabled`, `tags`, `id`, `short_id`, and
+        /// `depends_on` are optional. The DAG is carried in the payload: give
+        /// each step a readable `id` and list its parents' `id`s in
+        /// `depends_on` (a parent may also be an existing plan step by short
+        /// id or number). `id` is a batch-local wiring label only — it is
+        /// NOT persisted; ralph mints each step's 8-char `short_id` (the
+        /// handle later CLI commands resolve). Only set `short_id` to pin an
+        /// exported handle; if set it must be 8 base-62 chars. The whole
+        /// batch is validated (unique ids, no dangling/cyclic edges) and
+        /// inserted atomically — nothing is written if any edge is bad. A
+        /// step with no `depends_on` is a root.
         #[arg(long, value_name = "FILE|-")]
         import_json: Option<String>,
     },
 
     /// Remove a step from a plan.
     ///
-    /// Identify the step by positional number (1-based) **or** by UUID via
-    /// `--step-id`. The two are mutually exclusive; numbers are convenient
-    /// for humans, UUIDs are stable across concurrent edits.
+    /// Identify the step by positional number (1-based) or 8-char short id
+    /// **or** by UUID via `--step-id`. The selectors are mutually exclusive;
+    /// numbers are convenient for humans, short ids are stable across step
+    /// reordering, UUIDs are stable across concurrent edits.
     Remove {
-        /// Step number (1-based). Conflicts with --step-id.
+        /// Step number (1-based) or 8-char short id. Conflicts with --step-id.
         #[arg(conflicts_with = "step_id")]
-        step: Option<usize>,
+        step: Option<String>,
 
         /// Step UUID. Conflicts with positional step number.
         #[arg(long)]
@@ -718,12 +838,12 @@ pub enum StepCommand {
 
     /// Edit a step's title, description, agent, harness, criteria, or max-retries.
     ///
-    /// Identify the step by positional number (1-based) **or** by UUID via
-    /// `--step-id`. The two are mutually exclusive.
+    /// Identify the step by positional number (1-based) or 8-char short id
+    /// **or** by UUID via `--step-id`. The selectors are mutually exclusive.
     Edit {
-        /// Step number (1-based). Conflicts with --step-id.
+        /// Step number (1-based) or 8-char short id. Conflicts with --step-id.
         #[arg(conflicts_with = "step_id")]
-        step: Option<usize>,
+        step: Option<String>,
 
         /// Step UUID. Conflicts with positional step number.
         #[arg(long)]
@@ -779,23 +899,15 @@ pub enum StepCommand {
         #[arg(long, value_name = "POLICY")]
         change_policy: Option<ChangePolicy>,
 
-        /// Update the step-level retry strategy. Effective value is
-        /// resolved step > plan > default `keep`: this step-level override
-        /// wins, then the plan's `--retry-strategy`, then the built-in
-        /// default (`keep`). `keep` = a failed attempt leaves the working
-        /// tree as-is so the next attempt builds on it directly;
-        /// `rollback` = a failed attempt rolls the working tree back and
-        /// feeds the prior diff into the next attempt's prompt instead.
-        /// Omit to leave the existing override unchanged; use
-        /// `--clear-retry-strategy` to revert to plan/global inheritance.
-        #[arg(long, value_name = "STRATEGY")]
-        retry_strategy: Option<RetryStrategy>,
-
-        /// Explicitly clear the step-level retry-strategy override (sets to
-        /// NULL so the step inherits the plan/global default). Mirrors
-        /// `--clear-max-retries`; conflicts with `--retry-strategy`.
-        #[arg(long, conflicts_with = "retry_strategy")]
-        clear_retry_strategy: bool,
+        /// Set the per-step nondeterministic-review override
+        /// (docs/dag-redesign.md §6/§7). `on` forces review on for this
+        /// step, `off` forces it off, `inherit` clears the override so the
+        /// step defers to the plan, then the global, default. Precedence is
+        /// step > plan > config > false. Omit to leave the existing
+        /// override unchanged (no `--clear-*` form needed — `inherit` IS
+        /// the clear).
+        #[arg(long, value_name = "STATE")]
+        review: Option<StepReviewState>,
 
         /// Replace the step's tag list with these values (repeatable). Omit
         /// to leave existing tags unchanged; pass at least once to overwrite.
@@ -812,12 +924,12 @@ pub enum StepCommand {
 
     /// Reset a step's status back to pending.
     ///
-    /// Identify the step by positional number (1-based) **or** by UUID via
-    /// `--step-id`. The two are mutually exclusive.
+    /// Identify the step by positional number (1-based) or 8-char short id
+    /// **or** by UUID via `--step-id`. The selectors are mutually exclusive.
     Reset {
-        /// Step number (1-based). Conflicts with --step-id.
+        /// Step number (1-based) or 8-char short id. Conflicts with --step-id.
         #[arg(conflicts_with = "step_id")]
-        step: Option<usize>,
+        step: Option<String>,
 
         /// Step UUID. Conflicts with positional step number.
         #[arg(long)]
@@ -834,12 +946,12 @@ pub enum StepCommand {
 
     /// Move a step to a different position.
     ///
-    /// Identify the step by positional number (1-based) **or** by UUID via
-    /// `--step-id`. The two are mutually exclusive.
+    /// Identify the step by positional number (1-based) or 8-char short id
+    /// **or** by UUID via `--step-id`. The selectors are mutually exclusive.
     Move {
-        /// Step number to move (1-based). Conflicts with --step-id.
+        /// Step number to move (1-based) or 8-char short id. Conflicts with --step-id.
         #[arg(conflicts_with = "step_id")]
-        step: Option<usize>,
+        step: Option<String>,
 
         /// Step UUID. Conflicts with positional step number.
         #[arg(long)]
@@ -855,12 +967,12 @@ pub enum StepCommand {
 
     /// Attach a library hook to a specific step at a lifecycle event.
     ///
-    /// Identify the step by positional number (1-based) **or** by UUID via
-    /// `--step-id`. The two are mutually exclusive.
+    /// Identify the step by positional number (1-based) or 8-char short id
+    /// **or** by UUID via `--step-id`. The selectors are mutually exclusive.
     SetHook {
-        /// Step number (1-based). Conflicts with --step-id.
+        /// Step number (1-based) or 8-char short id. Conflicts with --step-id.
         #[arg(conflicts_with = "step_id")]
-        step: Option<usize>,
+        step: Option<String>,
 
         /// Step UUID. Conflicts with positional step number.
         #[arg(long)]
@@ -880,12 +992,12 @@ pub enum StepCommand {
 
     /// Detach a previously-attached hook from a step.
     ///
-    /// Identify the step by positional number (1-based) **or** by UUID via
-    /// `--step-id`. The two are mutually exclusive.
+    /// Identify the step by positional number (1-based) or 8-char short id
+    /// **or** by UUID via `--step-id`. The selectors are mutually exclusive.
     UnsetHook {
-        /// Step number (1-based). Conflicts with --step-id.
+        /// Step number (1-based) or 8-char short id. Conflicts with --step-id.
         #[arg(conflicts_with = "step_id")]
-        step: Option<usize>,
+        step: Option<String>,
 
         /// Step UUID. Conflicts with positional step number.
         #[arg(long)]
@@ -902,6 +1014,147 @@ pub enum StepCommand {
         #[arg(long)]
         hook: String,
     },
+
+    /// Manage step-to-step dependency edges within a plan.
+    #[command(subcommand)]
+    Dependency(StepDependencyCommand),
+}
+
+// ---------------------------------------------------------------------------
+// Step dependency subcommands (nested under `step dependency`)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Subcommand)]
+pub enum StepDependencyCommand {
+    /// Add one or more dependency edges to a step.
+    ///
+    /// Selectors accept a 1-based step number or an 8-char short id, scoped
+    /// to the same plan (the same disambiguation as every other step
+    /// command). Cycles and self-edges are rejected.
+    Add(StepDependencyMutationArgs),
+
+    /// Remove one or more dependency edges from a step.
+    Remove(StepDependencyMutationArgs),
+
+    /// List a step's direct dependencies and dependents.
+    List {
+        /// Step number (1-based) or 8-char short id.
+        step: String,
+
+        /// Plan slug. Defaults to the active plan.
+        plan: Option<String>,
+    },
+}
+
+/// Raw argv carrier for `step dependency add/remove`.
+///
+/// We parse this tail manually instead of relying on clap's greedy
+/// `num_args = 1..` handling so we can support both of these forms:
+///
+/// - `ralph step dependency add <step> <plan> --depends-on a b`
+/// - `ralph step dependency add <step> --depends-on a b <plan>`
+///
+/// ...without silently swallowing a trailing `<plan>` positional into the
+/// dependency list when it is a normal slug like `my-plan`.
+#[derive(Debug, Args)]
+#[command(trailing_var_arg = true)]
+pub struct StepDependencyMutationArgs {
+    /// Step number (1-based) or 8-char short id.
+    pub step: String,
+
+    /// Optional plan slug plus one or more `--depends-on` groups. Supported
+    /// forms:
+    ///
+    /// - `<plan> --depends-on a b`
+    /// - `--depends-on a --depends-on b <plan>`
+    ///
+    /// If the trailing token after `--depends-on` *looks like* a step
+    /// selector (a number or 8-char short id), it is treated as another
+    /// dependency; put the plan before `--depends-on` to avoid that
+    /// ambiguity.
+    #[arg(value_name = "PLAN|--depends-on", allow_hyphen_values = true)]
+    raw_tail: Vec<String>,
+}
+
+impl StepDependencyMutationArgs {
+    pub fn into_parts(self) -> anyhow::Result<(String, Option<String>, Vec<String>)> {
+        parse_step_dependency_tail(self.step, self.raw_tail)
+    }
+}
+
+fn parse_step_dependency_tail(
+    step: String,
+    raw_tail: Vec<String>,
+) -> anyhow::Result<(String, Option<String>, Vec<String>)> {
+    let mut plan = None;
+    let mut depends_on = Vec::new();
+    let mut i = 0usize;
+
+    while i < raw_tail.len() {
+        let tok = &raw_tail[i];
+        if tok == "--depends-on" {
+            i += 1;
+            if i >= raw_tail.len() || raw_tail[i].starts_with("--") {
+                anyhow::bail!("`--depends-on` requires at least one step selector");
+            }
+
+            let start = i;
+            while i < raw_tail.len() && !raw_tail[i].starts_with("--") {
+                i += 1;
+            }
+            let group = &raw_tail[start..i];
+            if plan.is_none()
+                && group.len() >= 2
+                && !looks_like_step_selector(group.last().expect("group is non-empty"))
+            {
+                depends_on.extend(group[..group.len() - 1].iter().cloned());
+                plan = Some(group[group.len() - 1].clone());
+            } else {
+                depends_on.extend(group.iter().cloned());
+            }
+            continue;
+        }
+
+        if tok.starts_with("--") {
+            anyhow::bail!(
+                "Unexpected flag `{tok}`; expected `--depends-on <step>` or an optional plan slug"
+            );
+        }
+
+        if plan.is_none() && depends_on.is_empty() {
+            plan = Some(tok.clone());
+            i += 1;
+            continue;
+        }
+
+        anyhow::bail!(
+            "Unexpected positional argument `{tok}`; put the plan slug before `--depends-on`, \
+             or repeat `--depends-on` once per dependency"
+        );
+    }
+
+    if depends_on.is_empty() {
+        anyhow::bail!("Missing required `--depends-on <step>`");
+    }
+
+    // Dependencies are always step selectors (a 1-based number or an 8-char
+    // short id). A non-selector token can only be a misplaced plan slug — e.g.
+    // a second plan in `... <plan> --depends-on 1 other-plan`, or a slug typed
+    // after `--depends-on` when one was already split off. Reject it here with
+    // a clear message rather than letting a bogus dependency fail downstream at
+    // step resolution.
+    if let Some(bad) = depends_on.iter().find(|t| !looks_like_step_selector(t)) {
+        anyhow::bail!(
+            "`{bad}` is not a valid step selector (expected a 1-based number or an 8-char \
+             short id); if it is a plan slug, put it before `--depends-on`"
+        );
+    }
+
+    Ok((step, plan, depends_on))
+}
+
+fn looks_like_step_selector(tok: &str) -> bool {
+    tok.parse::<usize>().ok().is_some_and(|n| n >= 1) || crate::storage::is_short_id_shaped(tok)
 }
 
 // ---------------------------------------------------------------------------
@@ -945,12 +1198,37 @@ pub enum PlanHarnessCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum QuestionCommand {
+    /// Legacy alias for `ralph interruption list`.
+    ///
+    /// Kept for one release as the V26 compatibility bridge documented in
+    /// `docs/dag-redesign.md`. Lists open questions and blockers through the
+    /// unified interruption model.
+    List {
+        /// Filter to interruptions on a specific plan slug.
+        plan: Option<String>,
+    },
+
+    /// Legacy alias for `ralph interruption resolve --answer`.
+    ///
+    /// Kept for one release as the V26 compatibility bridge documented in
+    /// `docs/dag-redesign.md`. Accepts the same 1-based list index legacy
+    /// `question answer` used, but also works with a direct interruption id.
+    Answer {
+        /// Interruption id (a uuid) OR its 1-based index in
+        /// `ralph question list` / `ralph interruption list`.
+        id: String,
+
+        /// Freeform answer/resolution text.
+        text: String,
+    },
+
     /// Record a harness-asked question against the currently-executing step.
     ///
     /// Designed to be invoked by the harness mid-step. Binds to the live
     /// `ralph run` for this project via the run lock; if no run is active,
-    /// or the plan does not have questions enabled, exits non-zero with an
-    /// explanatory message and writes nothing to the database.
+    /// exits non-zero with an explanatory message and writes nothing to the
+    /// database. (Interruptions are always enabled — the per-plan
+    /// `questions_enabled` opt-out was dropped in migration V36.)
     Ask {
         /// The question text. If omitted, read from stdin.
         question: Option<String>,
@@ -959,34 +1237,91 @@ pub enum QuestionCommand {
         /// answer; suggestions are hints, not a closed set.
         #[arg(long = "suggest", short = 's', value_name = "ANSWER")]
         suggest: Vec<String>,
-    },
 
-    /// List open (unanswered) questions for the current project.
+        /// Priority for the agent's suggested answers (1 = the agent's best
+        /// guess; lower wins). Optional and repeatable: the k-th
+        /// `--priority` binds to the k-th `-s/--suggest` by position. Any
+        /// `--suggest` past the last supplied `--priority` defaults to its
+        /// 1-based append order (docs/dag-redesign.md §7), so omitting
+        /// `--priority` entirely yields 1,2,3,… in listed order — the same
+        /// rule the V26 cutover used.
+        #[arg(long = "priority", value_name = "N")]
+        priority: Vec<i32>,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Interruption subcommands (docs/dag-redesign.md §7)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Subcommand)]
+pub enum InterruptionCommand {
+    /// List every open interruption (questions *and* blockers) for the
+    /// current project.
     ///
-    /// Output is numbered 1..N — those numbers are the input expected by
-    /// `ralph question answer` and `ralph question show`. Order is by
-    /// `asked_at` ASC then `id`, so a question's index does not change as
-    /// new questions arrive.
+    /// Numbered 1..N, ordered `asked_at` ASC then `id` so an index is
+    /// stable as new interruptions arrive. The number OR the interruption
+    /// id is accepted by `interruption show` / `interruption resolve`.
     List {
-        /// Filter to questions on a specific plan slug. Without this, all
-        /// open questions on plans for the current project are listed.
+        /// Filter to interruptions on a specific plan slug.
         plan: Option<String>,
     },
 
-    /// Answer a specific open question by its index in `ralph question list`.
-    Answer {
-        /// 1-based index from `ralph question list`.
-        num: usize,
+    /// Print one interruption's full body, kind, proposed options (with
+    /// priority), and resolution state.
+    ///
+    /// Accepts an optional leading [PLAN] positional (consistent with
+    /// `interruption list`, `status`, `log`, `run`, etc.). When PLAN is
+    /// supplied the selector <id|index> is resolved only against that
+    /// plan's open interruptions (so "1" is the first open item *on that
+    /// plan*).
+    #[command(allow_missing_positional = true)]
+    Show {
+        /// Optional plan slug. When supplied, <id|index> resolution + index
+        /// numbering are scoped to this plan only.
+        plan: Option<String>,
 
-        /// Answer text. If omitted, read from stdin (heredoc-friendly).
-        text: Option<String>,
+        /// Interruption id (a uuid) OR its 1-based index in
+        /// `ralph interruption list` (or the plan-scoped list when PLAN
+        /// is given).
+        id: String,
     },
 
-    /// Print a question's full text and any harness-supplied suggestions,
-    /// identified by its index in `ralph question list`.
-    Show {
-        /// 1-based index from `ralph question list`.
-        num: usize,
+    /// Resolve an open interruption: record the chosen answer/resolution
+    /// (and optional comment), flip it to `resolved`, and un-shadow the
+    /// step (its `Blocked` overlay clears so the scheduler re-queues it).
+    ///
+    /// Accepts an optional leading [PLAN] positional (consistent with
+    /// `interruption list`, `status`, `log`, `run`, etc.). When PLAN is
+    /// supplied the selector <id|index> is resolved only against that
+    /// plan's open interruptions (so "1" is the first open item *on that
+    /// plan*).
+    #[command(allow_missing_positional = true)]
+    Resolve {
+        /// Optional plan slug. When supplied, <id|index> resolution + index
+        /// numbering are scoped to this plan only.
+        plan: Option<String>,
+
+        /// Interruption id (a uuid) OR its 1-based index in
+        /// `ralph interruption list` (or the plan-scoped list when PLAN
+        /// is given).
+        id: String,
+
+        /// Resolve with the k-th proposed option (1-based, in priority
+        /// order as shown by `interruption show`). Mutually exclusive with
+        /// `--answer`.
+        #[arg(long, value_name = "K", conflicts_with = "answer")]
+        option: Option<usize>,
+
+        /// Resolve with a freeform answer/resolution. Mutually exclusive
+        /// with `--option`.
+        #[arg(long, value_name = "TEXT")]
+        answer: Option<String>,
+
+        /// An extra human note, always injected alongside the resolution
+        /// into the step's next prompt (docs/dag-redesign.md §3.4/§8).
+        #[arg(long, value_name = "TEXT")]
+        comment: Option<String>,
     },
 }
 
@@ -1017,14 +1352,44 @@ impl From<ChangeHandling> for crate::git::ParkStrategyKind {
     }
 }
 
-/// `on` / `off` value enum for `ralph plan questions`.
+/// `on` / `off` value enum for `ralph plan review`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 #[value(rename_all = "lowercase")]
-pub enum QuestionsState {
-    /// Enable the per-plan pause-for-question feature.
+pub enum OnOffState {
+    /// Enable the toggle.
     On,
-    /// Disable the feature (the default for new plans).
+    /// Disable the toggle.
     Off,
+}
+
+/// `on` / `off` / `inherit` tri-state value enum for
+/// `ralph step edit --review` (docs/dag-redesign.md §6/§7).
+///
+/// Maps to the nullable per-step `review_enabled` override:
+/// `on` ⇒ `Some(true)`, `off` ⇒ `Some(false)`, `inherit` ⇒ `None`
+/// (the step defers to the plan, then the global, default — precedence
+/// step > plan > config > false, resolved by
+/// [`crate::config::effective_review_enabled`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "lowercase")]
+pub enum StepReviewState {
+    /// Force review on for this step (overrides plan/global).
+    On,
+    /// Force review off for this step (overrides plan/global).
+    Off,
+    /// Clear the step override — defer to the plan, then global, default.
+    Inherit,
+}
+
+impl StepReviewState {
+    /// Resolve the tri-state to the nullable `review_enabled` column value.
+    pub fn to_override(self) -> Option<bool> {
+        match self {
+            StepReviewState::On => Some(true),
+            StepReviewState::Off => Some(false),
+            StepReviewState::Inherit => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1363,6 +1728,284 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_step_add_with_depends_on() {
+        // Repeatable --depends-on accumulates raw selectors (number or
+        // short id) in argv order; resolution happens in the handler.
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "add",
+            "Wire it up",
+            "my-feature",
+            "--depends-on",
+            "1",
+            "--depends-on",
+            "abc12345",
+        ])
+        .unwrap();
+
+        if let Command::Step(StepCommand::Add {
+            title,
+            plan,
+            depends_on,
+            ..
+        }) = cli.command.unwrap()
+        {
+            assert_eq!(title.as_deref(), Some("Wire it up"));
+            assert_eq!(plan.as_deref(), Some("my-feature"));
+            assert_eq!(depends_on, vec!["1".to_string(), "abc12345".to_string()]);
+        } else {
+            panic!("Expected Step Add");
+        }
+    }
+
+    #[test]
+    fn test_parse_step_add_depends_on_does_not_swallow_trailing_plan_slug() {
+        // Regression: an earlier `num_args = 1..` attempt made --depends-on
+        // greedy, so `--depends-on a my-plan` consumed `my-plan` as a
+        // second dependency and the bare `step add` then failed with
+        // "No active plan found". The contract is that the trailing
+        // positional `<plan>` slug is always preserved; --depends-on takes
+        // exactly one value per occurrence.
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "add",
+            "My Title",
+            "--depends-on",
+            "a",
+            "my-plan",
+        ])
+        .unwrap();
+
+        if let Command::Step(StepCommand::Add {
+            title,
+            plan,
+            depends_on,
+            ..
+        }) = cli.command.unwrap()
+        {
+            assert_eq!(title.as_deref(), Some("My Title"));
+            assert_eq!(plan.as_deref(), Some("my-plan"));
+            assert_eq!(depends_on, vec!["a".to_string()]);
+        } else {
+            panic!("Expected Step Add");
+        }
+    }
+
+    #[test]
+    fn test_parse_step_add_repeated_depends_on_preserves_trailing_plan_slug() {
+        // The supported multi-parent form: repeat --depends-on once per
+        // parent. The trailing `<plan>` positional must still parse as
+        // the plan slug.
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "add",
+            "Wire it up",
+            "--depends-on",
+            "1",
+            "--depends-on",
+            "abc12345",
+            "--depends-on",
+            "def67890",
+            "my-feature",
+        ])
+        .unwrap();
+
+        if let Command::Step(StepCommand::Add {
+            title,
+            plan,
+            depends_on,
+            ..
+        }) = cli.command.unwrap()
+        {
+            assert_eq!(title.as_deref(), Some("Wire it up"));
+            assert_eq!(plan.as_deref(), Some("my-feature"));
+            assert_eq!(
+                depends_on,
+                vec![
+                    "1".to_string(),
+                    "abc12345".to_string(),
+                    "def67890".to_string()
+                ]
+            );
+        } else {
+            panic!("Expected Step Add");
+        }
+    }
+
+    #[test]
+    fn test_parse_step_dependency_add_does_not_swallow_trailing_plan_slug() {
+        // Regression (parity with step-add): `step dependency add` has the
+        // same `<step> [plan]`-then-`--depends-on` shape, so a greedy
+        // `num_args = 1..` would let `--depends-on 1 2 my-plan` swallow
+        // `my-plan` as a third dependency and operate on the wrong (active)
+        // plan. The trailing `<plan>` positional must be preserved.
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "dependency",
+            "add",
+            "3",
+            "--depends-on",
+            "1",
+            "my-plan",
+        ])
+        .unwrap();
+
+        if let Command::Step(StepCommand::Dependency(StepDependencyCommand::Add(args))) =
+            cli.command.unwrap()
+        {
+            let (step, plan, depends_on) = args.into_parts().unwrap();
+            assert_eq!(step, "3");
+            assert_eq!(plan.as_deref(), Some("my-plan"));
+            assert_eq!(depends_on, vec!["1".to_string()]);
+        } else {
+            panic!("Expected Step Dependency Add");
+        }
+    }
+
+    #[test]
+    fn test_parse_step_dependency_add_repeated_preserves_trailing_plan_slug() {
+        // The supported multi-edge form: repeat --depends-on once per edge.
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "dependency",
+            "add",
+            "abc12345",
+            "--depends-on",
+            "1",
+            "--depends-on",
+            "def67890",
+            "my-feature",
+        ])
+        .unwrap();
+
+        if let Command::Step(StepCommand::Dependency(StepDependencyCommand::Add(args))) =
+            cli.command.unwrap()
+        {
+            let (step, plan, depends_on) = args.into_parts().unwrap();
+            assert_eq!(step, "abc12345");
+            assert_eq!(plan.as_deref(), Some("my-feature"));
+            assert_eq!(depends_on, vec!["1".to_string(), "def67890".to_string()]);
+        } else {
+            panic!("Expected Step Dependency Add");
+        }
+    }
+
+    #[test]
+    fn test_parse_step_dependency_add_multi_value_with_plan_before_flag() {
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "dependency",
+            "add",
+            "3",
+            "my-plan",
+            "--depends-on",
+            "1",
+            "2",
+        ])
+        .unwrap();
+
+        if let Command::Step(StepCommand::Dependency(StepDependencyCommand::Add(args))) =
+            cli.command.unwrap()
+        {
+            let (step, plan, depends_on) = args.into_parts().unwrap();
+            assert_eq!(step, "3");
+            assert_eq!(plan.as_deref(), Some("my-plan"));
+            assert_eq!(depends_on, vec!["1".to_string(), "2".to_string()]);
+        } else {
+            panic!("Expected Step Dependency Add");
+        }
+    }
+
+    #[test]
+    fn test_parse_step_dependency_add_rejects_misplaced_second_plan() {
+        // The plan is already set as the leading positional, so a trailing
+        // non-selector token after `--depends-on` (a second plan slug) must
+        // error clearly instead of being swallowed as a bogus dependency.
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "dependency",
+            "add",
+            "3",
+            "my-plan",
+            "--depends-on",
+            "1",
+            "other-plan",
+        ])
+        .unwrap();
+
+        if let Command::Step(StepCommand::Dependency(StepDependencyCommand::Add(args))) =
+            cli.command.unwrap()
+        {
+            let err = args.into_parts().unwrap_err().to_string();
+            assert!(
+                err.contains("`other-plan` is not a valid step selector"),
+                "got: {err}"
+            );
+        } else {
+            panic!("Expected Step Dependency Add");
+        }
+    }
+
+    #[test]
+    fn test_parse_step_dependency_add_multi_value_without_plan_still_works() {
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "dependency",
+            "add",
+            "3",
+            "--depends-on",
+            "1",
+            "2",
+        ])
+        .unwrap();
+
+        if let Command::Step(StepCommand::Dependency(StepDependencyCommand::Add(args))) =
+            cli.command.unwrap()
+        {
+            let (step, plan, depends_on) = args.into_parts().unwrap();
+            assert_eq!(step, "3");
+            assert_eq!(plan, None);
+            assert_eq!(depends_on, vec!["1".to_string(), "2".to_string()]);
+        } else {
+            panic!("Expected Step Dependency Add");
+        }
+    }
+
+    #[test]
+    fn test_parse_step_add_depends_on_conflicts_with_import_json() {
+        // The bulk JSON form carries no dependency field, so --depends-on
+        // must be rejected together with --import-json.
+        let result = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "add",
+            "--import-json",
+            "-",
+            "--depends-on",
+            "1",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_step_add_without_depends_on_is_empty() {
+        let cli = Cli::try_parse_from(["ralph-rs", "step", "add", "Solo step"]).unwrap();
+        if let Command::Step(StepCommand::Add { depends_on, .. }) = cli.command.unwrap() {
+            assert!(depends_on.is_empty());
+        } else {
+            panic!("Expected Step Add");
+        }
+    }
+
+    #[test]
     fn test_parse_run() {
         let cli = Cli::try_parse_from(["ralph-rs", "run", "my-feature"]).unwrap();
         if let Command::Run { plan, all, .. } = cli.command.unwrap() {
@@ -1557,6 +2200,115 @@ mod tests {
             assert_eq!(slug, "foo");
         } else {
             panic!("Expected Plan Dependency List");
+        }
+    }
+
+    #[test]
+    fn test_parse_step_dependency_add() {
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "dependency",
+            "add",
+            "3",
+            "my-plan",
+            "--depends-on",
+            "1",
+        ])
+        .unwrap();
+
+        if let Command::Step(StepCommand::Dependency(StepDependencyCommand::Add(args))) =
+            cli.command.unwrap()
+        {
+            let (step, plan, depends_on) = args.into_parts().unwrap();
+            assert_eq!(step, "3");
+            assert_eq!(plan, Some("my-plan".to_string()));
+            assert_eq!(depends_on, vec!["1".to_string()]);
+        } else {
+            panic!("Expected Step Dependency Add");
+        }
+    }
+
+    #[test]
+    fn test_parse_step_dependency_add_requires_depends_on() {
+        let cli = Cli::try_parse_from(["ralph-rs", "step", "dependency", "add", "3"]).unwrap();
+        if let Command::Step(StepCommand::Dependency(StepDependencyCommand::Add(args))) =
+            cli.command.unwrap()
+        {
+            let err = args.into_parts().unwrap_err().to_string();
+            assert!(
+                err.contains("Missing required `--depends-on <step>`"),
+                "got: {err}"
+            );
+        } else {
+            panic!("Expected Step Dependency Add");
+        }
+    }
+
+    #[test]
+    fn test_parse_step_dependency_remove() {
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "dependency",
+            "remove",
+            "abc12345",
+            "--depends-on",
+            "1",
+            "--depends-on",
+            "2",
+        ])
+        .unwrap();
+
+        if let Command::Step(StepCommand::Dependency(StepDependencyCommand::Remove(args))) =
+            cli.command.unwrap()
+        {
+            let (step, plan, depends_on) = args.into_parts().unwrap();
+            assert_eq!(step, "abc12345");
+            assert_eq!(plan, None);
+            assert_eq!(depends_on, vec!["1".to_string(), "2".to_string()]);
+        } else {
+            panic!("Expected Step Dependency Remove");
+        }
+    }
+
+    #[test]
+    fn test_parse_step_dependency_remove_multi_value_with_plan_before_flag() {
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "dependency",
+            "remove",
+            "abc12345",
+            "my-plan",
+            "--depends-on",
+            "1",
+            "2",
+        ])
+        .unwrap();
+
+        if let Command::Step(StepCommand::Dependency(StepDependencyCommand::Remove(args))) =
+            cli.command.unwrap()
+        {
+            let (step, plan, depends_on) = args.into_parts().unwrap();
+            assert_eq!(step, "abc12345");
+            assert_eq!(plan, Some("my-plan".to_string()));
+            assert_eq!(depends_on, vec!["1".to_string(), "2".to_string()]);
+        } else {
+            panic!("Expected Step Dependency Remove");
+        }
+    }
+
+    #[test]
+    fn test_parse_step_dependency_list() {
+        let cli = Cli::try_parse_from(["ralph-rs", "step", "dependency", "list", "2"]).unwrap();
+        if let Command::Step(StepCommand::Dependency(StepDependencyCommand::List { step, plan })) =
+            cli.command.unwrap()
+        {
+            assert_eq!(step, "2");
+            assert_eq!(plan, None);
+        } else {
+            panic!("Expected Step Dependency List");
         }
     }
 
@@ -1890,7 +2642,7 @@ mod tests {
     fn test_step_move() {
         let cli = Cli::try_parse_from(["ralph-rs", "step", "move", "3", "--to", "1"]).unwrap();
         if let Command::Step(StepCommand::Move { step, to, .. }) = cli.command.unwrap() {
-            assert_eq!(step, Some(3));
+            assert_eq!(step.as_deref(), Some("3"));
             assert_eq!(to, 1);
         } else {
             panic!("Expected Step Move");
@@ -1901,7 +2653,7 @@ mod tests {
     fn test_step_reset() {
         let cli = Cli::try_parse_from(["ralph-rs", "step", "reset", "2"]).unwrap();
         if let Command::Step(StepCommand::Reset { step, .. }) = cli.command.unwrap() {
-            assert_eq!(step, Some(2));
+            assert_eq!(step.as_deref(), Some("2"));
         } else {
             panic!("Expected Step Reset");
         }
@@ -1911,7 +2663,7 @@ mod tests {
     fn test_step_remove() {
         let cli = Cli::try_parse_from(["ralph-rs", "step", "remove", "1", "--force"]).unwrap();
         if let Command::Step(StepCommand::Remove { step, force, .. }) = cli.command.unwrap() {
-            assert_eq!(step, Some(1));
+            assert_eq!(step.as_deref(), Some("1"));
             assert!(force);
         } else {
             panic!("Expected Step Remove");
@@ -1945,7 +2697,7 @@ mod tests {
     fn test_step_remove_yes_alias() {
         let cli = Cli::try_parse_from(["ralph-rs", "step", "remove", "1", "--yes"]).unwrap();
         if let Command::Step(StepCommand::Remove { step, force, .. }) = cli.command.unwrap() {
-            assert_eq!(step, Some(1));
+            assert_eq!(step.as_deref(), Some("1"));
             assert!(force);
         } else {
             panic!("Expected Step Remove");
@@ -2103,150 +2855,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_plan_create_retry_strategy() {
-        let cli = Cli::try_parse_from([
-            "ralph-rs",
-            "plan",
-            "create",
-            "my-plan",
-            "--retry-strategy",
-            "rollback",
-        ])
-        .unwrap();
-        if let Command::Plan(PlanCommand::Create { retry_strategy, .. }) = cli.command.unwrap() {
-            assert_eq!(retry_strategy, Some(crate::plan::RetryStrategy::Rollback));
-        } else {
-            panic!("Expected Plan Create");
-        }
-    }
-
-    #[test]
-    fn test_parse_plan_create_retry_strategy_default_none() {
-        let cli = Cli::try_parse_from(["ralph-rs", "plan", "create", "my-plan"]).unwrap();
-        if let Command::Plan(PlanCommand::Create { retry_strategy, .. }) = cli.command.unwrap() {
-            assert!(retry_strategy.is_none());
-        } else {
-            panic!("Expected Plan Create");
-        }
-    }
-
-    #[test]
-    fn test_parse_step_add_retry_strategy() {
-        let cli = Cli::try_parse_from([
-            "ralph-rs",
-            "step",
-            "add",
-            "Implement",
-            "--retry-strategy",
-            "keep",
-        ])
-        .unwrap();
-        if let Command::Step(StepCommand::Add { retry_strategy, .. }) = cli.command.unwrap() {
-            assert_eq!(retry_strategy, Some(crate::plan::RetryStrategy::Keep));
-        } else {
-            panic!("Expected Step Add");
-        }
-    }
-
-    #[test]
-    fn test_parse_step_add_retry_strategy_invalid_rejected() {
-        let result = Cli::try_parse_from([
-            "ralph-rs",
-            "step",
-            "add",
-            "Implement",
-            "--retry-strategy",
-            "discard",
-        ]);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_step_edit_retry_strategy() {
-        let cli = Cli::try_parse_from([
-            "ralph-rs",
-            "step",
-            "edit",
-            "1",
-            "--retry-strategy",
-            "rollback",
-        ])
-        .unwrap();
-        if let Command::Step(StepCommand::Edit {
-            retry_strategy,
-            clear_retry_strategy,
-            ..
-        }) = cli.command.unwrap()
-        {
-            assert_eq!(retry_strategy, Some(crate::plan::RetryStrategy::Rollback));
-            assert!(!clear_retry_strategy);
-        } else {
-            panic!("Expected Step Edit");
-        }
-    }
-
-    #[test]
-    fn test_parse_step_edit_clear_retry_strategy() {
-        let cli = Cli::try_parse_from(["ralph-rs", "step", "edit", "1", "--clear-retry-strategy"])
-            .unwrap();
-        if let Command::Step(StepCommand::Edit {
-            retry_strategy,
-            clear_retry_strategy,
-            ..
-        }) = cli.command.unwrap()
-        {
-            assert!(retry_strategy.is_none());
-            assert!(clear_retry_strategy);
-        } else {
-            panic!("Expected Step Edit");
-        }
-    }
-
-    #[test]
-    fn test_parse_step_edit_set_and_clear_retry_strategy_conflict() {
-        // Mirrors how `--criteria` + `--clear-criteria` conflict: clap must
-        // reject passing both `--retry-strategy` and `--clear-retry-strategy`
-        // in the same invocation.
-        let result = Cli::try_parse_from([
-            "ralph-rs",
-            "step",
-            "edit",
-            "1",
-            "--retry-strategy",
-            "keep",
-            "--clear-retry-strategy",
-        ]);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_retry_strategy_help_explains_precedence() {
-        // Render the long help for `step add` and assert the precedence rule
-        // and both value meanings are documented (acceptance criterion:
-        // "help text explains the precedence"). We introspect the clap
-        // Command rather than shelling out so the test is hermetic.
-        let mut cmd = Cli::command();
-        let mut step_add = cmd
-            .find_subcommand_mut("step")
-            .and_then(|s| s.find_subcommand_mut("add"))
-            .expect("step add subcommand")
-            .clone();
-        let help = step_add.render_long_help().to_string();
-        assert!(
-            help.contains("step > plan > default"),
-            "help should state the step>plan>default precedence; got:\n{help}"
-        );
-        assert!(
-            help.contains("keep") && help.contains("rollback"),
-            "help should explain both keep and rollback; got:\n{help}"
-        );
-        assert!(
-            help.to_lowercase().contains("rolls the working tree back"),
-            "help should explain rollback semantics; got:\n{help}"
-        );
-    }
-
-    #[test]
     fn test_parse_question_ask_positional() {
         let cli = Cli::try_parse_from([
             "ralph-rs",
@@ -2259,7 +2867,11 @@ mod tests {
             "SQLite",
         ])
         .unwrap();
-        if let Command::Question(QuestionCommand::Ask { question, suggest }) = cli.command.unwrap()
+        if let Command::Question(QuestionCommand::Ask {
+            question,
+            suggest,
+            priority,
+        }) = cli.command.unwrap()
         {
             assert_eq!(
                 question.as_deref(),
@@ -2269,6 +2881,7 @@ mod tests {
                 suggest,
                 vec!["PostgreSQL".to_string(), "SQLite".to_string()]
             );
+            assert!(priority.is_empty(), "no --priority ⇒ append-order default");
         } else {
             panic!("Expected Question Ask");
         }
@@ -2279,102 +2892,215 @@ mod tests {
         // Both the positional and the `-s` flag must be optional so the
         // stdin-only / open-ended cases parse cleanly.
         let cli = Cli::try_parse_from(["ralph-rs", "question", "ask"]).unwrap();
-        if let Command::Question(QuestionCommand::Ask { question, suggest }) = cli.command.unwrap()
+        if let Command::Question(QuestionCommand::Ask {
+            question,
+            suggest,
+            priority,
+        }) = cli.command.unwrap()
         {
             assert!(question.is_none());
             assert!(suggest.is_empty());
+            assert!(priority.is_empty());
         } else {
             panic!("Expected Question Ask");
         }
     }
 
     #[test]
-    fn test_parse_question_list_no_plan() {
-        let cli = Cli::try_parse_from(["ralph-rs", "question", "list"]).unwrap();
-        if let Command::Question(QuestionCommand::List { plan }) = cli.command.unwrap() {
-            assert!(plan.is_none());
+    fn test_parse_question_ask_with_priority() {
+        // Each `--priority` binds to the `-s` at the same position; a
+        // suggestion past the last priority defaults to append order.
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "question",
+            "ask",
+            "Which DB?",
+            "-s",
+            "SQLite",
+            "--priority",
+            "1",
+            "-s",
+            "Postgres",
+            "--priority",
+            "2",
+            "-s",
+            "MySQL",
+        ])
+        .unwrap();
+        if let Command::Question(QuestionCommand::Ask {
+            question,
+            suggest,
+            priority,
+        }) = cli.command.unwrap()
+        {
+            assert_eq!(question.as_deref(), Some("Which DB?"));
+            assert_eq!(
+                suggest,
+                vec![
+                    "SQLite".to_string(),
+                    "Postgres".to_string(),
+                    "MySQL".to_string()
+                ]
+            );
+            assert_eq!(priority, vec![1, 2]);
         } else {
-            panic!("Expected Question List");
+            panic!("Expected Question Ask");
         }
     }
 
     #[test]
-    fn test_parse_question_list_with_plan() {
+    fn test_parse_question_list_and_answer_aliases() {
         let cli = Cli::try_parse_from(["ralph-rs", "question", "list", "my-plan"]).unwrap();
         if let Command::Question(QuestionCommand::List { plan }) = cli.command.unwrap() {
             assert_eq!(plan.as_deref(), Some("my-plan"));
         } else {
             panic!("Expected Question List");
         }
-    }
 
-    #[test]
-    fn test_parse_question_answer() {
-        let cli =
-            Cli::try_parse_from(["ralph-rs", "question", "answer", "3", "use Postgres"]).unwrap();
-        if let Command::Question(QuestionCommand::Answer { num, text }) = cli.command.unwrap() {
-            assert_eq!(num, 3);
-            assert_eq!(text.as_deref(), Some("use Postgres"));
+        let cli = Cli::try_parse_from(["ralph-rs", "question", "answer", "2", "Ship it"]).unwrap();
+        if let Command::Question(QuestionCommand::Answer { id, text }) = cli.command.unwrap() {
+            assert_eq!(id, "2");
+            assert_eq!(text, "Ship it");
         } else {
             panic!("Expected Question Answer");
         }
     }
 
     #[test]
-    fn test_parse_question_answer_text_optional_for_stdin() {
-        // Omitting the text positional must still parse so the dispatcher can
-        // fall back to stdin (heredoc-friendly invocation).
-        let cli = Cli::try_parse_from(["ralph-rs", "question", "answer", "1"]).unwrap();
-        if let Command::Question(QuestionCommand::Answer { num, text }) = cli.command.unwrap() {
-            assert_eq!(num, 1);
+    fn test_parse_block_positional_and_stdin() {
+        let cli = Cli::try_parse_from(["ralph-rs", "block", "needs sudo to install deps"]).unwrap();
+        if let Command::Block { text } = cli.command.unwrap() {
+            assert_eq!(text.as_deref(), Some("needs sudo to install deps"));
+        } else {
+            panic!("Expected Block");
+        }
+        // Omitted text ⇒ None (dispatcher falls back to stdin).
+        let cli = Cli::try_parse_from(["ralph-rs", "block"]).unwrap();
+        if let Command::Block { text } = cli.command.unwrap() {
             assert!(text.is_none());
         } else {
-            panic!("Expected Question Answer");
+            panic!("Expected Block");
         }
     }
 
     #[test]
-    fn test_parse_question_show() {
-        let cli = Cli::try_parse_from(["ralph-rs", "question", "show", "2"]).unwrap();
-        if let Command::Question(QuestionCommand::Show { num }) = cli.command.unwrap() {
-            assert_eq!(num, 2);
+    fn test_parse_interruption_list_show_resolve() {
+        let cli = Cli::try_parse_from(["ralph-rs", "interruption", "list"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Interruption(InterruptionCommand::List { plan: None })
+        ));
+
+        // 1-arg selector (plan omitted)
+        let cli = Cli::try_parse_from(["ralph-rs", "interruption", "show", "abc-123"]).unwrap();
+        if let Command::Interruption(InterruptionCommand::Show { plan, id }) = cli.command.unwrap()
+        {
+            assert_eq!(plan, None);
+            assert_eq!(id, "abc-123");
         } else {
-            panic!("Expected Question Show");
+            panic!("Expected Interruption Show");
+        }
+
+        // 2-arg form: [PLAN] <id>
+        let cli = Cli::try_parse_from(["ralph-rs", "interruption", "show", "my-plan", "def-456"])
+            .unwrap();
+        if let Command::Interruption(InterruptionCommand::Show { plan, id }) = cli.command.unwrap()
+        {
+            assert_eq!(plan.as_deref(), Some("my-plan"));
+            assert_eq!(id, "def-456");
+        } else {
+            panic!("Expected Interruption Show with plan");
+        }
+
+        // 1-arg selector (plan omitted)
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "interruption",
+            "resolve",
+            "2",
+            "--option",
+            "1",
+            "--comment",
+            "go for it",
+        ])
+        .unwrap();
+        if let Command::Interruption(InterruptionCommand::Resolve {
+            plan,
+            id,
+            option,
+            answer,
+            comment,
+        }) = cli.command.unwrap()
+        {
+            assert_eq!(plan, None);
+            assert_eq!(id, "2");
+            assert_eq!(option, Some(1));
+            assert!(answer.is_none());
+            assert_eq!(comment.as_deref(), Some("go for it"));
+        } else {
+            panic!("Expected Interruption Resolve");
+        }
+
+        // 2-arg form: [PLAN] <index> + flags
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "interruption",
+            "resolve",
+            "the-plan",
+            "3",
+            "--answer",
+            "custom",
+        ])
+        .unwrap();
+        if let Command::Interruption(InterruptionCommand::Resolve {
+            plan,
+            id,
+            option,
+            answer,
+            comment,
+        }) = cli.command.unwrap()
+        {
+            assert_eq!(plan.as_deref(), Some("the-plan"));
+            assert_eq!(id, "3");
+            assert_eq!(option, None);
+            assert_eq!(answer.as_deref(), Some("custom"));
+            assert!(comment.is_none());
+        } else {
+            panic!("Expected Interruption Resolve with plan");
         }
     }
 
     #[test]
-    fn test_parse_plan_questions_on() {
-        let cli = Cli::try_parse_from(["ralph-rs", "plan", "questions", "on", "my-plan"]).unwrap();
-        if let Command::Plan(PlanCommand::Questions { state, slug }) = cli.command.unwrap() {
-            assert_eq!(state, QuestionsState::On);
+    fn test_parse_interruption_resolve_option_answer_conflict() {
+        // clap must reject --option and --answer together (conflicts_with).
+        let res = Cli::try_parse_from([
+            "ralph-rs",
+            "interruption",
+            "resolve",
+            "1",
+            "--option",
+            "1",
+            "--answer",
+            "freeform",
+        ]);
+        assert!(res.is_err(), "--option and --answer are mutually exclusive");
+    }
+
+    #[test]
+    fn test_parse_plan_review_on() {
+        let cli = Cli::try_parse_from(["ralph-rs", "plan", "review", "on", "my-plan"]).unwrap();
+        if let Command::Plan(PlanCommand::Review { state, slug }) = cli.command.unwrap() {
+            assert_eq!(state, OnOffState::On);
             assert_eq!(slug, "my-plan");
         } else {
-            panic!("Expected Plan Questions");
+            panic!("Expected Plan Review");
         }
     }
 
     #[test]
-    fn test_parse_plan_questions_off() {
-        let cli = Cli::try_parse_from(["ralph-rs", "plan", "questions", "off", "my-plan"]).unwrap();
-        if let Command::Plan(PlanCommand::Questions { state, slug }) = cli.command.unwrap() {
-            assert_eq!(state, QuestionsState::Off);
-            assert_eq!(slug, "my-plan");
-        } else {
-            panic!("Expected Plan Questions");
-        }
-    }
-
-    #[test]
-    fn test_parse_plan_questions_invalid_state_rejected() {
+    fn test_parse_plan_review_invalid_state_rejected() {
         // Only `on`/`off` are valid; anything else must be rejected by clap.
-        let result = Cli::try_parse_from(["ralph-rs", "plan", "questions", "maybe", "my-plan"]);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_plan_questions_requires_slug() {
-        let result = Cli::try_parse_from(["ralph-rs", "plan", "questions", "on"]);
+        let result = Cli::try_parse_from(["ralph-rs", "plan", "review", "maybe", "my-plan"]);
         assert!(result.is_err());
     }
 

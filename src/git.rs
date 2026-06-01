@@ -34,9 +34,145 @@ fn git(workdir: &Path, args: &[&str]) -> Result<String> {
     Ok(stdout)
 }
 
+/// Run a git command in `workdir` and return its **raw** stdout bytes on
+/// success.
+///
+/// Mirrors [`git`]'s error handling (non-zero exit → `bail!` with the
+/// trimmed stderr) but does **not** lossily UTF-8-decode stdout. Used for
+/// `git status --porcelain=v1 -z`, whose NUL-delimited records can carry
+/// non-UTF8 path bytes that the lossy [`git`] helper would silently corrupt
+/// (and, worse, whose replacement characters could change how a record is
+/// split). Path bytes are converted to `String` only at the parse boundary
+/// (`String::from_utf8_lossy`), matching how the rest of the codebase models
+/// paths as `String` — truly non-UTF8 paths are still best-effort, but they
+/// are no longer silently merged or mis-split.
+fn git_bytes(workdir: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(workdir)
+        .output()
+        .with_context(|| format!("failed to execute git {}", args.join(" ")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "git {} failed (exit {}): {}",
+            args.join(" "),
+            output.status,
+            stderr.trim()
+        );
+    }
+
+    Ok(output.stdout)
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+/// Validate that `branch_name` is a syntactically legal git branch name.
+///
+/// This is a **pure, deterministic** reimplementation of the rules in
+/// git-check-ref-format(1), applied to the full ref `refs/heads/<branch>` —
+/// exactly the decision `git check-ref-format refs/heads/<name>` (no
+/// `--allow-onelevel`) would make. It deliberately does **not** spawn a
+/// subprocess: a validation gate that runs before any DB write must not
+/// depend on `git` being on `PATH`, on process-spawn succeeding, or on an
+/// unbounded external command — it has to be fast, total, and byte-identical
+/// on every machine. Git's own check still runs *authoritatively* at
+/// branch-creation time (`create_and_checkout_branch` /
+/// `create_branch_from_sha`), so git remains the final arbiter and any
+/// conceivable divergence on an exotic name is still caught there as
+/// defense-in-depth; this function's job is to reject the clearly-invalid
+/// cases up front with an actionable, machine-independent message.
+///
+/// On any rejection this `bail!`s with a message naming the offending branch.
+pub fn check_ref_format(branch_name: &str) -> Result<()> {
+    if branch_name.trim().is_empty() {
+        bail!(
+            "invalid branch name: name is empty or whitespace-only \
+             (got {branch_name:?})"
+        );
+    }
+
+    // The git-check-ref-format(1) refname rules ACCEPT a leading dash, but a
+    // leading-dash branch is still hazardous: it is later passed as a bare
+    // argument to `git checkout -b <name>` where it would be misparsed as a
+    // flag. Reject it explicitly so the failure is caught up front with a
+    // clear message rather than as a confusing git CLI error later.
+    if branch_name.starts_with('-') {
+        bail!(
+            "invalid branch name '{branch_name}': must not start with '-' \
+             (it would be misinterpreted as a git command-line flag)"
+        );
+    }
+
+    if let Err(rule) = validate_refname(&format!("refs/heads/{branch_name}")) {
+        bail!("invalid branch name '{branch_name}': {rule}");
+    }
+    Ok(())
+}
+
+/// Pure validator for the git-check-ref-format(1) refname rules. `refname` is
+/// the FULL ref (e.g. `refs/heads/<branch>`), so rule 2 ("must contain at
+/// least one `/`") is always satisfied by the `refs/heads/` prefix — matching
+/// `git check-ref-format refs/heads/<name>` without `--allow-onelevel`.
+/// Returns the human-readable rule that was violated, or `Ok(())`.
+///
+/// Encodes every rule from git-check-ref-format(1) verbatim so it cannot
+/// silently drift: whole-name shape (rules 6/7/9 and the `.lock`/`@{`/`..`
+/// sequence rules), the forbidden character set (rules 4/5/10), and the
+/// per-`/`-component rules (rule 1).
+fn validate_refname(refname: &str) -> Result<(), &'static str> {
+    // Whole-name shape rules.
+    if refname == "@" {
+        return Err("a ref cannot be the single character '@'");
+    }
+    if refname.starts_with('/') || refname.ends_with('/') {
+        return Err("a ref cannot begin or end with '/'");
+    }
+    if refname.ends_with('.') {
+        return Err("a ref cannot end with '.'");
+    }
+    if refname.contains("..") {
+        return Err("a ref cannot contain two consecutive dots '..'");
+    }
+    if refname.contains("//") {
+        return Err("a ref cannot contain consecutive slashes '//'");
+    }
+    if refname.contains("@{") {
+        return Err("a ref cannot contain the sequence '@{'");
+    }
+
+    // Forbidden characters anywhere (rules 4/5/10): ASCII control (< 0x20)
+    // and DEL (0x7f), space, ~ ^ : ? * [ and backslash.
+    for ch in refname.chars() {
+        if (ch as u32) < 0x20 || ch == '\u{7f}' {
+            return Err("a ref cannot contain ASCII control characters");
+        }
+        match ch {
+            ' ' => return Err("a ref cannot contain a space"),
+            '~' | '^' | ':' => return Err("a ref cannot contain any of '~', '^', ':'"),
+            '?' | '*' | '[' => return Err("a ref cannot contain any of '?', '*', '['"),
+            '\\' => return Err("a ref cannot contain a backslash"),
+            _ => {}
+        }
+    }
+
+    // Per-slash-component rules (rule 1): no component may begin with '.' or
+    // end with '.lock'. This must check EVERY component, not just the last
+    // (e.g. `foo.lock/bar` is invalid), which the whole-name checks miss.
+    for component in refname.split('/') {
+        if component.starts_with('.') {
+            return Err("no slash-separated ref component may begin with '.'");
+        }
+        if component.ends_with(".lock") {
+            return Err("no slash-separated ref component may end with '.lock'");
+        }
+    }
+
+    Ok(())
+}
 
 /// Create a new branch and switch to it.
 pub fn create_and_checkout_branch(workdir: &Path, branch_name: &str) -> Result<()> {
@@ -85,41 +221,94 @@ pub fn has_uncommitted_changes(workdir: &Path) -> Result<bool> {
 /// Stage **all** changes (tracked + untracked) and commit with `message`.
 ///
 /// This is a convenience wrapper equivalent to `git add -A && git commit -m <message>`.
-#[allow(dead_code)]
 pub fn commit_changes(workdir: &Path, message: &str) -> Result<()> {
     git(workdir, &["add", "-A"]).context("git add -A failed")?;
     git(workdir, &["commit", "-m", message]).context("git commit failed")?;
     Ok(())
 }
 
-/// Parse `git status --porcelain` output into a list of file paths.
+/// Parse `git status --porcelain=v1 -z` output into a list of file paths.
 ///
-/// Rename/copy entries (`R` or `C` status in either column) are split on
-/// ` -> ` so both the old and new paths are returned as separate entries.
-fn parse_porcelain_status(out: &str) -> Vec<String> {
+/// **Why `-z`:** the human-readable `--porcelain` (v1, no `-z`) C-quotes any
+/// path containing "unusual" bytes — newlines, double-quotes, backslashes,
+/// non-ASCII — wrapping it in double quotes with backslash escapes, and uses
+/// a literal ` -> ` separator for renames/copies. A path that legitimately
+/// contains those bytes would then be mis-quoted or mis-split by a naive
+/// line/`" -> "` parser. With `-z`, git emits paths **raw** (never quoted)
+/// and delimits every record with a NUL. Each record is `XY <path>` followed
+/// by `\0`. For a rename/copy (`R` or `C` in either status column) the record
+/// is followed by a **second** NUL-terminated record containing the
+/// **original** path: `R  <new>\0<orig>\0`. We consume that following record
+/// and push the old path *then* the new path (preserving this function's
+/// existing returned-order contract: old before new).
+///
+/// `from_utf8_lossy` is applied only at this boundary; see [`git_bytes`].
+///
+/// **This is a total parser: any deviation from the porcelain-v1 `-z`
+/// protocol is a hard error, never a silent best-effort guess.** The returned
+/// list drives the skip/rollback preservation paths (`rollback_except`,
+/// `restage_files`, `get_all_changed_files` callers): a *wrong* list there
+/// means deleting a file the user wanted kept, or failing to restore one — so
+/// a malformed/truncated stream MUST abort the operation rather than act on a
+/// corrupt view. The only deviations git can legitimately produce are none;
+/// every error arm below is an impossible-unless-git-or-the-pipe-broke case,
+/// and in exactly those cases we refuse to proceed.
+fn parse_porcelain_status_z(out: &[u8]) -> Result<Vec<String>> {
     let mut files: Vec<String> = Vec::new();
-    for line in out.lines() {
-        if line.is_empty() {
+    // Split on NUL. A well-formed stream ends with a trailing NUL, so the
+    // final split element is an empty slice; skip empties.
+    let mut records = out.split(|&b| b == 0u8).filter(|r| !r.is_empty());
+
+    while let Some(record) = records.next() {
+        // A record is exactly `XY <path>`: a 2-char status column, a single
+        // space at index 2, then the raw (never-quoted, under `-z`) path.
+        // Anything shorter, or without the space delimiter, is not porcelain
+        // v1 output — refuse rather than mis-slice.
+        if record.len() < 4 || record[2] != b' ' {
+            bail!(
+                "malformed `git status --porcelain=v1 -z` record (expected \
+                 `XY <path>`, got {} byte(s)): refusing to act on an \
+                 unparseable status",
+                record.len()
+            );
+        }
+        let status = &record[..2];
+        let path = &record[3..];
+        let is_rename_or_copy = status.contains(&b'R') || status.contains(&b'C');
+        if is_rename_or_copy {
+            // A rename/copy is TWO records: `XY <new>\0<orig>\0`. The original
+            // path MUST follow; its absence means a truncated stream. Acting
+            // on just the new path here would silently drop the old path from
+            // the preserve/rollback set — exactly the data-loss class this
+            // total parser exists to prevent.
+            let Some(orig) = records.next() else {
+                bail!(
+                    "truncated `git status --porcelain=v1 -z`: rename/copy \
+                     record for {:?} has no following original-path record; \
+                     refusing to act on an incomplete changed-file list",
+                    String::from_utf8_lossy(path)
+                );
+            };
+            // Order contract: old (original) then new, matching the prior
+            // ` -> ` (old -> new) behavior every caller/test depends on.
+            files.push(String::from_utf8_lossy(orig).into_owned());
+            files.push(String::from_utf8_lossy(path).into_owned());
             continue;
         }
-        // `git status --porcelain` lines look like "XY filename" (3-char prefix).
-        let status = line.get(..2).unwrap_or("");
-        let rest = line.get(3..).unwrap_or(line);
-        let is_rename_or_copy = status.contains('R') || status.contains('C');
-        if is_rename_or_copy && let Some((old, new)) = rest.split_once(" -> ") {
-            files.push(old.to_string());
-            files.push(new.to_string());
-            continue;
-        }
-        files.push(rest.to_string());
+        files.push(String::from_utf8_lossy(path).into_owned());
     }
-    files
+    Ok(files)
 }
 
 /// Return a list of all changed files (staged, unstaged, and untracked).
+///
+/// Propagates a hard error if git's porcelain output is malformed/truncated
+/// (see [`parse_porcelain_status_z`]) — callers in the skip/rollback path
+/// must abort rather than preserve/delete files off a corrupt view.
 pub fn get_all_changed_files(workdir: &Path) -> Result<Vec<String>> {
-    let out = git(workdir, &["status", "--porcelain"]).context("could not list changed files")?;
-    Ok(parse_porcelain_status(&out))
+    let out = git_bytes(workdir, &["status", "--porcelain=v1", "-z"])
+        .context("could not list changed files")?;
+    parse_porcelain_status_z(&out).context("could not parse `git status` output")
 }
 
 /// Return a list of paths that currently have **staged** changes (the index
@@ -189,6 +378,24 @@ pub fn rollback_changes(workdir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// `git reset --hard HEAD` — discard tracked-file modifications, unmerged
+/// index entries, and any partial/conflicted stash apply, returning the
+/// working tree to its committed state.
+///
+/// **Untracked files are left in place** (unlike [`rollback_changes`],
+/// which also runs `git clean -fd`). This is intentional: the
+/// conflicted-parked-restore cleanup uses it to clear tracked-file conflict
+/// markers and unmerged index entries WITHOUT deleting any untracked file —
+/// neither the user's pre-existing untracked files nor any file created
+/// concurrently. The stash's own new untracked files are then removed
+/// surgically by path (via [`list_stash_untracked_files`]), so the cleanup
+/// never has to snapshot-and-diff the untracked set (which risked deleting a
+/// concurrently-created file).
+pub fn reset_hard_to_head(workdir: &Path) -> Result<()> {
+    git(workdir, &["reset", "--hard", "HEAD"]).context("git reset --hard HEAD failed")?;
+    Ok(())
+}
+
 /// Return a list of untracked files (respecting .gitignore).
 pub fn get_untracked_files(workdir: &Path) -> Result<Vec<String>> {
     let out = git(workdir, &["ls-files", "--others", "--exclude-standard"])
@@ -222,12 +429,11 @@ pub fn commit_staged(workdir: &Path, message: &str) -> Result<()> {
 /// Mixed-reset HEAD back to `sha`, **keeping the working tree intact**.
 ///
 /// `git reset --mixed <sha>` moves the branch ref and unstages the index but
-/// leaves every file on disk exactly as it was. Used by the executor's
-/// `RetryStrategy::Keep` path when a prior attempt's agent committed on its
-/// own: we un-commit that orphan commit so it can't become a second,
-/// duplicate step commit, while still carrying the agent's work forward as
-/// uncommitted changes (Keep's contract). A later successful attempt then
-/// produces exactly one coherent `ralph:` step commit.
+/// leaves every file on disk exactly as it was. Used by the executor when a
+/// prior attempt's agent committed on its own: we un-commit that orphan commit
+/// so it can't become a second, duplicate step commit, while still carrying
+/// the agent's work forward as uncommitted changes. A later successful attempt
+/// then produces exactly one coherent `ralph:` step commit.
 pub fn reset_mixed_to(workdir: &Path, sha: &str) -> Result<()> {
     git(workdir, &["reset", "--mixed", sha])
         .with_context(|| format!("git reset --mixed {sha} failed"))?;
@@ -289,10 +495,136 @@ fn remove_untracked_except(
     Ok(())
 }
 
+/// List the untracked files captured by a `--include-untracked` stash.
+///
+/// A `git stash push --include-untracked` commit has up to **three** parents:
+/// `^1` = the base commit, `^2` = the stashed index, and `^3` = a tree of the
+/// captured untracked files. Park created the parked stash with
+/// `--include-untracked -- ':!<pre_existing>'`
+/// ([`stash_push_with_untracked_except`]), so `<stash>^3` contains EXACTLY the
+/// harness-created untracked WIP and never the user's pre-existing untracked
+/// files. Listing it gives us the precise set of files a conflicted
+/// `git stash apply` would have written into the working tree on its own,
+/// which the conflicted-restore cleanup can remove without touching anything
+/// the user (or a concurrent tool) created.
+///
+/// Returns `Ok(vec![])` when the stash carried no untracked files. Depending
+/// on the git version this manifests as either a missing `^3` parent (older
+/// git) or a `^3` parent whose tree is empty (git 2.43 still synthesizes the
+/// `^3` parent even with nothing to capture); both collapse to an empty list.
+/// The missing-`^3` case is explicitly **not** an error — we probe with
+/// `git rev-parse --verify --quiet <stash>^3` (which exits non-zero rather
+/// than printing to stderr) before listing.
+///
+/// `format!("{stash_sha}^3")` is passed as a single argv element, so the `^3`
+/// suffix needs no shell escaping.
+pub fn list_stash_untracked_files(workdir: &Path, stash_sha: &str) -> Result<Vec<String>> {
+    let untracked_ref = format!("{stash_sha}^3");
+
+    // Probe for the `^3` parent without bailing: `--verify --quiet` exits
+    // non-zero (and silent) when the revision doesn't resolve, which is the
+    // legitimate "stash captured no untracked files" case on git versions
+    // that omit the parent entirely.
+    let probe = Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", &untracked_ref])
+        .current_dir(workdir)
+        .output()
+        .with_context(|| format!("failed to execute git rev-parse {untracked_ref}"))?;
+    if !probe.status.success() {
+        return Ok(Vec::new());
+    }
+
+    // `-z` yields NUL-separated, *unquoted* paths. Without it, ls-tree
+    // octal-quotes paths containing tabs/quotes/non-ASCII bytes, and the
+    // residue-cleanup caller would then try to `remove_file` the literal
+    // quoted string (which doesn't exist on disk), silently leaving the real
+    // stash-introduced untracked file behind on the conflicted-restore path.
+    let out = git(
+        workdir,
+        &["ls-tree", "-r", "-z", "--name-only", &untracked_ref],
+    )
+    .with_context(|| format!("could not list untracked files in stash {stash_sha}^3"))?;
+    Ok(out
+        .split('\0')
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect())
+}
+
 /// Return the full SHA of the current HEAD commit.
 pub fn get_commit_hash(workdir: &Path) -> Result<String> {
     let out = git(workdir, &["rev-parse", "HEAD"]).context("could not get current commit hash")?;
     Ok(out.trim().to_string())
+}
+
+/// Abbreviate a commit SHA to git's short form (`git rev-parse --short`).
+///
+/// Used by the read-only reviewer prompt (docs/dag-redesign.md §8) so the
+/// `<short_id>.<n>` framing in the instruction reads against a human-sized
+/// commit handle rather than a 40-char hash. Falls back to the first 12
+/// chars of `sha` if `git` can't resolve it (e.g. a synthetic SHA in a unit
+/// test) — purely cosmetic, never load-bearing.
+pub fn short_sha(workdir: &Path, sha: &str) -> String {
+    match git(workdir, &["rev-parse", "--short", sha]) {
+        Ok(out) => out.trim().to_string(),
+        Err(_) => sha.chars().take(12).collect(),
+    }
+}
+
+/// True iff `sha` is an ancestor of (or equal to) the current `HEAD`
+/// commit (`git merge-base --is-ancestor <sha> HEAD`).
+///
+/// Used by [`crate::review::ReviewTreeGuard`] to PROVE the §9-inv-2
+/// read-only-review invariant in a way that is **sound under genuine
+/// concurrency**. A review of step A runs while the next *unrelated*
+/// implementation (step B) legitimately commits ON TOP of the branch,
+/// advancing `HEAD` (the accepted §5 linear-history entanglement). That
+/// keeps the reviewed commit an ancestor of `HEAD`, so this stays `true`
+/// — no false positive. A *tampering* reviewer that checks out / resets /
+/// `commit --amend`s / rebases the line containing the reviewed commit
+/// removes it from `HEAD`'s ancestry, so this flips to `false` and the
+/// review is rejected. (Pinning the reviewed commit's own object id is
+/// useless here: git keeps an amended/orphaned commit reachable *by its
+/// SHA* until GC, so `rev-parse <sha>` is a tautology — ancestry-from-HEAD
+/// is the property that actually distinguishes tampering from a concurrent
+/// forward commit.) `Ok(false)` if `sha` does not resolve at all (a
+/// reviewer GC'd / rewrote it away).
+pub fn is_ancestor_of_head(workdir: &Path, sha: &str) -> Result<bool> {
+    let status = Command::new("git")
+        .args(["merge-base", "--is-ancestor", sha, "HEAD"])
+        .current_dir(workdir)
+        .output()
+        .with_context(|| format!("could not check ancestry of {sha} vs HEAD"))?;
+    // `--is-ancestor` exits 0 = ancestor, 1 = not, other = error (e.g. a
+    // bad/orphaned rev). Anything other than a clean 0 ⇒ not reachable.
+    Ok(status.status.success())
+}
+
+/// Return the unified diff **introduced by a single commit** —
+/// `git show <sha>` restricted to the patch with no pager/color.
+///
+/// This is the O(1) reviewer-diff primitive (docs/dag-redesign.md §4/§8,
+/// Decision 5): the reviewer is shown *exactly one* commit's change, never a
+/// cumulative range diff (`a..b`) and never a dependency's diff — so a
+/// step's review cost does not grow with the depth or width of the branch
+/// above it. The format is fixed to `--format=` (empty) + `--patch` so the
+/// output is *only* the diff hunks (no commit-header noise that could be
+/// mistaken for a second diff), keeping the §8/Decision-5 guarantee
+/// machine-checkable.
+pub fn show_commit_diff(workdir: &Path, sha: &str) -> Result<String> {
+    git(
+        workdir,
+        &[
+            "-c",
+            "core.pager=cat",
+            "show",
+            "--no-color",
+            "--format=",
+            "--patch",
+            sha,
+        ],
+    )
+    .with_context(|| format!("could not `git show` commit {sha}"))
 }
 
 /// Create a new branch rooted at the given SHA and switch to it.
@@ -362,14 +694,63 @@ pub enum StashPopOutcome {
 /// - `Err(_)` when `git stash push` itself failed for any reason other than
 ///   a clean tree (e.g. not a git repo, permission error).
 pub fn stash_push_with_untracked(workdir: &Path, message: &str) -> Result<Option<StashRef>> {
+    stash_push_with_untracked_except(workdir, message, &[])
+}
+
+/// Like [`stash_push_with_untracked`] but excludes the named paths from the
+/// stash via negative pathspecs (`:!<path>`). Used by the interruption-park
+/// path to keep the user's *pre-existing* untracked files in the working
+/// tree — they were never the harness's WIP, so we must not bury them on
+/// the stash stack (a later `git stash clear` or pop-conflict would lose
+/// them outright).
+///
+/// `exclude_paths` is a list of repo-relative paths (the same shape as
+/// [`get_untracked_files`] returns). When empty, this is byte-equivalent to
+/// [`stash_push_with_untracked`]. When non-empty, the spawned command is:
+///
+/// ```text
+/// git stash push --include-untracked -m <message> -- ':!<p1>' ':!<p2>' ...
+/// ```
+///
+/// `git stash push` with a pathspec restricts the stash to matching paths;
+/// combining a wildcard implicit-everything pathspec with negative excludes
+/// (the pattern git documents under `pathspec`) is the lightest-weight way
+/// to say "everything except these". Verified compatible with git >=
+/// 2.23. Returns `Ok(None)` when the resulting filtered tree is clean.
+pub fn stash_push_with_untracked_except(
+    workdir: &Path,
+    message: &str,
+    exclude_paths: &[String],
+) -> Result<Option<StashRef>> {
     // `git stash push` on a clean tree exits 0 with "No local changes to
     // save" on stdout — we have to distinguish that case from a real stash.
     // Rather than string-match stdout (brittle across locales), we ask git
     // for the pre-push stash list, push, and diff.
     let before = stash_list_shas(workdir)?;
 
+    let mut args: Vec<String> = vec![
+        "stash".to_string(),
+        "push".to_string(),
+        "--include-untracked".to_string(),
+        "-m".to_string(),
+        message.to_string(),
+    ];
+    // Only add the `--` pathspec sentinel when we have exclusions. Without
+    // it, plain `git stash push --include-untracked` stays the exact
+    // command that hit production for years (and the test fixture below
+    // proves the no-exclusion path is byte-equivalent).
+    if !exclude_paths.is_empty() {
+        args.push("--".to_string());
+        for path in exclude_paths {
+            // `:!<path>` is git's negative-pathspec literal exclude. Quoting
+            // here is unnecessary because we're passing each path as a
+            // separate argv entry rather than through a shell.
+            args.push(format!(":!{path}"));
+        }
+    }
+
     let output = Command::new("git")
-        .args(["stash", "push", "--include-untracked", "-m", message])
+        .args(&args)
         .current_dir(workdir)
         .output()
         .with_context(|| format!("failed to execute git stash push -m '{message}'"))?;
@@ -384,16 +765,17 @@ pub fn stash_push_with_untracked(workdir: &Path, message: &str) -> Result<Option
     }
 
     // Match by message against the post-push list. If nothing was pushed
-    // (clean tree), the match will find no new stash and we return None.
-    // If something was pushed, the new stash's SHA is one of (after -
-    // before) and its subject matches `message`.
+    // (clean tree, or all changes were in the excluded set), the match
+    // will find no new stash and we return None. If something was pushed,
+    // the new stash's SHA is one of (after - before) and its subject
+    // matches `message`.
     let after = stash_list_shas_with_subjects(workdir)?;
     for (sha, subject) in &after {
         if !before.contains(sha) && subject_matches(subject, message) {
             return Ok(Some(StashRef(sha.clone())));
         }
     }
-    // No new stash -> tree was clean.
+    // No new stash -> tree was clean (post-exclusion).
     Ok(None)
 }
 
@@ -457,6 +839,37 @@ pub fn stash_pop(workdir: &Path, stash_ref: &StashRef) -> Result<StashPopOutcome
     }
 
     Ok(StashPopOutcome::Clean)
+}
+
+/// Drop the stash identified by `stash_ref` without applying it.
+///
+/// Used when a parked step worktree is being intentionally discarded
+/// (skip/reset/terminal fail). Returns `Ok(true)` if a stash entry was found
+/// and dropped, `Ok(false)` if it was already gone.
+pub fn drop_stash(workdir: &Path, stash_ref: &StashRef) -> Result<bool> {
+    let entries = stash_list_shas_with_refs(workdir)?;
+    let stash_ref_name = match entries.iter().find(|(sha, _)| sha == stash_ref.as_str()) {
+        Some((_, name)) => name.clone(),
+        None => return Ok(false),
+    };
+
+    let drop_out = Command::new("git")
+        .args(["stash", "drop", &stash_ref_name])
+        .current_dir(workdir)
+        .output()
+        .with_context(|| format!("failed to execute git stash drop {stash_ref_name}"))?;
+
+    if !drop_out.status.success() {
+        let stderr = String::from_utf8_lossy(&drop_out.stderr);
+        bail!(
+            "git stash drop {} failed ({}): {}",
+            stash_ref_name,
+            drop_out.status,
+            stderr.trim(),
+        );
+    }
+
+    Ok(true)
 }
 
 /// Find a stash (by its commit SHA) whose subject contains `message`.
@@ -597,7 +1010,6 @@ impl ParkStrategyKind {
 /// How [`park_changes`] should dispose of the working-tree changes left
 /// behind when a step is skipped mid-run.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // wired into the skip flow in a later step
 pub enum ParkStrategy {
     /// `git stash push --include-untracked -m <label>` — recoverable later.
     Stash { label: String },
@@ -610,7 +1022,6 @@ pub enum ParkStrategy {
 
 /// What [`park_changes`] actually did.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // consumed by the skip flow in a later step
 pub enum ParkOutcome {
     /// Changes were stashed; `stash_ref` recovers them.
     Stashed { stash_ref: StashRef },
@@ -637,7 +1048,6 @@ pub enum ParkOutcome {
 ///
 /// `trailer_id` is only consulted for `Commit`; `pre_existing_untracked`
 /// only for `Discard`.
-#[allow(dead_code)] // called by the skip flow in a later step
 pub fn park_changes(
     workdir: &Path,
     strategy: ParkStrategy,
@@ -837,6 +1247,614 @@ pub fn revert_commit(workdir: &Path, sha: &str) -> Result<RevertOutcome> {
 }
 
 // ---------------------------------------------------------------------------
+// Per-iteration step commits + Ralph-* trailers (docs/dag-redesign.md §3.2/§5)
+// ---------------------------------------------------------------------------
+
+/// Trailer key carrying the plan slug on a per-iteration step commit.
+pub const ITERATION_PLAN_TRAILER: &str = "Ralph-Plan";
+/// Trailer key carrying the step `short_id` on a per-iteration step commit.
+pub const ITERATION_STEP_TRAILER: &str = "Ralph-Step";
+/// Trailer key carrying the 1-based iteration number on a per-iteration
+/// step commit.
+pub const ITERATION_NUM_TRAILER: &str = "Ralph-Iteration";
+/// Trailer key carrying the review verdict on a per-iteration step commit
+/// (`pending` initially; later annotated by the review pipeline).
+pub const ITERATION_REVIEW_TRAILER: &str = "Ralph-Review";
+
+/// Collapse a step title into a single sanitized commit-subject fragment.
+///
+/// The git subject line must be a single line: newlines/tabs/control chars
+/// are replaced with spaces and runs of whitespace collapsed. The result is
+/// length-capped so a pathological multi-paragraph title can't produce a
+/// thousand-column subject. Tooling never parses the subject (it parses the
+/// trailers), so this is purely cosmetic — but it must stay deterministic.
+pub fn sanitize_commit_subject(title: &str) -> String {
+    let mut out = String::with_capacity(title.len());
+    let mut prev_space = false;
+    for ch in title.chars() {
+        if ch.is_control() || ch.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+        } else {
+            out.push(ch);
+            prev_space = false;
+        }
+    }
+    let trimmed = out.trim();
+    // Cap at 72 chars (a conventional git subject soft limit) on a char
+    // boundary so multibyte titles don't panic.
+    const MAX: usize = 72;
+    if trimmed.chars().count() > MAX {
+        trimmed.chars().take(MAX).collect::<String>()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Build the full commit message for one per-iteration step commit.
+///
+/// Subject: `ralph <short_id>.<n> - <sanitized one-line title>`.
+/// Trailers (a blank line then `Key: value`, git's standard trailer block —
+/// the same shape [`park_changes`] uses for `Ralph-Skipped-Step`):
+/// ```text
+/// Ralph-Plan: <slug>
+/// Ralph-Step: <short_id>
+/// Ralph-Iteration: <n>
+/// Ralph-Review: pending
+/// ```
+/// Tooling (`ralph log` / `step reset`) parses *only* the trailers via git's
+/// own trailer parser, never the subject.
+pub fn build_iteration_commit_message(
+    short_id: &str,
+    iteration: i32,
+    title: &str,
+    plan_slug: &str,
+) -> String {
+    let subject = format!(
+        "ralph {}.{} - {}",
+        short_id,
+        iteration,
+        sanitize_commit_subject(title)
+    );
+    format!(
+        "{subject}\n\n\
+         {ITERATION_PLAN_TRAILER}: {plan_slug}\n\
+         {ITERATION_STEP_TRAILER}: {short_id}\n\
+         {ITERATION_NUM_TRAILER}: {iteration}\n\
+         {ITERATION_REVIEW_TRAILER}: pending\n"
+    )
+}
+
+/// A per-iteration step commit discovered on a branch: its SHA plus the
+/// `Ralph-Step` short id and `Ralph-Iteration` number pulled from trailers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IterationCommit {
+    pub sha: String,
+    pub plan_slug: Option<String>,
+    pub step_short_id: String,
+    pub iteration: i32,
+}
+
+/// Extract a single named trailer's value from a commit, using git's own
+/// trailer parser (`git interpret-trailers --parse`) so a body sentence or a
+/// quoted diff that merely *mentions* the key can never false-match. Returns
+/// `None` when the commit carries no such trailer.
+///
+/// Generalizes [`parse_skipped_step_trailer`] (which is kept as-is for the
+/// skip-WIP path) to any trailer key.
+pub fn parse_trailer(workdir: &Path, sha: &str, key: &str) -> Result<Option<String>> {
+    let raw = git(workdir, &["log", "-1", "--format=%B", sha])
+        .with_context(|| format!("could not read commit message for {sha}"))?;
+
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new("git")
+        .args(["interpret-trailers", "--parse"])
+        .current_dir(workdir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn git interpret-trailers")?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(raw.as_bytes())
+            .context("failed to write commit message to git interpret-trailers")?;
+    }
+    let output = child
+        .wait_with_output()
+        .context("git interpret-trailers --parse failed to run")?;
+    if !output.status.success() {
+        bail!(
+            "git interpret-trailers --parse failed (exit {}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let parsed = String::from_utf8_lossy(&output.stdout);
+    for line in parsed.lines() {
+        if let Some((k, value)) = line.split_once(':')
+            && k.trim().eq_ignore_ascii_case(key)
+        {
+            let v = value.trim();
+            if !v.is_empty() {
+                return Ok(Some(v.to_string()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Dedicated git-notes ref the review pipeline annotates verdicts under.
+/// Notes attach to a *fixed* commit SHA without rewriting history (so it is
+/// safe to annotate a non-HEAD historical iteration commit) and without ever
+/// touching the working tree (so it does not violate the §9-inv-2 "reviews
+/// are strictly read-only w.r.t. the working tree" hard invariant — a note
+/// write changes `refs/notes/...`, not the index/worktree/branch).
+pub const REVIEW_NOTES_REF: &str = "refs/notes/ralph-review";
+
+/// Annotate the reviewed commit's `Ralph-Review` verdict (§5/§9).
+///
+/// The per-iteration commit bakes in `Ralph-Review: pending` at commit time
+/// (it is immutable history). The verdict (`passed` | `failed` | `skipped` |
+/// `disabled`) is recorded *after the fact* against the fixed SHA via a git
+/// note on [`REVIEW_NOTES_REF`], NOT by amending/rewriting the commit:
+///
+/// - Amending a historical commit would rewrite linear history and shift
+///   every later iteration commit's SHA — fatal under concurrent reviews
+///   (§9-inv-2: a review runs against a *fixed* SHA while the next
+///   implementation is already committing on top).
+/// - A note write is read-only w.r.t. the working tree / index / branch ref,
+///   so it preserves the read-only-review hard invariant.
+///
+/// The note body is a single `Ralph-Review: <verdict>` line — the same
+/// trailer key ([`ITERATION_REVIEW_TRAILER`]) the commit carries — so
+/// tooling reads the final verdict by preferring the note over the baked-in
+/// `pending`. `--force` so a re-review (corrective-chain) overwrites a prior
+/// note rather than erroring.
+pub fn annotate_review_verdict(workdir: &Path, sha: &str, verdict: &str) -> Result<()> {
+    let body = format!("{ITERATION_REVIEW_TRAILER}: {verdict}");
+    git(
+        workdir,
+        &[
+            "notes",
+            "--ref",
+            REVIEW_NOTES_REF,
+            "add",
+            "--force",
+            "-m",
+            &body,
+            sha,
+        ],
+    )
+    .with_context(|| format!("could not annotate review verdict on commit {sha}"))?;
+    Ok(())
+}
+
+/// Read back the annotated `Ralph-Review` verdict for `sha` (the note on
+/// [`REVIEW_NOTES_REF`]), or `None` when no verdict has been recorded yet
+/// (the commit still carries only its baked-in `pending` trailer). Used by
+/// tests and `ralph log` to surface the *final* verdict rather than the
+/// commit-time placeholder.
+pub fn read_review_verdict(workdir: &Path, sha: &str) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .args(["notes", "--ref", REVIEW_NOTES_REF, "show", sha])
+        .current_dir(workdir)
+        .output()
+        .with_context(|| format!("failed to read review note for {sha}"))?;
+    if !output.status.success() {
+        // `git notes show` exits non-zero when there is no note — that is the
+        // "not yet reviewed / no verdict" case, not an error.
+        return Ok(None);
+    }
+    let raw = String::from_utf8_lossy(&output.stdout);
+    for line in raw.lines() {
+        if let Some((k, v)) = line.split_once(':')
+            && k.trim().eq_ignore_ascii_case(ITERATION_REVIEW_TRAILER)
+        {
+            let v = v.trim();
+            if !v.is_empty() {
+                return Ok(Some(v.to_string()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Walk every commit reachable from `branch` and return the per-iteration
+/// step commits (those carrying a `Ralph-Step` trailer), **newest first**
+/// (`git log` order). Commits without the trailer (or with an unparseable
+/// `Ralph-Iteration`) are skipped.
+///
+/// `branch` is resolved with `git rev-list`, so it works whether or not it
+/// is currently checked out — mirrors [`list_skip_wip_commits`].
+pub fn list_iteration_commits(workdir: &Path, branch: &str) -> Result<Vec<IterationCommit>> {
+    let shas = git(workdir, &["rev-list", branch])
+        .with_context(|| format!("could not list commits on branch '{branch}'"))?;
+    let mut out = Vec::new();
+    for sha in shas.lines().map(str::trim).filter(|s| !s.is_empty()) {
+        let Some(step_short_id) = parse_trailer(workdir, sha, ITERATION_STEP_TRAILER)? else {
+            continue;
+        };
+        let iteration = match parse_trailer(workdir, sha, ITERATION_NUM_TRAILER)? {
+            Some(s) => match s.parse::<i32>() {
+                Ok(n) => n,
+                // A Ralph-Step commit with a non-numeric Ralph-Iteration is
+                // malformed — skip rather than guess.
+                Err(_) => continue,
+            },
+            None => continue,
+        };
+        let plan_slug = parse_trailer(workdir, sha, ITERATION_PLAN_TRAILER)?;
+        out.push(IterationCommit {
+            sha: sha.to_string(),
+            plan_slug,
+            step_short_id,
+            iteration,
+        });
+    }
+    Ok(out)
+}
+
+/// Per-iteration commits on `branch` whose `Ralph-Step` trailer equals
+/// `short_id`, newest-first. Convenience filter over
+/// [`list_iteration_commits`].
+pub fn iteration_commits_for_step(
+    workdir: &Path,
+    branch: &str,
+    short_id: &str,
+) -> Result<Vec<IterationCommit>> {
+    Ok(list_iteration_commits(workdir, branch)?
+        .into_iter()
+        .filter(|c| c.step_short_id == short_id)
+        .collect())
+}
+
+/// Return the distinct file paths touched by the listed commits (added,
+/// modified, deleted, etc.). Uses `git diff-tree --name-only -r` per SHA.
+/// Empty input or no output yields empty vec. Duplicates removed but order
+/// is first-seen.
+pub fn files_touched_by_commits(workdir: &Path, shas: &[String]) -> Result<Vec<String>> {
+    let mut seen = Vec::new();
+    for sha in shas {
+        let out = git(
+            workdir,
+            &["diff-tree", "--no-commit-id", "--name-only", "-r", sha],
+        )
+        .with_context(|| format!("git diff-tree for commit {sha} failed"))?;
+        for line in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            if !seen.contains(&line.to_string()) {
+                seen.push(line.to_string());
+            }
+        }
+    }
+    Ok(seen)
+}
+
+/// Returns true iff there are Ralph-* iteration commits for `short_id` on
+/// `branch` *and* the current uncommitted dirty files overlap at least one
+/// path touched by the most recent (up to 3) of those commits.
+///
+/// This is the conservative "likely ralph-owned crash residue from the
+/// InProgress step" test used by the medium crash-reconcile UX in
+/// `stash_if_dirty`. Errors during detection are treated as "no" (do not
+/// offer interactive recovery).
+pub fn has_crash_residue_overlap_for_step(
+    workdir: &Path,
+    branch: &str,
+    short_id: &str,
+) -> Result<bool> {
+    let commits = iteration_commits_for_step(workdir, branch, short_id)?;
+    if commits.is_empty() {
+        return Ok(false);
+    }
+    let recent_shas: Vec<String> = commits.into_iter().take(3).map(|c| c.sha).collect();
+    let touched = files_touched_by_commits(workdir, &recent_shas)?;
+    if touched.is_empty() {
+        return Ok(false);
+    }
+    let dirty = get_all_changed_files(workdir)?;
+    let overlap = dirty.iter().any(|d| touched.contains(d));
+    Ok(overlap)
+}
+
+/// Order an arbitrary set of `targets` SHAs by their position on `branch`,
+/// **newest-first** (`git rev-list` order). SHAs not reachable from `branch`
+/// are dropped. Used by `ralph step reset` so a mixed set of skip-WIP +
+/// per-iteration commits is reverted in a clean newest-first sequence
+/// regardless of how the two trailer scans interleaved them.
+pub fn order_shas_newest_first(
+    workdir: &Path,
+    branch: &str,
+    targets: &[String],
+) -> Result<Vec<String>> {
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+    let want: std::collections::HashSet<&str> = targets.iter().map(String::as_str).collect();
+    let shas = git(workdir, &["rev-list", branch])
+        .with_context(|| format!("could not list commits on branch '{branch}'"))?;
+    Ok(shas
+        .lines()
+        .map(str::trim)
+        .filter(|s| want.contains(s))
+        .map(str::to_string)
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
+// Throwaway review worktree (docs/dag-redesign.md §8 / §9 invariant 2)
+// ---------------------------------------------------------------------------
+
+/// Create a **detached** linked worktree of `workdir` pinned at `sha`, rooted
+/// at `path` (which must not yet exist).
+///
+/// `git worktree add --detach <path> <sha>` checks `sha`'s tree out into a
+/// brand-new, *physically separate* directory whose `HEAD` is detached at
+/// `sha`. The reviewer harness is run with its cwd set to that directory, so
+/// it is structurally incapable of touching the implementation's live working
+/// tree: `echo evil >> src/foo.rs` inside the reviewer lands in the throwaway
+/// directory, never in the shared `workdir` the next implementation commits
+/// from. This is the §9-inv-2 "reviews are strictly read-only w.r.t. the
+/// working tree" hard invariant enforced *structurally* rather than only
+/// detected after the fact.
+pub fn add_detached_worktree(workdir: &Path, path: &Path, sha: &str) -> Result<()> {
+    git(
+        workdir,
+        &["worktree", "add", "--detach", &path.to_string_lossy(), sha],
+    )
+    .with_context(|| {
+        format!(
+            "could not create detached review worktree at {} pinned at {sha}",
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+/// Forcibly remove the linked worktree at `path` and prune dangling
+/// administrative entries.
+///
+/// `--force` because the reviewer may have left dirty/untracked junk in the
+/// throwaway tree (that is exactly the tamper class we are containing — it is
+/// *expected* there and must not block cleanup). Tolerant by design: if the
+/// directory is already gone (panic/early-return raced cleanup, or a prior
+/// call already removed it) `git worktree remove` errors, which we swallow,
+/// then always `git worktree prune` so no orphan administrative entry is left
+/// in `.git/worktrees/`. Cleanup must never itself fail a run.
+pub fn remove_worktree(workdir: &Path, path: &Path) {
+    // Best-effort: a failure here (already-removed dir, etc.) must not mask
+    // the review outcome. We still prune unconditionally afterwards.
+    let _ = Command::new("git")
+        .args(["worktree", "remove", "--force", &path.to_string_lossy()])
+        .current_dir(workdir)
+        .output();
+    let _ = Command::new("git")
+        .args(["worktree", "prune"])
+        .current_dir(workdir)
+        .output();
+    // Belt-and-suspenders: if `git worktree remove` could not delete the
+    // directory (e.g. it was already detached from git's metadata), make sure
+    // no throwaway tree is left on disk.
+    if path.exists() {
+        let _ = std::fs::remove_dir_all(path);
+    }
+}
+
+/// Best-effort sweep of review worktrees stranded by a `SIGKILL`'d run.
+///
+/// `ReviewWorktree`'s RAII `Drop` cleans up on every *normal* exit path, but
+/// a forceful second Ctrl+C (`std::process::exit(130)`) or an OS `SIGKILL`
+/// skips `Drop`, leaving a `<tmp>/ralph-review-*` directory and a
+/// `.git/worktrees/` admin entry behind. Reviews are short-lived (a single
+/// read-only `git show` diff), so any `ralph-review-*` temp dir older than a
+/// few hours is unambiguously orphaned. We prune git's admin entries, then
+/// remove on-disk dirs that are BOTH older than the threshold AND owned by a
+/// process that is no longer alive. The mtime-age guard makes this safe under
+/// a *concurrent* ralph run whose review started recently; the PID-liveness
+/// guard ([`review_dir_pid_is_alive`]) additionally protects a review that
+/// legitimately outlives the threshold or whose read-only worktree never
+/// advances its mtime — neither is reaped while its owner still runs. Never
+/// fails the caller.
+pub fn sweep_stale_review_worktrees(main_repo: &Path) {
+    // 6h: orders of magnitude longer than any real review, far short of
+    // anything that would race a live concurrent review.
+    const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+    if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !name.starts_with("ralph-review-") {
+                continue;
+            }
+            let stale = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|mtime| mtime.elapsed().ok())
+                .map(|age| age >= STALE_AFTER)
+                .unwrap_or(false);
+            // WHY: the mtime guard alone can reap a worktree out from under a
+            // LIVE reviewer — a review that legitimately runs past the 6h
+            // threshold, or whose dir mtime never advances because the
+            // reviewer only reads, looks "stale" by age while still in use.
+            // The dir name embeds the creating PID (`ralph-review-<pid>-…`),
+            // so before reaping we skip any dir whose PID is still alive. Only
+            // reap when BOTH stale-by-mtime AND the owning process is gone.
+            // On platforms without `/proc` (or an unparseable name) we can't
+            // prove liveness, so we fall back to mtime-only — never regressing
+            // cleanup where the liveness signal is unavailable.
+            if stale && !review_dir_pid_is_alive(name) {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+
+    // Prune *after* the removals so that the `.git/worktrees/*` admin
+    // entries for the directories we just deleted are reaped in the same
+    // sweep (not stranded until some later run prunes again). A single
+    // prune at the end also clears any entries whose directory was already
+    // gone for unrelated reasons, so this still covers the original intent.
+    let _ = Command::new("git")
+        .args(["worktree", "prune"])
+        .current_dir(main_repo)
+        .output();
+}
+
+/// Liveness guard for [`sweep_stale_review_worktrees`]: given a review
+/// worktree dir name (`ralph-review-<pid>-<sha12>-<nanos>`, minted by
+/// [`ReviewWorktree::create`]), report whether the embedded creating PID is
+/// still a running process.
+///
+/// Returns `false` (treat as reapable) when we *cannot prove* the PID is
+/// alive — an unparseable name, or a platform without `/proc`. That keeps the
+/// sweep's existing mtime-only behavior on platforms lacking a liveness
+/// signal, so the caller never regresses cleanup; the liveness check only
+/// *adds* protection (skips reaping) where we can positively confirm the
+/// owner is still running.
+///
+/// This is a *liveness* probe, not an *ownership* probe: after the original
+/// reviewer exited, its PID can be recycled by an unrelated process, in which
+/// case a genuinely-orphaned (>6h) dir reads as "alive" and is skipped this
+/// sweep. The consequence is a bounded, benign disk-space leak of one stale
+/// temp dir — never data loss, and the unconditional `git worktree prune` in
+/// the caller still reaps the admin entry — and a later sweep reaps the dir
+/// once the recycled PID frees up. We accept that over the alternative
+/// (reaping a dir out from under a live reviewer).
+fn review_dir_pid_is_alive(dir_name: &str) -> bool {
+    // `ralph-review-<pid>-<sha12>-<nanos>` → take the segment after the
+    // `ralph-review-` prefix, up to the next `-`.
+    let Some(rest) = dir_name.strip_prefix("ralph-review-") else {
+        return false;
+    };
+    let Some(pid_str) = rest.split('-').next() else {
+        return false;
+    };
+    if pid_str.parse::<u32>().is_err() {
+        return false;
+    }
+    // Linux-only liveness probe via procfs. On non-Linux (`/proc` absent) the
+    // path simply won't exist and we report not-alive, falling back to the
+    // mtime-only sweep — never blocking cleanup where we can't check.
+    std::path::Path::new(&format!("/proc/{pid_str}")).exists()
+}
+
+/// List the filesystem paths of every registered worktree (including the
+/// main one), for tests asserting no orphan review worktree leaked.
+#[cfg(test)]
+pub fn list_worktree_paths(workdir: &Path) -> Result<Vec<String>> {
+    let out =
+        git(workdir, &["worktree", "list", "--porcelain"]).context("could not list worktrees")?;
+    Ok(out
+        .lines()
+        .filter_map(|l| l.strip_prefix("worktree "))
+        .map(|s| s.trim().to_string())
+        .collect())
+}
+
+/// RAII guard for a throwaway review worktree (docs/dag-redesign.md §8/§9-inv-2).
+///
+/// Construction creates the detached worktree at the reviewed SHA; `Drop`
+/// removes it **synchronously** (best-effort). Because `Drop` runs on
+/// **every** exit path of the function that holds the guard — normal return,
+/// `?`-propagated error, the spawn/await failing, a panic unwinding through
+/// the spawned review task, or the task being aborted/timed out — and the
+/// removal runs to completion before `Drop` returns, the throwaway tree is
+/// *always* torn down before the value goes away. There is no code path that
+/// creates one and leaks it on a normal exit (a `SIGKILL`/forceful-exit that
+/// skips `Drop` entirely is the backstop's job — see
+/// `sweep_stale_review_worktrees`). The path lives under the OS temp dir with
+/// a unique component so concurrent reviews never collide.
+pub struct ReviewWorktree {
+    /// The main repository the linked worktree is attached to (where
+    /// `git worktree remove/prune` must run).
+    main_repo: std::path::PathBuf,
+    /// The throwaway worktree directory; the reviewer harness's cwd.
+    path: std::path::PathBuf,
+}
+
+impl ReviewWorktree {
+    /// Create a uniquely-named detached worktree of `main_repo` at `sha`.
+    ///
+    /// The directory is `<tmp>/ralph-review-<pid>-<sha12>-<nanos>` so two
+    /// concurrent reviews (allowed by §3.5 item 3) never collide and a stale
+    /// dir from a crashed prior run can never be reused.
+    pub fn create(main_repo: &Path, sha: &str) -> Result<Self> {
+        let unique = format!(
+            "ralph-review-{}-{}-{}",
+            std::process::id(),
+            sha.chars().take(12).collect::<String>(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        );
+        let path = std::env::temp_dir().join(unique);
+        add_detached_worktree(main_repo, &path, sha)?;
+        Ok(Self {
+            main_repo: main_repo.to_path_buf(),
+            path,
+        })
+    }
+
+    /// The throwaway worktree directory — the cwd to spawn the reviewer in.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ReviewWorktree {
+    fn drop(&mut self) {
+        // `remove_worktree` shells out to git twice (`worktree remove --force`,
+        // `worktree prune`) via the *sync* `std::process::Command`. Those are
+        // quick subprocess calls, so we run them SYNCHRONOUSLY here and let
+        // `Drop` complete only after the worktree is actually gone. A previous
+        // version detached the cleanup onto a background task and returned
+        // immediately; on a short run that finalizes and exits promptly the
+        // detached task could be cut off before it ran, leaking the
+        // `<tmp>/ralph-review-*` dir + its `.git/worktrees/` admin entry until
+        // the 6h sweep reaped it. Running cleanup inline closes that leak.
+        //
+        // The hazard with a synchronous subprocess call is that `Drop` can run
+        // on a tokio worker thread (this guard is created inside the spawned,
+        // detached `run_review_subprocess` task — it is dropped there on the
+        // success/timeout/`?`/panic/abort paths). Blocking a multi-thread
+        // runtime worker on the two git calls (potentially longer under a
+        // contended `.git/index.lock`) would starve the scheduler. So when we
+        // are on a *multi-thread* runtime, wrap the call in `block_in_place`,
+        // which hands the worker's other tasks off to a sibling worker for the
+        // duration. On a current-thread runtime `block_in_place` would panic
+        // (there is no sibling to hand work to), and with no runtime at all
+        // there is nothing to starve — both fall through to a plain inline
+        // call. In every branch the removal finishes before `Drop` returns.
+        //
+        // Best-effort: `remove_worktree` swallows its own errors (`let _ =
+        // ...`); `sweep_stale_review_worktrees` remains the backstop for the
+        // `SIGKILL`/forceful-exit case that skips `Drop` entirely.
+        let main_repo = std::mem::take(&mut self.main_repo);
+        let path = std::mem::take(&mut self.path);
+        let on_multi_thread_runtime = matches!(
+            tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()),
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+        );
+        if on_multi_thread_runtime {
+            // We are on a multi-thread runtime worker — tell tokio this thread
+            // is about to block so it can keep the rest of the runtime moving.
+            tokio::task::block_in_place(move || {
+                remove_worktree(&main_repo, &path);
+            });
+        } else {
+            // Current-thread runtime (block_in_place would panic) or no
+            // runtime (e.g. a pure sync test / non-tokio thread): nothing to
+            // starve, so just run the quick subprocess calls inline.
+            remove_worktree(&main_repo, &path);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -930,6 +1948,220 @@ mod tests {
     }
 
     #[test]
+    fn test_reset_hard_to_head_discards_tracked_changes() {
+        let (_tmp, dir) = init_repo();
+        // Dirty a tracked file.
+        fs::write(dir.join("README.md"), "# tampered\n").unwrap();
+        assert!(has_uncommitted_changes(&dir).unwrap());
+
+        reset_hard_to_head(&dir).unwrap();
+
+        // Tracked file is back to its committed content; no unmerged paths.
+        assert_eq!(
+            fs::read_to_string(dir.join("README.md")).unwrap(),
+            "# hello"
+        );
+        let status = git(&dir, &["status", "--porcelain"]).unwrap();
+        assert!(
+            status.trim().is_empty(),
+            "reset --hard must leave a clean tree (no unmerged paths): {status:?}",
+        );
+    }
+
+    #[test]
+    fn test_reset_hard_to_head_preserves_untracked_files() {
+        let (_tmp, dir) = init_repo();
+        // Untracked file the user wants kept.
+        fs::write(dir.join("scratch.txt"), "keep me\n").unwrap();
+        // Also dirty a tracked file so the reset has something to undo.
+        fs::write(dir.join("README.md"), "# tampered\n").unwrap();
+
+        reset_hard_to_head(&dir).unwrap();
+
+        // The tracked file was reset...
+        assert_eq!(
+            fs::read_to_string(dir.join("README.md")).unwrap(),
+            "# hello"
+        );
+        // ...but the untracked file survives (reset --hard, not clean -fd).
+        assert_eq!(
+            fs::read_to_string(dir.join("scratch.txt")).unwrap(),
+            "keep me\n",
+        );
+    }
+
+    #[test]
+    fn test_reset_hard_clears_conflicted_stash_apply() {
+        let (_tmp, dir) = init_repo();
+        // Reproduce a conflicted stash pop: stash version-A, commit
+        // divergent version-B, then apply the stash so the tree carries
+        // conflict markers / unmerged entries.
+        fs::write(dir.join("README.md"), "version-A\n").unwrap();
+        let stash_ref = stash_push_with_untracked(&dir, "ralph: conflict-reset-test")
+            .unwrap()
+            .expect("expected parked stash");
+        fs::write(dir.join("README.md"), "version-B\n").unwrap();
+        commit_changes(&dir, "divergent").unwrap();
+        let outcome = stash_pop(&dir, &stash_ref).unwrap();
+        assert!(
+            matches!(outcome, StashPopOutcome::Conflicted(_)),
+            "fixture must produce a conflicted apply; got {outcome:?}",
+        );
+        // Sanity: the tree is dirty / has unmerged paths now.
+        let dirty = git(&dir, &["status", "--porcelain"]).unwrap();
+        assert!(!dirty.trim().is_empty());
+
+        reset_hard_to_head(&dir).unwrap();
+
+        let status = git(&dir, &["status", "--porcelain"]).unwrap();
+        assert!(
+            status.trim().is_empty(),
+            "reset --hard must clear the conflicted apply (no unmerged paths): {status:?}",
+        );
+        assert!(!has_conflict_marker(&status));
+        // The committed (version-B) content is restored.
+        assert_eq!(
+            fs::read_to_string(dir.join("README.md")).unwrap(),
+            "version-B\n",
+        );
+    }
+
+    /// BUG #1 (conflicted parked-restore cleanup): a parked stash pushed with
+    /// `--include-untracked` can carry NEW untracked files the harness made.
+    /// When applying it conflicts, the cleanup must (a) clear the unmerged
+    /// tracked-file conflict, (b) remove the stash's new untracked file, and
+    /// (c) preserve the user's pre-existing untracked file. `git reset --hard
+    /// HEAD` clears (a) but leaves the stash's new untracked file behind;
+    /// `rollback_except(workdir, &pre_apply_untracked)` does all three.
+    #[test]
+    fn test_rollback_except_cleans_conflicted_stash_apply_keeps_preexisting() {
+        let (_tmp, dir) = init_repo();
+
+        // Pre-existing user untracked file: must survive the cleanup.
+        fs::write(dir.join("preexisting.txt"), "user pre-existing\n").unwrap();
+        // Snapshot taken BEFORE the apply (the runner captures exactly this):
+        // at this instant the only untracked file is the pre-existing one,
+        // because the stash's new untracked file is still inside the stash.
+        fs::write(dir.join("README.md"), "version-A\n").unwrap();
+        fs::write(dir.join("new.txt"), "harness-created untracked\n").unwrap();
+        // Park: stash everything (incl. the new untracked file) EXCEPT the
+        // pre-existing user file.
+        let stash_ref = stash_push_with_untracked_except(
+            &dir,
+            "ralph: conflict-clean-test",
+            &["preexisting.txt".to_string()],
+        )
+        .unwrap()
+        .expect("expected parked stash");
+        assert!(dir.join("preexisting.txt").exists());
+        assert!(!dir.join("new.txt").exists());
+
+        // The pre-apply snapshot the runner would capture right here.
+        let pre_apply_untracked = get_untracked_files(&dir).unwrap();
+        assert_eq!(pre_apply_untracked, vec!["preexisting.txt".to_string()]);
+
+        // Divergent commit so the stash apply conflicts. Commit only the
+        // tracked README change (`commit -am`) — NOT `git add -A`, which would
+        // sweep the still-untracked `preexisting.txt`/`new.txt` into the
+        // commit and change the fixture from the real runner's situation.
+        fs::write(dir.join("README.md"), "version-B\n").unwrap();
+        git(&dir, &["commit", "-am", "divergent"]).unwrap();
+        let outcome = stash_pop(&dir, &stash_ref).unwrap();
+        assert!(
+            matches!(outcome, StashPopOutcome::Conflicted(_)),
+            "fixture must produce a conflicted apply; got {outcome:?}",
+        );
+        // Sanity: both the tracked conflict and the stash's new untracked
+        // file are present after the conflicted apply.
+        assert!(dir.join("new.txt").exists());
+        let dirty = git(&dir, &["status", "--porcelain"]).unwrap();
+        assert!(
+            has_conflict_marker(&dirty),
+            "expected unmerged paths: {dirty:?}"
+        );
+
+        // The cleanup the runner now performs.
+        rollback_except(&dir, &pre_apply_untracked).unwrap();
+
+        let status = git(&dir, &["status", "--porcelain"]).unwrap();
+        // Only the pre-existing untracked file remains; conflict cleared, the
+        // stash's new untracked file removed.
+        assert_eq!(
+            status.trim(),
+            "?? preexisting.txt",
+            "cleanup must leave only the pre-existing untracked file: {status:?}",
+        );
+        assert!(!has_conflict_marker(&status));
+        assert!(
+            !dir.join("new.txt").exists(),
+            "the stash's new untracked file must be removed (BUG #1)",
+        );
+        assert!(
+            dir.join("preexisting.txt").exists(),
+            "the user's pre-existing untracked file must be preserved",
+        );
+        // Tracked content is back to the committed (version-B) state.
+        assert_eq!(
+            fs::read_to_string(dir.join("README.md")).unwrap(),
+            "version-B\n",
+        );
+    }
+
+    /// `list_stash_untracked_files` reads `<stash>^3` and returns EXACTLY the
+    /// untracked files the stash captured — never tracked changes (those live
+    /// in `^1`/`^2`) and never the user's pre-existing untracked files (park
+    /// excludes them via the pathspec).
+    #[test]
+    fn test_list_stash_untracked_files_returns_only_captured_untracked() {
+        let (_tmp, dir) = init_repo();
+
+        // A pre-existing untracked file the user already had: park excludes it,
+        // so it must NOT show up in `^3`.
+        fs::write(dir.join("preexisting.txt"), "user pre-existing\n").unwrap();
+        // A tracked-file modification: lands in `^1`/`^2`, never `^3`.
+        fs::write(dir.join("README.md"), "tracked change\n").unwrap();
+        // A NEW untracked file the harness created: the only thing `^3` should
+        // list.
+        fs::write(dir.join("new.txt"), "harness-created untracked\n").unwrap();
+
+        let stash_ref = stash_push_with_untracked_except(
+            &dir,
+            "ralph: list-untracked-test",
+            &["preexisting.txt".to_string()],
+        )
+        .unwrap()
+        .expect("expected parked stash");
+
+        let untracked = list_stash_untracked_files(&dir, stash_ref.as_str()).unwrap();
+        assert_eq!(
+            untracked,
+            vec!["new.txt".to_string()],
+            "must list only the harness-created untracked file (not the tracked \
+             change, not the user's pre-existing untracked file): {untracked:?}",
+        );
+    }
+
+    /// A stash with NO untracked files must yield an empty list. Depending on
+    /// the git version this is either a missing `^3` parent or a `^3` whose
+    /// tree is empty; both must collapse to `Ok(vec![])` (never an error).
+    #[test]
+    fn test_list_stash_untracked_files_empty_when_no_untracked() {
+        let (_tmp, dir) = init_repo();
+
+        // Only a tracked change, no untracked files at all.
+        fs::write(dir.join("README.md"), "tracked change\n").unwrap();
+        let stash_ref = stash_push_with_untracked(&dir, "ralph: list-untracked-empty-test")
+            .unwrap()
+            .expect("expected parked stash");
+
+        let untracked = list_stash_untracked_files(&dir, stash_ref.as_str()).unwrap();
+        assert!(
+            untracked.is_empty(),
+            "a stash with no untracked files must yield an empty list: {untracked:?}",
+        );
+    }
+
+    #[test]
     fn test_get_all_changed_files() {
         let (_tmp, dir) = init_repo();
         fs::write(dir.join("a.txt"), "a").unwrap();
@@ -940,25 +2172,46 @@ mod tests {
         assert!(files.contains(&"b.txt".to_string()));
     }
 
+    /// Build a NUL-delimited `git status --porcelain=v1 -z` byte stream from
+    /// `(status, path[, orig])` tuples. For an `R`/`C` record git emits the
+    /// `XY <new>` record first, then a SEPARATE NUL-terminated record with
+    /// the ORIGINAL path — this helper reproduces that exact framing.
+    type PorcelainRec<'a> = (&'a str, &'a [u8], Option<&'a [u8]>);
+
+    fn porcelain_z(records: &[PorcelainRec]) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::new();
+        for (status, path, orig) in records {
+            out.extend_from_slice(status.as_bytes());
+            out.push(b' ');
+            out.extend_from_slice(path);
+            out.push(0u8);
+            if let Some(orig) = orig {
+                out.extend_from_slice(orig);
+                out.push(0u8);
+            }
+        }
+        out
+    }
+
     #[test]
     fn test_parse_porcelain_status_rename_and_copy() {
-        // Simulated `git status --porcelain` output covering:
+        // Simulated `git status --porcelain=v1 -z` output covering:
         //   - plain modifications
         //   - adds
         //   - untracked
-        //   - a staged rename (R  old -> new)
-        //   - a staged copy    (C  old -> new)
-        //   - an unstaged rename where worktree column is R ( R old -> new)
-        let lines = [
-            " M modified.txt",
-            "A  added.txt",
-            "?? untracked.txt",
-            "R  old_renamed.txt -> new_renamed.txt",
-            "C  src_copied.txt -> dst_copied.txt",
-            " R wt_old.txt -> wt_new.txt",
-        ];
-        let out = lines.join("\n") + "\n";
-        let files = parse_porcelain_status(&out);
+        //   - a staged rename (R  with a following orig-path record)
+        //   - a staged copy   (C  with a following orig-path record)
+        //   - an unstaged rename where the worktree column is R ( R …)
+        // Returned-order contract: for R/C we push ORIG then NEW.
+        let out = porcelain_z(&[
+            (" M", b"modified.txt", None),
+            ("A ", b"added.txt", None),
+            ("??", b"untracked.txt", None),
+            ("R ", b"new_renamed.txt", Some(b"old_renamed.txt")),
+            ("C ", b"dst_copied.txt", Some(b"src_copied.txt")),
+            (" R", b"wt_new.txt", Some(b"wt_old.txt")),
+        ]);
+        let files = parse_porcelain_status_z(&out).expect("well-formed -z stream parses");
         assert_eq!(
             files,
             vec![
@@ -973,6 +2226,178 @@ mod tests {
                 "wt_new.txt".to_string(),
             ]
         );
+    }
+
+    /// Paths containing a space, a newline, a double-quote and a non-ASCII
+    /// (non-UTF8) byte. Under the old line/`" -> "` parser these would have
+    /// been C-quoted by git and mis-split / mis-decoded; under `-z` they are
+    /// emitted RAW and must round-trip (the non-UTF8 byte goes through the
+    /// documented best-effort `from_utf8_lossy` boundary).
+    #[test]
+    fn test_parse_porcelain_status_z_unusual_paths() {
+        // 0xFF is never valid UTF-8 → exercises the lossy boundary.
+        let spacey = b"a file.txt".as_slice();
+        let newliney = b"line1\nline2.txt".as_slice();
+        let quoted = b"weird\"name.txt".as_slice();
+        let non_utf8: &[u8] = &[b'b', b'a', b'd', 0xFF, b'.', b't', b'x', b't'];
+
+        let out = porcelain_z(&[
+            (" M", spacey, None),
+            ("A ", newliney, None),
+            ("??", quoted, None),
+            // A rename whose NEW and ORIG paths both carry unusual bytes.
+            ("R ", b"to .txt", Some(non_utf8)),
+        ]);
+        let files = parse_porcelain_status_z(&out).expect("raw -z paths parse");
+
+        assert_eq!(files[0], "a file.txt");
+        assert_eq!(files[1], "line1\nline2.txt");
+        assert_eq!(files[2], "weird\"name.txt");
+        // orig (non-UTF8) pushed before new; lossy-decoded but not split.
+        assert_eq!(files[3], String::from_utf8_lossy(non_utf8));
+        assert!(files[3].contains('\u{FFFD}'), "non-UTF8 byte lossily kept");
+        assert_eq!(files[4], "to .txt");
+        assert_eq!(files.len(), 5);
+    }
+
+    /// Total-parser contract: an empty stream (clean tree) is `Ok([])`, not
+    /// an error.
+    #[test]
+    fn test_parse_porcelain_status_z_empty_is_ok_empty() {
+        assert_eq!(parse_porcelain_status_z(b"").unwrap(), Vec::<String>::new());
+        // A lone trailing NUL (the well-formed "no entries" shape) is also
+        // an empty list, not a malformed record.
+        assert_eq!(
+            parse_porcelain_status_z(b"\0").unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    /// Total-parser contract: a rename/copy record whose required following
+    /// original-path record is missing (truncated pipe) is a HARD ERROR —
+    /// acting on just the new path would silently drop the old path from the
+    /// rollback/preserve set (the data-loss class this parser prevents).
+    #[test]
+    fn test_parse_porcelain_status_z_truncated_rename_is_error() {
+        // `R  new.txt\0` with NO following `\0`-terminated orig record.
+        let mut out: Vec<u8> = Vec::new();
+        out.extend_from_slice(b"R ");
+        out.push(b' ');
+        out.extend_from_slice(b"new.txt");
+        out.push(0u8);
+        let err = parse_porcelain_status_z(&out)
+            .expect_err("a rename with no orig record must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("truncated") && msg.contains("rename/copy"),
+            "error must name the truncation: {msg}"
+        );
+    }
+
+    /// Total-parser contract: a record that is not `XY <path>` (too short, or
+    /// missing the space delimiter at index 2) is a HARD ERROR, never
+    /// mis-sliced into a bogus path.
+    #[test]
+    fn test_parse_porcelain_status_z_malformed_record_is_error() {
+        // Missing the space at index 2 ("XYpath" instead of "XY path").
+        let err = parse_porcelain_status_z(b"MMnospace.txt\0")
+            .expect_err("record without the `XY ` delimiter must be rejected");
+        assert!(err.to_string().contains("malformed"), "{err}");
+        // Too short to even contain `XY <1-char path>`.
+        let err2 = parse_porcelain_status_z(b"M\0").expect_err("a 1-byte record must be rejected");
+        assert!(err2.to_string().contains("malformed"), "{err2}");
+    }
+
+    #[test]
+    fn test_check_ref_format_accepts_valid_names() {
+        // A representative spread of legal branch names, including ones that
+        // exercise "allowed" edges of the rules: single-level, slashed,
+        // dots-but-not-double, embedded (non-leading) dash, digits, a
+        // component that merely *contains* "lock", and `@` not as `@{` or a
+        // lone `@`.
+        for ok in [
+            "main",
+            "feat/foo",
+            "release-1.2.3",
+            "feat/JIRA-123_some-thing",
+            "user/feature.work",
+            "v2",
+            "a/b/c/d",
+            "lockfile-update",
+            "has@sign",
+        ] {
+            check_ref_format(ok).unwrap_or_else(|e| panic!("{ok:?} must be valid: {e}"));
+        }
+    }
+
+    /// Every git-check-ref-format(1) rule the native validator encodes must
+    /// reject, plus our two explicit pre-checks (empty, leading dash). Each
+    /// case asserts the user-facing `invalid branch name` framing so callers
+    /// always get an actionable message.
+    #[test]
+    fn test_check_ref_format_rejects_every_rule() {
+        let cases: &[&str] = &[
+            "",                 // empty (pre-check)
+            "   ",              // whitespace-only (pre-check)
+            "-leading-dash",    // leading '-' (pre-check; CLI-flag hazard)
+            "feat/bad..branch", // rule: consecutive dots
+            "..",               // consecutive dots / ends with '.'
+            "bad branch",       // rule: space
+            "feat/..hidden",    // component begins with '.'
+            ".hidden",          // component begins with '.'
+            "ends.",            // ends with '.'
+            "foo.lock",         // component ends with '.lock'
+            "foo.lock/bar",     // NON-last component ends with '.lock'
+            "foo//bar",         // consecutive slashes
+            "trailing/",        // ends with '/'
+            "has~tilde",        // rule: '~'
+            "has^caret",        // rule: '^'
+            "has:colon",        // rule: ':'
+            "has?q",            // rule: '?'
+            "has*star",         // rule: '*'
+            "has[bracket",      // rule: '['
+            "back\\slash",      // rule: backslash
+            "ctrl\u{7f}del",    // rule: DEL control char
+            "ctrl\u{1}soh",     // rule: <0x20 control char
+            "ref@{0}",          // rule: '@{' sequence
+        ];
+        for bad in cases {
+            let e = check_ref_format(bad).expect_err(&format!("{bad:?} must be rejected"));
+            assert!(
+                e.to_string().contains("invalid branch name"),
+                "rejection for {bad:?} must use the actionable framing: {e}"
+            );
+        }
+    }
+
+    /// Slash-shape branches map onto the `refs/heads/<name>` form correctly:
+    /// a leading slash collapses to `refs/heads//x` (consecutive slashes) and
+    /// is rejected deterministically.
+    #[test]
+    fn test_check_ref_format_slash_edges() {
+        check_ref_format("/leading").expect_err("a '/'-leading branch must reject");
+        check_ref_format("a//b").expect_err("consecutive slashes must reject");
+        check_ref_format("trailing/").expect_err("a trailing-'/' branch must reject");
+    }
+
+    /// `validate_refname` is the pure rule core; pin the documented decision
+    /// for the bare-ref forms (no `refs/heads/` prefix) so the encoding can't
+    /// silently drift from git-check-ref-format(1).
+    #[test]
+    fn test_validate_refname_core_rules() {
+        assert!(validate_refname("refs/heads/main").is_ok());
+        assert!(validate_refname("@").is_err()); // rule 9
+        assert!(validate_refname("/x").is_err()); // rule 6 (leading slash)
+        assert!(validate_refname("x/").is_err()); // rule 6 (trailing slash)
+        assert!(validate_refname("a..b").is_err()); // rule 3
+        assert!(validate_refname("a//b").is_err()); // rule 6
+        assert!(validate_refname("a.").is_err()); // rule 7
+        assert!(validate_refname("a@{b").is_err()); // rule 8
+        assert!(validate_refname("a\\b").is_err()); // rule 10
+        assert!(validate_refname(".hidden/x").is_err()); // rule 1 (begins '.')
+        assert!(validate_refname("x/foo.lock").is_err()); // rule 1 ('.lock')
+        assert!(validate_refname("a b").is_err()); // rule 4 (space)
+        assert!(validate_refname("a\u{0}b").is_err()); // rule 4 (control)
     }
 
     #[test]
@@ -1210,6 +2635,119 @@ mod tests {
         assert_eq!(found, stash);
     }
 
+    /// `stash_push_with_untracked_except` must preserve the user's
+    /// pre-existing untracked files in the worktree while still stashing
+    /// the harness's tracked modifications and untracked new files. The
+    /// preserved files must NOT appear in the resulting stash entry (so a
+    /// later admin `git stash clear` cannot delete them, and a pop-on-
+    /// conflict leaves them untouched).
+    #[test]
+    fn test_stash_push_with_untracked_except_keeps_excluded_files_in_workdir() {
+        let (_tmp, dir) = init_repo();
+
+        // The user's pre-existing untracked file — must survive the park.
+        fs::write(dir.join("user-scratch.txt"), "user data").unwrap();
+        // Harness work: modify a tracked file + create a new untracked file.
+        fs::write(dir.join("README.md"), "# modified by harness").unwrap();
+        fs::write(dir.join("harness-new.txt"), "wip from harness").unwrap();
+
+        let exclude = vec!["user-scratch.txt".to_string()];
+        let msg = "ralph: park-test exclude scratch";
+        let stash = stash_push_with_untracked_except(&dir, msg, &exclude)
+            .unwrap()
+            .expect("expected a stash entry for the harness's WIP");
+
+        // The user's pre-existing file is STILL in the worktree, untouched.
+        assert!(
+            dir.join("user-scratch.txt").exists(),
+            "pre-existing untracked file must remain in the workdir post-park"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("user-scratch.txt")).unwrap(),
+            "user data"
+        );
+
+        // The harness's tracked + untracked changes were stashed (and so
+        // are no longer in the worktree).
+        assert_eq!(
+            fs::read_to_string(dir.join("README.md")).unwrap(),
+            "# hello"
+        );
+        assert!(!dir.join("harness-new.txt").exists());
+
+        // Popping the stash restores the harness's work — and the user's
+        // file is *still* there (it was never in the stash).
+        let outcome = stash_pop(&dir, &stash).unwrap();
+        assert_eq!(outcome, StashPopOutcome::Clean);
+        assert_eq!(
+            fs::read_to_string(dir.join("README.md")).unwrap(),
+            "# modified by harness"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("harness-new.txt")).unwrap(),
+            "wip from harness"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("user-scratch.txt")).unwrap(),
+            "user data",
+            "the user's file must survive a clean pop too"
+        );
+    }
+
+    /// When only the excluded paths are dirty, the resulting stash is
+    /// empty — `stash_push_with_untracked_except` must return `None`
+    /// (mirroring `stash_push_with_untracked`'s clean-tree contract) and
+    /// leave the excluded files untouched on disk.
+    #[test]
+    fn test_stash_push_with_untracked_except_returns_none_when_only_excluded_dirty() {
+        let (_tmp, dir) = init_repo();
+        fs::write(dir.join("only-user.txt"), "only user").unwrap();
+
+        let exclude = vec!["only-user.txt".to_string()];
+        let result =
+            stash_push_with_untracked_except(&dir, "ralph: should-be-empty", &exclude).unwrap();
+        assert!(
+            result.is_none(),
+            "a tree whose only diff is in the excluded set is logically clean; got {result:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("only-user.txt")).unwrap(),
+            "only user"
+        );
+    }
+
+    /// Dropping the parked stash (the "Mark Failed" / discard path) must
+    /// not affect the user's pre-existing untracked file — proving that
+    /// `discard_parked_worktree_state` (which delegates to `drop_stash`)
+    /// is safe with the negative-pathspec approach because the excluded
+    /// files were never in the stash in the first place.
+    #[test]
+    fn test_stash_push_with_untracked_except_drop_does_not_touch_excluded() {
+        let (_tmp, dir) = init_repo();
+
+        fs::write(dir.join("user-scratch.txt"), "must survive").unwrap();
+        fs::write(dir.join("harness-new.txt"), "wip").unwrap();
+
+        let exclude = vec!["user-scratch.txt".to_string()];
+        let stash =
+            stash_push_with_untracked_except(&dir, "ralph: drop-test exclude scratch", &exclude)
+                .unwrap()
+                .expect("expected stash");
+
+        // Drop without applying — equivalent to discard_parked_worktree_state.
+        assert!(drop_stash(&dir, &stash).unwrap());
+
+        // User's pre-existing file is still right where they left it.
+        assert!(dir.join("user-scratch.txt").exists());
+        assert_eq!(
+            fs::read_to_string(dir.join("user-scratch.txt")).unwrap(),
+            "must survive"
+        );
+        // The harness's stashed work is gone (it was the entire content of
+        // the dropped stash).
+        assert!(!dir.join("harness-new.txt").exists());
+    }
+
     #[test]
     fn test_stash_pop_clean() {
         let (_tmp, dir) = init_repo();
@@ -1298,6 +2836,29 @@ mod tests {
 
         let outcome = stash_pop(&dir, &stash).unwrap();
         assert_eq!(outcome, StashPopOutcome::NotFound);
+    }
+
+    #[test]
+    fn test_drop_stash_discards_entry_without_applying() {
+        let (_tmp, dir) = init_repo();
+        fs::write(
+            dir.join("note.txt"),
+            "park me
+",
+        )
+        .unwrap();
+        let stash = stash_push_with_untracked(&dir, "ralph: discard me")
+            .unwrap()
+            .expect("sha");
+
+        let dropped = drop_stash(&dir, &stash).unwrap();
+
+        assert!(dropped);
+        assert!(
+            !dir.join("note.txt").exists(),
+            "discard must not apply the stash"
+        );
+        assert_eq!(stash_pop(&dir, &stash).unwrap(), StashPopOutcome::NotFound);
     }
 
     #[test]
@@ -1604,5 +3165,158 @@ mod tests {
         // Both layers undone; f.txt no longer exists (back to init state).
         assert!(!dir.join("f.txt").exists());
         assert!(!has_uncommitted_changes(&dir).unwrap());
+    }
+
+    // ----- Per-iteration commit message + Ralph-* trailers (STEP 32/34) -----
+
+    #[test]
+    fn test_sanitize_commit_subject_collapses_and_caps() {
+        assert_eq!(
+            sanitize_commit_subject("Add  OAuth\tlogin"),
+            "Add OAuth login"
+        );
+        assert_eq!(
+            sanitize_commit_subject("line one\nline two\n\nline three"),
+            "line one line two line three"
+        );
+        assert_eq!(sanitize_commit_subject("  trim me  "), "trim me");
+        let long = "x".repeat(200);
+        assert_eq!(sanitize_commit_subject(&long).chars().count(), 72);
+        // Multibyte titles cap on a char boundary (no panic).
+        let multi = "é".repeat(100);
+        assert_eq!(sanitize_commit_subject(&multi).chars().count(), 72);
+    }
+
+    #[test]
+    fn test_build_iteration_commit_message_subject_and_trailers() {
+        let msg = build_iteration_commit_message("a1b2c3d4", 3, "Add  the\nthing", "my-plan");
+        let mut lines = msg.lines();
+        assert_eq!(
+            lines.next().unwrap(),
+            "ralph a1b2c3d4.3 - Add the thing",
+            "subject is `ralph <short_id>.<n> - <sanitized title>`"
+        );
+        assert!(msg.contains("\nRalph-Plan: my-plan\n"));
+        assert!(msg.contains("\nRalph-Step: a1b2c3d4\n"));
+        assert!(msg.contains("\nRalph-Iteration: 3\n"));
+        assert!(msg.contains("\nRalph-Review: pending\n"));
+    }
+
+    #[test]
+    fn test_iteration_commit_trailers_parsed_by_git_not_subject() {
+        let (_tmp, dir) = init_repo();
+        let branch = get_current_branch(&dir).unwrap();
+
+        // Commit two iterations for one step + one for another.
+        fs::write(dir.join("a.txt"), "1").unwrap();
+        commit_changes(
+            &dir,
+            &build_iteration_commit_message("STEPAAAA", 1, "A", "p"),
+        )
+        .unwrap();
+        let a1 = get_commit_hash(&dir).unwrap();
+        fs::write(dir.join("a.txt"), "2").unwrap();
+        commit_changes(
+            &dir,
+            &build_iteration_commit_message("STEPAAAA", 2, "A", "p"),
+        )
+        .unwrap();
+        let a2 = get_commit_hash(&dir).unwrap();
+        fs::write(dir.join("b.txt"), "1").unwrap();
+        commit_changes(
+            &dir,
+            &build_iteration_commit_message("STEPBBBB", 1, "B", "p"),
+        )
+        .unwrap();
+        let b1 = get_commit_hash(&dir).unwrap();
+
+        // Trailer parsing is by git's own parser (not subject scraping):
+        // a prose mention must not false-match.
+        fs::write(dir.join("c.txt"), "1").unwrap();
+        commit_changes(&dir, "talks about Ralph-Step: NOTATRAILER inline\n").unwrap();
+        let prose = get_commit_hash(&dir).unwrap();
+        assert_eq!(
+            parse_trailer(&dir, &prose, ITERATION_STEP_TRAILER).unwrap(),
+            None
+        );
+
+        // All iteration commits discovered, newest-first, grouped by step.
+        let all = list_iteration_commits(&dir, &branch).unwrap();
+        let shas: Vec<&str> = all.iter().map(|c| c.sha.as_str()).collect();
+        assert_eq!(shas, vec![b1.as_str(), a2.as_str(), a1.as_str()]);
+
+        let a = iteration_commits_for_step(&dir, &branch, "STEPAAAA").unwrap();
+        assert_eq!(a.len(), 2);
+        assert_eq!(a[0].iteration, 2);
+        assert_eq!(a[1].iteration, 1);
+        assert_eq!(a[0].plan_slug.as_deref(), Some("p"));
+
+        // step reset isolation: ordering a step's SHAs newest-first and
+        // reverting them touches ONLY that step's commits.
+        let targets: Vec<String> = a.iter().map(|c| c.sha.clone()).collect();
+        let ordered = order_shas_newest_first(&dir, &branch, &targets).unwrap();
+        assert_eq!(ordered, vec![a2.clone(), a1.clone()]);
+        for sha in &ordered {
+            assert!(matches!(
+                revert_commit(&dir, sha).unwrap(),
+                RevertOutcome::Reverted { .. }
+            ));
+        }
+        // Step A's file is gone (both iterations reverted); step B's stays.
+        assert!(!dir.join("a.txt").exists(), "A reverted");
+        assert_eq!(
+            fs::read_to_string(dir.join("b.txt")).unwrap(),
+            "1",
+            "B intact"
+        );
+    }
+
+    /// Source-shape assertion for `ReviewWorktree::Drop`.
+    ///
+    /// `Drop` must clean the worktree up **synchronously** — completing the
+    /// `remove_worktree` call before it returns — so a short run that
+    /// finalizes and exits promptly cannot leak the worktree. (A prior
+    /// version detached cleanup onto `spawn_blocking` / a fresh OS thread and
+    /// returned immediately, which leaked on fast exit.) Because `Drop` can
+    /// run on a tokio worker thread, the synchronous call must be wrapped in
+    /// `block_in_place` when on a multi-thread runtime so it doesn't starve
+    /// the scheduler, falling through to a plain inline call otherwise.
+    ///
+    /// A behavioral test is covered in `review.rs` (it asserts the worktree
+    /// is gone right after the guard drops). Here we assert the source shape:
+    /// the Drop body must call `remove_worktree` inline (the synchronous
+    /// path), guard the multi-thread case with `block_in_place`, and must NOT
+    /// detach cleanup via `spawn_blocking` / `std::thread::spawn` (which would
+    /// reintroduce the fast-exit leak).
+    #[test]
+    fn test_review_worktree_drop_cleans_up_synchronously() {
+        let src = include_str!("git.rs");
+        let sig = "impl Drop for ReviewWorktree {";
+        let start = src.find(sig).expect("ReviewWorktree::Drop impl must exist");
+        let after = &src[start..];
+        // Bound the slice at the impl's section: stop at the next `// ---`
+        // divider after the Drop impl.
+        let end_rel = after
+            .find("\n// ---")
+            .expect("expected the next section divider after the Drop impl");
+        let body = &after[..end_rel];
+
+        assert!(
+            body.contains("remove_worktree(&main_repo, &path)"),
+            "ReviewWorktree::Drop must call remove_worktree synchronously so \
+             cleanup completes before Drop returns (no fast-exit leak)",
+        );
+        assert!(
+            body.contains("block_in_place"),
+            "ReviewWorktree::Drop must wrap the synchronous remove in \
+             block_in_place when on a multi-thread runtime so it doesn't \
+             starve the scheduler while the git subprocess calls run",
+        );
+        assert!(
+            !body.contains("spawn_blocking") && !body.contains("std::thread::spawn"),
+            "ReviewWorktree::Drop must NOT detach cleanup onto spawn_blocking \
+             / std::thread::spawn — a detached task can be cut off when a \
+             short run exits before it runs, leaking the worktree",
+        );
     }
 }

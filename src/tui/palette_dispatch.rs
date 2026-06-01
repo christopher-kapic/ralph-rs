@@ -10,8 +10,6 @@
 // `/plan delete <slug>`, `/plan approve [<slug>]`.
 //
 // Step #31 wires the v1-deferred routes per TUI-plan.md §9:
-// * `/plan questions on|off [<slug>]` — flips `plans.questions_enabled` via
-//   the surrounding view's storage helper.
 // * `/step add <title>` — appends a new step to the focused plan.
 // * `/step skip [<num>]` — mirrors the `s` keybinding's `runner::skip_step`.
 // * `/step move <num> --to <m>` — re-keys a step into a new position.
@@ -163,14 +161,6 @@ pub enum PaletteAction {
     /// `/plan approve [<slug>]` — flip `Planning` → `Ready` (toast otherwise).
     /// No confirm — mirrors the plan-list `A` keybinding.
     Approve { plan_id: String, slug: String },
-    /// `/plan questions on|off [<slug>]` — flip `plans.questions_enabled` via
-    /// `storage::set_plan_questions_enabled`. Mirrors the `Q` keybinding on
-    /// the plan-list tile.
-    SetQuestionsEnabled {
-        plan_id: String,
-        slug: String,
-        enabled: bool,
-    },
     /// `/step add <title>` — append a new step to the focused plan via
     /// `storage::create_step`. The caller defaults the rest of the column
     /// values (no agent, no harness override, empty criteria, etc.) — the
@@ -256,6 +246,15 @@ pub enum PaletteAction {
         plan_slug: String,
         step_label: String,
     },
+    /// `/inbox` — open the cross-branch interruptions inbox
+    /// (docs/dag-redesign.md §12.3). Reachable from any view; the consumer
+    /// pushes `run_inbox_tui`.
+    OpenInbox,
+    /// `/focus [<short_id>]` — re-root the plan-detail outline on a step's
+    /// downstream-dependents cone (docs/dag-redesign.md §12.2). `short_id`
+    /// is `None` to focus the cursor's step. Only meaningful in plan-detail;
+    /// other views toast.
+    FocusStep { short_id: Option<String> },
     /// Recognized command whose palette surface isn't wired yet. Caller
     /// renders a `Coming soon — landing in step <N>` info toast. Only
     /// `/help` currently emits this — the overlay itself is reachable via
@@ -296,14 +295,6 @@ pub fn dispatch(cmd: &PaletteCommand, ctx: &PaletteContext<'_>) -> PaletteAction
 
         // -- /plan approve [<slug>] ---------------------------------------
         PaletteCommand::PlanApprove(slug) => dispatch_plan_approve(slug.as_deref(), ctx),
-
-        // -- /plan questions on|off [<slug>] ------------------------------
-        PaletteCommand::PlanQuestionsOn(slug) => {
-            dispatch_plan_questions(slug.as_deref(), true, ctx)
-        }
-        PaletteCommand::PlanQuestionsOff(slug) => {
-            dispatch_plan_questions(slug.as_deref(), false, ctx)
-        }
 
         // -- /step add <title> --------------------------------------------
         PaletteCommand::StepAdd(title) => dispatch_step_add(title, ctx),
@@ -350,6 +341,17 @@ pub fn dispatch(cmd: &PaletteCommand, ctx: &PaletteContext<'_>) -> PaletteAction
 
         // -- /import <path> -----------------------------------------------
         PaletteCommand::Import(path) => PaletteAction::Import { path: path.clone() },
+
+        // -- /inbox -------------------------------------------------------
+        // docs/dag-redesign.md §12.3: the inbox is deliberately decoupled
+        // from DAG navigation and reachable from anywhere, so it needs no
+        // plan/step context resolution.
+        PaletteCommand::Inbox => PaletteAction::OpenInbox,
+
+        // -- /focus [<short_id>] ------------------------------------------
+        PaletteCommand::Focus(short_id) => PaletteAction::FocusStep {
+            short_id: short_id.clone(),
+        },
 
         // -- /quit / /q ---------------------------------------------------
         PaletteCommand::Quit => PaletteAction::Quit,
@@ -515,25 +517,6 @@ fn dispatch_plan_approve(slug: Option<&str>, ctx: &PaletteContext<'_>) -> Palett
                 }
             }
         }
-        ResolvedSlug::Missing => PaletteAction::Toast {
-            message: "No plan selected.".to_string(),
-            kind: ToastKind::Info,
-        },
-        ResolvedSlug::Unknown(name) => unknown_plan_toast(&name),
-    }
-}
-
-fn dispatch_plan_questions(
-    slug: Option<&str>,
-    enabled: bool,
-    ctx: &PaletteContext<'_>,
-) -> PaletteAction {
-    match resolve_slug(slug, ctx) {
-        ResolvedSlug::Some(target) => PaletteAction::SetQuestionsEnabled {
-            plan_id: target.id,
-            slug: target.slug,
-            enabled,
-        },
         ResolvedSlug::Missing => PaletteAction::Toast {
             message: "No plan selected.".to_string(),
             kind: ToastKind::Info,
@@ -1254,6 +1237,29 @@ mod tests {
         );
     }
 
+    // -- /inbox + /focus (docs/dag-redesign.md §12.3 / §12.2) -------------
+
+    #[test]
+    fn inbox_dispatches_to_open_inbox() {
+        let c = Ctx::new();
+        assert_eq!(dispatch_str("/inbox", &c), PaletteAction::OpenInbox);
+    }
+
+    #[test]
+    fn focus_dispatches_with_optional_short_id() {
+        let c = Ctx::new();
+        assert_eq!(
+            dispatch_str("/focus", &c),
+            PaletteAction::FocusStep { short_id: None }
+        );
+        assert_eq!(
+            dispatch_str("/focus a1b2c3d4", &c),
+            PaletteAction::FocusStep {
+                short_id: Some("a1b2c3d4".to_string())
+            }
+        );
+    }
+
     // -- /export ----------------------------------------------------------
 
     #[test]
@@ -1319,74 +1325,6 @@ mod tests {
             action,
             PaletteAction::Import {
                 path: "/tmp/plan.json".to_string(),
-            }
-        );
-    }
-
-    // -- /plan questions on|off -------------------------------------------
-
-    #[test]
-    fn plan_questions_on_named_flips_flag() {
-        let mut c = Ctx::new();
-        c.plans = vec![plan_ref("alpha", PlanStatus::Ready)];
-        let action = dispatch_str("/plan questions on alpha", &c);
-        assert_eq!(
-            action,
-            PaletteAction::SetQuestionsEnabled {
-                plan_id: "id-alpha".to_string(),
-                slug: "alpha".to_string(),
-                enabled: true,
-            }
-        );
-    }
-
-    #[test]
-    fn plan_questions_off_named_flips_flag() {
-        let mut c = Ctx::new();
-        c.plans = vec![plan_ref("alpha", PlanStatus::Ready)];
-        let action = dispatch_str("/plan questions off alpha", &c);
-        assert_eq!(
-            action,
-            PaletteAction::SetQuestionsEnabled {
-                plan_id: "id-alpha".to_string(),
-                slug: "alpha".to_string(),
-                enabled: false,
-            }
-        );
-    }
-
-    #[test]
-    fn plan_questions_on_omitted_uses_focus() {
-        let mut c = Ctx::new();
-        c.plans = vec![plan_ref("alpha", PlanStatus::Ready)];
-        c.focused_slug = Some("alpha".to_string());
-        let action = dispatch_str("/plan questions on", &c);
-        assert_eq!(
-            action,
-            PaletteAction::SetQuestionsEnabled {
-                plan_id: "id-alpha".to_string(),
-                slug: "alpha".to_string(),
-                enabled: true,
-            }
-        );
-    }
-
-    #[test]
-    fn plan_questions_unknown_slug_toasts_error() {
-        let c = Ctx::new();
-        let action = dispatch_str("/plan questions on ghost", &c);
-        assert_eq!(action, unknown_plan_toast("ghost"));
-    }
-
-    #[test]
-    fn plan_questions_omitted_with_no_focus_toasts_info() {
-        let c = Ctx::new();
-        let action = dispatch_str("/plan questions off", &c);
-        assert_eq!(
-            action,
-            PaletteAction::Toast {
-                message: "No plan selected.".to_string(),
-                kind: ToastKind::Info,
             }
         );
     }

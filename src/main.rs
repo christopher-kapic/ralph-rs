@@ -1,6 +1,7 @@
 mod cli;
 mod commands;
 mod config;
+mod dag_util;
 mod db;
 mod executor;
 mod export;
@@ -16,11 +17,15 @@ mod plan;
 mod plan_harness;
 mod preflight;
 mod prompt;
+mod review;
 mod run_lock;
 mod runner;
 mod signal;
 mod storage;
 mod test_runner;
+// Blanket dead-code suppression for the TUI module: it carries substantial
+// intentional scaffolding (views/widgets wired up across later DAG-redesign
+// phases). Per-item gating would be noise; this single allow covers it.
 #[allow(dead_code)]
 mod tui;
 mod validate;
@@ -29,8 +34,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use crate::cli::{
-    AgentsCommand, Cli, Command, HooksCommand, PlanCommand, PlanDependencyCommand,
-    PlanHarnessCommand, PromptCommand, QuestionCommand, QuestionsState, StepCommand,
+    AgentsCommand, Cli, Command, HooksCommand, InterruptionCommand, OnOffState, PlanCommand,
+    PlanDependencyCommand, PlanHarnessCommand, PromptCommand, QuestionCommand, StepCommand,
+    StepDependencyCommand,
 };
 
 use crate::commands::{resolve_plan, resolve_project};
@@ -106,7 +112,7 @@ fn main() -> Result<()> {
                 branch,
                 harness,
                 agent,
-                retry_strategy,
+                max_review_corrections,
                 tests,
                 depends_on,
             } => {
@@ -116,15 +122,17 @@ fn main() -> Result<()> {
                 let h = harness.as_deref().or(cli.harness.as_deref());
                 commands::plan_create(
                     &conn,
-                    &slug,
-                    &project,
-                    description.as_deref(),
-                    branch.as_deref(),
-                    h,
-                    agent.as_deref(),
-                    retry_strategy,
-                    &tests,
-                    &depends_on,
+                    commands::PlanCreateArgs {
+                        slug: &slug,
+                        project: &project,
+                        description: description.as_deref(),
+                        branch: branch.as_deref(),
+                        harness: h,
+                        agent: agent.as_deref(),
+                        max_review_corrections,
+                        tests: &tests,
+                        depends_on: &depends_on,
+                    },
                     &out,
                 )
             }
@@ -205,6 +213,14 @@ fn main() -> Result<()> {
                         plan_slug.as_deref(),
                     ))?;
                     if exit_code == 0 {
+                        // Non-fatal DAG sanity check: an authoring harness
+                        // that expressed ordering by array/positional order
+                        // instead of real edges produces an all-roots,
+                        // edge-less plan that "runs" but has none of the
+                        // intended gating. `ralph import` validates; `plan
+                        // harness generate` had no such guard. Warn (never
+                        // fail) and point at how to inspect/fix.
+                        plan_harness::warn_if_edgeless_dag(&conn, &project, plan_slug.as_deref());
                         return Ok(());
                     }
                     // Drop the SQLite connection and tokio runtime explicitly
@@ -217,9 +233,9 @@ fn main() -> Result<()> {
                     std::process::exit(exit_code);
                 }
             },
-            PlanCommand::Questions { state, slug } => {
-                let enabled = matches!(state, QuestionsState::On);
-                commands::cmd_plan_questions(&conn, &slug, &project, enabled, &out)
+            PlanCommand::Review { state, slug } => {
+                let enabled = matches!(state, OnOffState::On);
+                commands::cmd_plan_review(&conn, &slug, &project, enabled, &out)
             }
         },
 
@@ -234,14 +250,16 @@ fn main() -> Result<()> {
                 plan,
                 description,
                 after,
+                before,
+                root,
                 agent,
                 harness,
                 model,
                 criteria,
                 max_retries,
                 change_policy,
-                retry_strategy,
                 tags,
+                depends_on,
                 import_json,
             } => {
                 // Precedence: per-subcommand --harness overrides the global
@@ -268,19 +286,23 @@ fn main() -> Result<()> {
                     let title = title.as_deref().expect("clap guarantees title is present");
                     commands::step_add(
                         &conn,
-                        &p.slug,
-                        &project,
-                        title,
-                        description.as_deref(),
-                        after,
-                        agent.as_deref(),
-                        h,
-                        model.as_deref(),
-                        &criteria,
-                        max_retries,
-                        change_policy,
-                        retry_strategy,
-                        &tags,
+                        commands::StepAddArgs {
+                            plan_slug: &p.slug,
+                            project: &project,
+                            title,
+                            description: description.as_deref(),
+                            after: after.as_deref(),
+                            before: before.as_deref(),
+                            root,
+                            agent: agent.as_deref(),
+                            harness: h,
+                            model: model.as_deref(),
+                            criteria: &criteria,
+                            max_retries,
+                            change_policy,
+                            tags: &tags,
+                            depends_on: &depends_on,
+                        },
                         &out,
                     )
                 }
@@ -296,7 +318,7 @@ fn main() -> Result<()> {
                     &conn,
                     &p.slug,
                     &project,
-                    step,
+                    step.as_deref(),
                     step_id.as_deref(),
                     force,
                     &out,
@@ -316,32 +338,32 @@ fn main() -> Result<()> {
                 max_retries,
                 clear_max_retries,
                 change_policy,
-                retry_strategy,
-                clear_retry_strategy,
+                review,
                 tags,
                 clear_tags,
             } => {
                 let p = resolve_plan(&conn, plan, &project, false)?;
                 commands::step_edit(
                     &conn,
-                    &p.slug,
-                    &project,
-                    step,
-                    step_id.as_deref(),
-                    title.as_deref(),
-                    description.as_deref(),
-                    agent.as_deref(),
-                    harness.as_deref(),
-                    model.as_deref(),
-                    &criteria,
-                    clear_criteria,
-                    max_retries,
-                    clear_max_retries,
-                    change_policy,
-                    retry_strategy,
-                    clear_retry_strategy,
-                    &tags,
-                    clear_tags,
+                    commands::StepEditArgs {
+                        plan_slug: &p.slug,
+                        project: &project,
+                        step_sel: step.as_deref(),
+                        step_id: step_id.as_deref(),
+                        title: title.as_deref(),
+                        description: description.as_deref(),
+                        agent: agent.as_deref(),
+                        harness: harness.as_deref(),
+                        model: model.as_deref(),
+                        criteria: &criteria,
+                        clear_criteria,
+                        max_retries,
+                        clear_max_retries,
+                        change_policy,
+                        review: review.map(|r| r.to_override()),
+                        tags: &tags,
+                        clear_tags,
+                    },
                     &out,
                 )
             }
@@ -356,7 +378,7 @@ fn main() -> Result<()> {
                     &conn,
                     &p.slug,
                     &project,
-                    step,
+                    step.as_deref(),
                     step_id.as_deref(),
                     force,
                     &out,
@@ -369,7 +391,15 @@ fn main() -> Result<()> {
                 plan,
             } => {
                 let p = resolve_plan(&conn, plan, &project, false)?;
-                commands::step_move(&conn, &p.slug, &project, step, step_id.as_deref(), to, &out)
+                commands::step_move(
+                    &conn,
+                    &p.slug,
+                    &project,
+                    step.as_deref(),
+                    step_id.as_deref(),
+                    to,
+                    &out,
+                )
             }
             StepCommand::SetHook {
                 step,
@@ -381,12 +411,14 @@ fn main() -> Result<()> {
                 let p = resolve_plan(&conn, plan, &project, false)?;
                 commands::cmd_step_set_hook(
                     &conn,
-                    &p.slug,
-                    &project,
-                    step,
-                    step_id.as_deref(),
-                    lifecycle,
-                    &hook,
+                    commands::StepHookTarget {
+                        plan_slug: &p.slug,
+                        project: &project,
+                        step_sel: step.as_deref(),
+                        step_id: step_id.as_deref(),
+                        lifecycle,
+                        hook_name: &hook,
+                    },
                     &out,
                 )
             }
@@ -400,15 +432,47 @@ fn main() -> Result<()> {
                 let p = resolve_plan(&conn, plan, &project, false)?;
                 commands::cmd_step_unset_hook(
                     &conn,
-                    &p.slug,
-                    &project,
-                    step,
-                    step_id.as_deref(),
-                    lifecycle,
-                    &hook,
+                    commands::StepHookTarget {
+                        plan_slug: &p.slug,
+                        project: &project,
+                        step_sel: step.as_deref(),
+                        step_id: step_id.as_deref(),
+                        lifecycle,
+                        hook_name: &hook,
+                    },
                     &out,
                 )
             }
+            StepCommand::Dependency(dep_cmd) => match dep_cmd {
+                StepDependencyCommand::Add(args) => {
+                    let (step, plan, depends_on) = args.into_parts()?;
+                    let p = resolve_plan(&conn, plan, &project, false)?;
+                    commands::step_dependency_add(
+                        &conn,
+                        &p.slug,
+                        &project,
+                        &step,
+                        &depends_on,
+                        &out,
+                    )
+                }
+                StepDependencyCommand::Remove(args) => {
+                    let (step, plan, depends_on) = args.into_parts()?;
+                    let p = resolve_plan(&conn, plan, &project, false)?;
+                    commands::step_dependency_remove(
+                        &conn,
+                        &p.slug,
+                        &project,
+                        &step,
+                        &depends_on,
+                        &out,
+                    )
+                }
+                StepDependencyCommand::List { step, plan } => {
+                    let p = resolve_plan(&conn, plan, &project, true)?;
+                    commands::step_dependency_list(&conn, &p.slug, &project, &step, &out)
+                }
+            },
         },
 
         // -- Run --
@@ -543,14 +607,24 @@ fn main() -> Result<()> {
             strict,
         } => {
             let h = cli.harness.as_deref();
+            // `--strict` rejects a bundle that would enable review on this
+            // machine when no usable review harness is configured
+            // (docs/dag-redesign.md §13.3). Inherited global review defaults
+            // count too.
+            let review_harness_configured = crate::preflight::review_harness_is_usable(&config);
+            let global_review_enabled = config.review.enabled.unwrap_or(false);
             import::import_plan(
                 &conn,
                 &file,
-                &project,
-                slug.as_deref(),
-                branch.as_deref(),
-                h,
-                strict,
+                &import::ImportOptions {
+                    slug: slug.as_deref(),
+                    branch: branch.as_deref(),
+                    harness: h,
+                    project: &project,
+                    strict,
+                    review_harness_configured,
+                    global_review_enabled,
+                },
             )
         }
 
@@ -587,10 +661,35 @@ fn main() -> Result<()> {
 
         // -- Question --
         Command::Question(subcmd) => match subcmd {
-            QuestionCommand::Ask { question, suggest } => {
+            QuestionCommand::List { plan } => commands::interruption::cmd_interruption_list(
+                &conn,
+                &project,
+                plan.as_deref(),
+                &out,
+            ),
+            QuestionCommand::Answer { id, text } => {
+                commands::interruption::cmd_interruption_resolve(
+                    &conn,
+                    &project,
+                    commands::interruption::ResolveArgs {
+                        plan_slug: None,
+                        selector: &id,
+                        option: None,
+                        answer: Some(&text),
+                        comment: None,
+                        // legacy `question answer` alias: only questions, not blockers
+                        require_question: true,
+                    },
+                    &out,
+                )
+            }
+            QuestionCommand::Ask {
+                question,
+                suggest,
+                priority,
+            } => {
                 use crate::commands::question::{
-                    DISABLED_MESSAGE, NO_ACTIVE_RUN_MESSAGE, QuestionAskOutcome,
-                    record_question_ask,
+                    NO_ACTIVE_RUN_MESSAGE, QuestionAskOutcome, record_question_ask,
                 };
                 use std::io::Read;
 
@@ -608,38 +707,79 @@ fn main() -> Result<()> {
                     }
                 };
 
-                match record_question_ask(&conn, &project, &q, &suggest)? {
+                match record_question_ask(&conn, &project, &q, &suggest, &priority, &out)? {
                     QuestionAskOutcome::NoActiveRun => {
                         eprintln!("{NO_ACTIVE_RUN_MESSAGE}");
-                        std::process::exit(1);
-                    }
-                    QuestionAskOutcome::Disabled => {
-                        eprintln!("{DISABLED_MESSAGE}");
                         std::process::exit(1);
                     }
                     QuestionAskOutcome::Recorded { .. } => Ok(()),
                 }
             }
-            QuestionCommand::List { plan } => {
-                commands::question::cmd_question_list(&conn, &project, plan.as_deref(), &out)
+        },
+
+        // -- Block (raise a blocker interruption) --
+        Command::Block { text } => {
+            use crate::commands::question::{
+                BLOCK_NO_ACTIVE_RUN_MESSAGE, QuestionAskOutcome, record_block,
+            };
+            use std::io::Read;
+
+            let body = match text {
+                Some(t) => t,
+                None => {
+                    let mut buf = String::new();
+                    std::io::stdin()
+                        .read_to_string(&mut buf)
+                        .context("Failed to read blocker text from stdin")?;
+                    buf.trim_end().to_string()
+                }
+            };
+
+            match record_block(&conn, &project, &body, &out)? {
+                QuestionAskOutcome::NoActiveRun => {
+                    eprintln!("{BLOCK_NO_ACTIVE_RUN_MESSAGE}");
+                    std::process::exit(1);
+                }
+                QuestionAskOutcome::Recorded { .. } => Ok(()),
             }
-            QuestionCommand::Answer { num, text } => {
-                use std::io::Read;
-                let answer = match text {
-                    Some(t) => t,
-                    None => {
-                        let mut buf = String::new();
-                        std::io::stdin()
-                            .read_to_string(&mut buf)
-                            .context("Failed to read answer text from stdin")?;
-                        buf.trim_end().to_string()
-                    }
-                };
-                commands::question::cmd_question_answer(&conn, &project, num, &answer, &out)
+        }
+
+        // -- Interruption (human-side list/show/resolve) --
+        Command::Interruption(subcmd) => match subcmd {
+            InterruptionCommand::List { plan } => commands::interruption::cmd_interruption_list(
+                &conn,
+                &project,
+                plan.as_deref(),
+                &out,
+            ),
+            InterruptionCommand::Show { plan, id } => {
+                commands::interruption::cmd_interruption_show(
+                    &conn,
+                    &project,
+                    plan.as_deref(),
+                    &id,
+                    &out,
+                )
             }
-            QuestionCommand::Show { num } => {
-                commands::question::cmd_question_show(&conn, &project, num, &out)
-            }
+            InterruptionCommand::Resolve {
+                plan,
+                id,
+                option,
+                answer,
+                comment,
+            } => commands::interruption::cmd_interruption_resolve(
+                &conn,
+                &project,
+                commands::interruption::ResolveArgs {
+                    plan_slug: plan.as_deref(),
+                    selector: &id,
+                    option,
+                    answer: answer.as_deref(),
+                    comment: comment.as_deref(),
+                    require_question: false,
+                },
+                &out,
+            ),
         },
 
         // -- Agents --
@@ -714,6 +854,15 @@ fn main() -> Result<()> {
             cli::ConfigCommand::SetTimezone { tz } => {
                 commands::config_cmd::config_set_timezone(&tz)
             }
+            cli::ConfigCommand::Review(cli::ConfigReviewCommand::Set {
+                harness,
+                model,
+                enabled,
+            }) => commands::config_cmd::config_review_set(
+                harness.as_deref(),
+                model.as_deref(),
+                enabled,
+            ),
         },
 
         // -- Completions --

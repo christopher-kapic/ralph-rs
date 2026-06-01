@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ralph-rs — DAG TUI mockups (chosen direction)</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161b22; --panel2:#1c2230; --ink:#c9d1d9;
+    --dim:#6e7681; --line:#30363d;
+    --complete:#34d058;   /* green  */
+    --impl:#f7d135;       /* yellow */
+    --review:#3b82f6;     /* blue — the blue-ish we already have */
+    --pend:#f5f7fa;       /* bright white */
+    --fail:#ef4444;       /* red    */
+    --block:#db6d28;      /* orange */
+    --skip:#6e7681;       /* gray   */
+    --cursor:#f7d135;     /* row highlight arrow (= theme CURSOR) */
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:14px/1.5 ui-sans-serif,system-ui,sans-serif}
+  header{padding:20px 28px;border-bottom:1px solid var(--line)}
+  h1{margin:0 0 4px;font-size:18px}
+  header p{margin:0;color:var(--dim);font-size:13px}
+  .tabs{display:flex;flex-wrap:wrap;gap:6px;padding:14px 28px 0}
+  .tabs button{background:var(--panel);color:var(--ink);border:1px solid var(--line);
+    padding:8px 14px;border-radius:7px 7px 0 0;cursor:pointer;font-size:13px}
+  .tabs button.active{background:var(--panel2);border-bottom-color:var(--panel2);
+    color:var(--review);font-weight:600}
+  main{padding:0 28px 60px}
+  .view{display:none}
+  .view.active{display:block}
+  .card{background:var(--panel2);border:1px solid var(--line);border-radius:0 10px 10px 10px;
+    padding:22px;margin-bottom:18px}
+  .term{background:#0b0e13;border:1px solid var(--line);border-radius:8px;
+    padding:16px 18px;white-space:pre;overflow-x:auto;
+    font:13px/1.6 "SF Mono",ui-monospace,"Cascadia Code",Menlo,Consolas,monospace}
+  h2{font-size:15px;margin:4px 0 6px}
+  .lead{color:var(--dim);font-size:13px;margin:0 0 16px;max-width:74ch}
+  .complete{color:var(--complete)} .impl{color:var(--impl)}
+  .review{color:var(--review)} .pend{color:var(--pend)}
+  .fail{color:var(--fail)} .block{color:var(--block)} .skip{color:var(--skip)}
+  .dim{color:var(--dim)} .b{font-weight:700}
+  .cur{background:#1f6feb26}
+  .arrow{color:var(--cursor);font-weight:700}
+  .pc{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:16px}
+  .pc div{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 14px}
+  .pc h3{margin:0 0 6px;font-size:12px;letter-spacing:.05em;text-transform:uppercase;color:var(--dim)}
+  .pc ul{margin:0;padding-left:18px;font-size:13px}
+  .legend{display:flex;flex-wrap:wrap;gap:16px;font-size:12px;padding:12px 28px 0}
+  .legend span{white-space:nowrap}
+  .feedback{margin:8px 28px 40px;padding:16px 20px;background:#13241a;
+    border:1px solid #1f6f3c;border-radius:8px;color:#aee0bf;font-size:13px;max-width:84ch}
+  code{background:#0b0e13;padding:1px 5px;border-radius:4px;font-size:12px}
+  .tag{display:inline-block;font-size:11px;border:1px solid #1f6f3c;color:#7fd99b;
+    border-radius:999px;padding:1px 9px;margin-left:8px;vertical-align:middle}
+</style>
+</head>
+<body>
+<header>
+  <h1>ralph-rs — DAG TUI <span class="tag">chosen direction</span></h1>
+  <p>Outline view selected. All §12 decisions locked. Companion to <code>docs/dag-redesign.md §12</code>.</p>
+</header>
+
+<div class="legend">
+  <span class="complete">✓ complete · green</span>
+  <span class="impl">● implementing · yellow</span>
+  <span class="review">◐ reviewing · blue</span>
+  <span class="pend">○ waiting-for-turn · white</span>
+  <span class="fail">✗ failed / review-failed · red</span>
+  <span class="block">⊘ blocked (question or blocker) · orange</span>
+  <span class="skip">– skipped · gray</span>
+  <span class="arrow">→ cursor</span>
+</div>
+
+<div class="tabs">
+  <button data-t="o" class="active">A · Outline (chosen)</button>
+  <button data-t="f">A · Focused (re-root)</button>
+  <button data-t="i">Inbox (run-through)</button>
+  <button data-t="m">Answer modal</button>
+  <button data-t="x">Rejected alternates</button>
+</div>
+
+<main>
+
+<!-- ============ A: OUTLINE ============ -->
+<section class="view active" id="o">
+<div class="card">
+  <h2>Outline — primary <code>plan_detail</code> view</h2>
+  <p class="lead">Topologically ordered, indented by depth. A join step lists every dependency by short id inline. <code>z</code> re-roots at the cursor step (next tab). <code>i</code> opens the inbox with an open-count badge. Status color is the step glyph + title; the cursor is a row highlight + a yellow <span class="arrow">→</span> (kept distinct from implementing-yellow because it's a row treatment, not a text recolor).</p>
+<div class="term">┌─ Plan: <span class="b">add-oauth-login</span>  ·  branch feat/oauth  ·  7 steps  ·  <span class="block">1 blocked</span>  <span class="review">1 in review</span> ─┐
+
+ <span class="complete">✓ a1f3</span>  Scaffold auth module                     <span class="dim">review ✓   root</span>
+ │
+ ├─<span class="fail">✗ b2e7</span>  Users + sessions schema                <span class="fail">review ✗</span> <span class="dim">→ spawned r8k2</span>
+ │  └─<span class="impl">● r8k2</span>  ↳ Fix nullable session token        <span class="dim">corrects b2e7 · attempt 2</span>
+ │
+ ├─<span class="review">◐ c9d4</span>  OAuth provider client                  <span class="review">review in-flight (codex)</span>
+ │
+ └─<span class="block">⊘ d5a8</span>  Login UI form                          <span class="block">BLOCKED · question</span>
+
+<span class="arrow">→</span><span class="cur"> <span class="pend">○ e3b1</span>  Session middleware                     <span class="dim">deps: b2e7, r8k2</span>          </span>
+
+  <span class="pend">○ f7c2</span>  Wire end-to-end login flow             <span class="dim">join · deps: c9d4, d5a8, e3b1</span>
+
+└─ <span class="dim">j/k move · l open · z focus · a add · D deps · i inbox(1) · ? help</span> ──────┘</div>
+  <div class="pc">
+    <div><h3>Strengths</h3><ul><li>No layout engine; scrolls; diff-friendly</li><li>Depth = indentation reads instantly</li><li>Color tells state at a glance across branches</li><li>Closest to today's list — low relearn</li></ul></div>
+    <div><h3>Notes</h3><ul><li>Join steps appear once; fan-in is the textual <code>deps:</code> list</li><li><span class="fail">✗ b2e7</span> = review-failed: step is structurally complete but coloured red as the "problem" state; its fix <span class="impl">r8k2</span> is the live work</li></ul></div>
+  </div>
+</div>
+</section>
+
+<!-- ============ A FOCUSED ============ -->
+<section class="view" id="f">
+<div class="card">
+  <h2>Focused — re-root at a subtask (<code>z</code> on a step)</h2>
+  <p class="lead">Re-roots the outline at the cursor step and shows only that step and its transitive <b>dependents</b> (downstream cone); unrelated branches hide. Breadcrumb chrome shows the focus path; <code>Z</code>/<code>Esc</code> pops back toward the true root. Pure view transform — the scheduler still spans the whole DAG. (Here: focused on <span class="b">b2e7</span>.)</p>
+<div class="term"><span class="dim">add-oauth-login</span> › <span class="b">focus: b2e7</span>                       <span class="dim">Z back to root</span>
+┌────────────────────────────────────────────────────────────┐
+
+ <span class="fail">✗ b2e7</span>  Users + sessions schema                <span class="fail">review ✗</span> <span class="dim">(focus root)</span>
+ └─<span class="impl">● r8k2</span>  ↳ Fix nullable session token          <span class="dim">corrects b2e7 · attempt 2</span>
+    └─<span class="pend">○ e3b1</span>  Session middleware                  <span class="dim">deps: b2e7, r8k2</span>
+       └─<span class="pend">○ f7c2</span>  Wire end-to-end login flow       <span class="dim">join · deps: c9d4, d5a8, e3b1</span>
+
+ <span class="dim">hidden (unrelated): a1f3 · c9d4 · d5a8</span>
+
+└─ <span class="dim">j/k move · l open · Z/Esc back to root · i inbox(1) · ? help</span> ─────┘</div>
+  <div class="pc">
+    <div><h3>Strengths</h3><ul><li>Cuts a wide plan down to the branch you care about</li><li>Breadcrumb keeps "where am I" obvious; cheap nesting</li><li>Doesn't perturb scheduling — safe to use mid-run</li></ul></div>
+    <div><h3>Locked</h3><ul><li><b>Downstream</b> dependents cone (confirmed). Upstream context rides the breadcrumb, not the body — no second mode.</li><li>Hidden-count footer kept for orientation.</li></ul></div>
+  </div>
+</div>
+</section>
+
+<!-- ============ INBOX ============ -->
+<section class="view" id="i">
+<div class="card">
+  <h2>Interruptions inbox (<code>View::Inbox</code>) — run-through answering</h2>
+  <p class="lead">Every open question/blocker across all branches, decoupled from DAG navigation. Submitting an answer <b>auto-advances to the next open one</b> so you clear the whole queue in a single pass — the actual human-in-the-loop efficiency win. Resolved items stay (dimmed) for context; other branches keep running while you work the queue.</p>
+<div class="term">┌─ Interruptions · <span class="b">add-oauth-login</span> · <span class="block">1 open</span> · <span class="dim">2 resolved</span> · run-through 1/1 ─┐
+
+<span class="arrow">→</span><span class="cur"> <span class="block">⊘ QUESTION</span>  step <span class="b">d5a8</span> · Login UI form · attempt 1          </span>
+<span class="cur">   Which OAuth providers must launch with? The plan says      </span>
+<span class="cur">   "social login" but not which set.                          </span>
+<span class="cur">   proposed:  <span class="complete">1</span> Google + GitHub   <span class="dim">2</span> Google only          </span>
+<span class="cur">              <span class="dim">3</span> Google + GitHub + Microsoft                     </span>
+
+   <span class="dim">✓ BLOCKER   step c9d4 · resolved 4m ago</span>
+   <span class="dim">  "needs OAUTH_TEST_CLIENT_SECRET" → resolved w/ comment</span>
+
+   <span class="dim">✓ QUESTION  step b2e7 · resolved 12m ago</span>
+   <span class="dim">  token column type → chose option 2 (TEXT, nullable)</span>
+
+└─ <span class="dim">⏎ answer (→ next open) · r resolve blocker · Esc exit · c9d4 still running</span> ─┘</div>
+  <div class="pc">
+    <div><h3>Strengths</h3><ul><li>One queue for all human debt → batch the bottleneck</li><li>Auto-advance = answer several in a row, no list bouncing</li><li>Footer reassures: branches keep moving while you answer</li></ul></div>
+    <div><h3>Locked</h3><ul><li>Own <code>View::Inbox</code> (confirmed), not a plan-detail pane.</li><li>Run-through iterates open items; resolved shown dimmed for context.</li></ul></div>
+  </div>
+</div>
+</section>
+
+<!-- ============ MODAL ============ -->
+<section class="view" id="m">
+<div class="card">
+  <h2>Answer modal — ranked proposals + comment + freeform</h2>
+  <p class="lead">Opened from the inbox or a blocked step. Proposed answers in priority order (agent's #1 pre-selected). Pick one and/or add a comment, or drop to freeform. Blocker variant has no options — just resolve / resolve-with-comment. Chosen answer + comment both flow into the <em>bounded</em> resolution injection (redesign §8).</p>
+<div class="term">       ┌───────────── Answer · step <span class="b">d5a8</span> ─────────────┐
+       │ <span class="dim">Q:</span> Which OAuth providers must launch with?       │
+       │                                                  │
+       │  <span class="complete">●</span> <span class="cur">1  Google + GitHub            </span><span class="dim">agent's pick</span>  │
+       │  <span class="dim">○</span> 2  Google only                              │
+       │  <span class="dim">○</span> 3  Google + GitHub + Microsoft              │
+       │  <span class="dim">○</span> <span class="b">f</span>  ✎ type a freeform answer…                │
+       │                                                  │
+       │ <span class="dim">comment (optional, injected next attempt):</span>       │
+       │ ┌────────────────────────────────────────────┐ │
+       │ │ also gate Microsoft behind a feature flag    │ │
+       │ └────────────────────────────────────────────┘ │
+       │                                                  │
+       │  <span class="dim">j/k pick · e edit comment · ⏎ submit · Esc cancel</span> │
+       └──────────────────────────────────────────────────┘
+  <span class="dim">on submit: d5a8 → waiting-for-turn; resolution + comment injected next attempt</span></div>
+  <div class="pc">
+    <div><h3>Strengths</h3><ul><li>Priority order guides without forcing the human</li><li>Comment + chosen option both injected (bounded — §8)</li><li>Extends existing <code>answer_modal.rs</code></li></ul></div>
+    <div><h3>Locked</h3><ul><li>No "let the agent decide" row — resolving a question needs an explicit answer/freeform (the agent asked because it lacked confidence). Abandoning a step is <code>ralph skip</code>, separate.</li><li>Question vs. blocker = two layouts to maintain</li></ul></div>
+  </div>
+</div>
+</section>
+
+<!-- ============ REJECTED ============ -->
+<section class="view" id="x">
+<div class="card">
+  <h2>Rejected alternates (kept for the record)</h2>
+  <p class="lead">Not building these. Swimlanes and the connector graph were evaluated; the outline won on render cost, edit ergonomics, and similarity to today's view. Recorded so the trade-off isn't relitigated later.</p>
+<div class="term"><span class="b">B · Swimlanes</span>  one column per independent branch
+  ─ visually sells parallelism, but lane width/wrap is fiddly,
+    breaks past ~4 lanes, and join steps belong to no lane.
+
+<span class="b">C · Connector graph</span>  drawn ASCII edges, true fan-in
+  ─ best whole-plan mental model, but edge routing is a project
+    in itself and it's poor for cursoring/editing.
+
+  <span class="dim">If a future need arises, C could return as a read-only `g` overview.</span></div>
+</div>
+</section>
+
+</main>
+
+<div class="feedback">
+  <b>All decisions locked.</b>
+  Focus = downstream dependents cone (breadcrumb carries the upstream context).
+  Inbox = its own <code>View::Inbox</code> with run-through answering.
+  No "let the agent decide" shortcut — questions need an explicit answer.
+  Colors (TUI-wide): <span class="complete">complete green</span> (unchanged),
+  <span class="impl">implementing yellow</span>,
+  <span class="review">reviewing blue #3b82f6</span> (freed by complete staying green),
+  <span class="pend">waiting white</span>,
+  <span class="fail">failed red</span>,
+  <span class="block">blocked orange #db6d28</span>.
+  Ready to break into a ralph plan per redesign §15.
+</div>
+
+<script>
+  const tabs=document.querySelectorAll('.tabs button');
+  const views=document.querySelectorAll('.view');
+  tabs.forEach(b=>b.onclick=()=>{
+    tabs.forEach(x=>x.classList.remove('active'));
+    views.forEach(v=>v.classList.remove('active'));
+    b.classList.add('active');
+    document.getElementById(b.dataset.t).classList.add('active');
+  });
+</script>
+</body>
+</html>

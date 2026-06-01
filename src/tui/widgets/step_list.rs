@@ -34,21 +34,30 @@ pub fn status_glyph(status: StepStatus) -> &'static str {
         StepStatus::Failed => "✘",
         StepStatus::Skipped => "⊘",
         StepStatus::Aborted => "⊘",
+        // §3.3 derived overlay (open interruption — question or blocker).
+        StepStatus::Blocked => "?",
     }
 }
 
-/// Foreground color for a row given its step status. Used by both the row
-/// styler here and the right-pane status line in plan-detail so the two
-/// stay aligned.
+/// Foreground color for a row given its step status. Delegates to the
+/// single TUI-wide §12.5 mapping ([`theme::step_status_color`]) so the row
+/// styler here, the right-pane status line in plan-detail, the DAG glyph,
+/// and the plan-list dot can never drift apart (docs/dag-redesign.md §12.5
+/// "one state, one color, TUI-wide").
 fn status_fg(status: StepStatus) -> Color {
-    match status {
-        StepStatus::Complete => theme::STATUS_COMPLETE,
-        StepStatus::InProgress => theme::STATUS_IN_PROGRESS,
-        StepStatus::Failed => theme::STATUS_FAILED,
-        StepStatus::Skipped => theme::CHROME_DIM,
-        StepStatus::Aborted => theme::STATUS_FAILED,
-        StepStatus::Pending => theme::STATUS_PENDING,
-    }
+    theme::step_status_color(status)
+}
+
+/// The presentational inputs to [`render`] besides the `frame` / `area` /
+/// `list_state` rendering handles: the `steps`, the `[N]`-badge `selection`,
+/// the optional `cursor_index`, the `active_run` flag, and the bordered block
+/// `title`.
+pub struct RenderSteps<'a> {
+    pub steps: &'a [Step],
+    pub selection: &'a Selection<String>,
+    pub cursor_index: Option<usize>,
+    pub active_run: bool,
+    pub title: &'a str,
 }
 
 /// Render the compact step list into `area`.
@@ -62,17 +71,14 @@ fn status_fg(status: StepStatus) -> Color {
 /// - `list_state`: carries the viewport offset across frames. Callers
 ///   should keep one `ListState` per logical list so scroll position
 ///   survives re-renders.
-#[allow(clippy::too_many_arguments)]
-pub fn render(
-    frame: &mut Frame,
-    area: Rect,
-    steps: &[Step],
-    selection: &Selection<String>,
-    cursor_index: Option<usize>,
-    active_run: bool,
-    title: &str,
-    list_state: &mut ListState,
-) {
+pub fn render(frame: &mut Frame, area: Rect, args: RenderSteps<'_>, list_state: &mut ListState) {
+    let RenderSteps {
+        steps,
+        selection,
+        cursor_index,
+        active_run,
+        title,
+    } = args;
     let items: Vec<ListItem> = steps
         .iter()
         .enumerate()
@@ -134,6 +140,7 @@ mod tests {
     fn make_step(idx: usize, title: &str, status: StepStatus) -> Step {
         Step {
             id: format!("s{idx}"),
+            short_id: String::new(),
             plan_id: "p1".to_string(),
             sort_key: format!("a{idx}"),
             title: title.to_string(),
@@ -150,7 +157,9 @@ mod tests {
             skipped_reason: None,
             change_policy: ChangePolicy::Required,
             tags: vec![],
-            retry_strategy: None,
+            review_enabled: None,
+            review_status: None,
+            corrects_step_id: None,
         }
     }
 
@@ -172,11 +181,13 @@ mod tests {
                 render(
                     frame,
                     area,
-                    steps,
-                    selection,
-                    cursor_index,
-                    active_run,
-                    title,
+                    RenderSteps {
+                        steps,
+                        selection,
+                        cursor_index,
+                        active_run,
+                        title,
+                    },
                     &mut list_state,
                 );
             })

@@ -11,4 +11,7 @@ pub enum View {
     ArchivedList,
     PlanDetail,
     StepDetail,
+    /// Cross-branch interruptions inbox (docs/dag-redesign.md §12.3) —
+    /// decoupled from DAG navigation, reachable from anywhere.
+    Inbox,
 }

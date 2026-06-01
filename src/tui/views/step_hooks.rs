@@ -1098,28 +1098,32 @@ mod tests {
     ) -> (String, String) {
         let plan_id = storage::create_plan(
             conn,
-            slug,
-            project,
-            &format!("br-{slug}"),
-            "d",
-            None,
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug,
+                project,
+                branch_name: &format!("br-{slug}"),
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .expect("create_plan")
         .id;
         let (step, _) = storage::create_step(
             conn,
             &plan_id,
-            "Step",
-            "",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .expect("create_step");
         (plan_id, step.id)

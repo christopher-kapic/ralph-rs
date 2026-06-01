@@ -47,14 +47,16 @@ pub enum InputAction {
     /// The user pressed `enter` / `→` / `l` to open the step-detail view for
     /// the step under the cursor (TUI-plan.md §7).
     OpenStepDetail(String),
-    /// The user pressed `Q` to flip the plan's `questions_enabled` column
-    /// (TUI-plan.md §17 'Toggle surfaces').
-    ToggleQuestionsEnabled,
     /// The user pressed `P` while a run is live to toggle the operator's
     /// graceful-pause request. The dispatcher flips `plans.pause_requested`
     /// — first press sets it (runner stops after the current step), second
     /// press clears it (cancels the request before the boundary fires).
     TogglePauseRequested,
+    /// The user pressed `I` (Shift-i) to open the cross-branch interruptions
+    /// inbox — docs/dag-redesign.md §12.3. (Lowercase `i` is insert-above, so
+    /// the inbox deliberately uses `I`.) Reachable from anywhere; the
+    /// dispatcher pushes `View::Inbox` via `run_inbox_tui`.
+    OpenInbox,
 }
 
 /// True when J/K should scroll the live-run tails (TUI-plan.md §13) instead
@@ -85,17 +87,28 @@ fn handle_normal_mode(app: &mut PlanDetailApp, key: KeyEvent) -> InputAction {
     // reason about its own edit-vs-non-edit classification.
     let locked = app.read_only.is_locked();
 
-    match key.code {
-        // Navigation
-        KeyCode::Char('j') | KeyCode::Down => {
-            app.navigate_down();
-            InputAction::None
+    // docs/dag-redesign.md §12.1/§12.2: the dependency outline owns
+    // navigation (`j`/`k`), focus/re-root (`z`/`Z`, and `Esc` *only* while
+    // focused), and step-open (`enter`/`l`/`→`). Consult it first; on
+    // `Handled` we realign the flat-list `selected_index` so the existing
+    // cursor-target helpers (skip/reset/delete) stay correct. `Passthrough`
+    // falls through to the edit / run / sub-view bindings below, preserving
+    // every pre-existing keybinding (no script/muscle-memory regression).
+    {
+        use crate::tui::views::outline_view::OutlineOutcome;
+        match app.outline.handle_key(key) {
+            OutlineOutcome::Handled => {
+                app.realign_selection_to_outline();
+                return InputAction::None;
+            }
+            OutlineOutcome::OpenStep(id) => {
+                return InputAction::OpenStepDetail(id);
+            }
+            OutlineOutcome::Passthrough => {}
         }
-        KeyCode::Char('k') | KeyCode::Up => {
-            app.navigate_up();
-            InputAction::None
-        }
+    }
 
+    match key.code {
         // Multi-select
         KeyCode::Char(' ') => {
             app.toggle_selection();
@@ -198,10 +211,15 @@ fn handle_normal_mode(app: &mut PlanDetailApp, key: KeyEvent) -> InputAction {
             None => InputAction::None,
         },
 
-        // Flip `plans.questions_enabled` for this plan (TUI-plan.md §17
-        // 'Toggle surfaces'). Mirrors plan-list's Q binding. Edit — suppressed
-        // when locked.
-        KeyCode::Char('Q') if !locked => InputAction::ToggleQuestionsEnabled,
+        // Open the cross-branch interruptions inbox (docs/dag-redesign.md
+        // §12.3). The spec's canonical key is `i`, but plan-detail's `i`
+        // already inserts a step above the cursor (a documented, tested,
+        // muscle-memory binding the redesign explicitly must not regress —
+        // §13.1 "no script regressions"); the inbox is therefore bound to
+        // `I` (Shift-i) here and in plan-list, where lowercase `i` likewise
+        // already creates a plan. Read-only navigation, allowed while
+        // locked.
+        KeyCode::Char('I') => InputAction::OpenInbox,
 
         // Graceful pause: toggle `plans.pause_requested` while a run is live.
         // The runner reads + clears the flag between step boundaries, so the
@@ -212,11 +230,20 @@ fn handle_normal_mode(app: &mut PlanDetailApp, key: KeyEvent) -> InputAction {
 
         // Open step detail for the highlighted step (TUI-plan.md §7).
         // Read-only navigation, so allowed even while locked.
+        //
+        // This arm only runs when the outline handler above returned
+        // `Passthrough` — i.e. there is no selected visible row (empty
+        // outline / empty focus cone). Resolve the target through the
+        // OUTLINE's selected visible row, never `self.steps[selected_index]`:
+        // under focus/re-root the visible set is a strict subset, so the flat
+        // index can point at a step OUTSIDE the cone and open the wrong step
+        // (docs/dag-redesign.md §12.1/§12.2 — keyboard + mouse must both
+        // resolve through `outline.visible_rows()`). No selected visible row
+        // ⇒ no-op, not an arbitrary flat-vec step.
         KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-            if app.steps.is_empty() {
-                InputAction::None
-            } else {
-                InputAction::OpenStepDetail(app.steps[app.selected_index].id.clone())
+            match app.outline.selected_step_id() {
+                Some(id) => InputAction::OpenStepDetail(id),
+                None => InputAction::None,
             }
         }
 
@@ -314,17 +341,18 @@ mod tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
-            retry_strategy: None,
+            review_enabled: None,
+            max_review_corrections: None,
         };
         let steps: Vec<Step> = (0..n)
             .map(|i| Step {
                 id: format!("s{i}"),
+                short_id: String::new(),
                 plan_id: "p1".to_string(),
                 sort_key: format!("a{i}"),
                 title: format!("Step {}", i + 1),
@@ -345,7 +373,9 @@ mod tests {
                 skipped_reason: None,
                 change_policy: crate::plan::ChangePolicy::Required,
                 tags: vec![],
-                retry_strategy: None,
+                review_enabled: None,
+                review_status: None,
+                corrects_step_id: None,
             })
             .collect();
         PlanDetailApp::new(plan, steps, &Config::default())
@@ -357,6 +387,20 @@ mod tests {
 
     fn key_with_mod(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
+    }
+
+    /// Position the cursor on step index `idx`. docs/dag-redesign.md §12.1
+    /// moved cursor ownership from the flat `selected_index` to the
+    /// dependency outline (`OutlineState::cursor`), so tests must drive the
+    /// cursor through the outline (the new source of truth) rather than
+    /// poking `selected_index` directly — `realign_selection_to_outline`
+    /// then mirrors it back onto `selected_index` for the cursor-target
+    /// helpers. Steps in `make_app` have empty `short_id` + ascending
+    /// `sort_key`, so the outline order == construction order == `idx`.
+    fn cursor_to(app: &mut PlanDetailApp, idx: usize) {
+        for _ in 0..idx {
+            handle_key(app, key(KeyCode::Char('j')));
+        }
     }
 
     // -- Normal mode tests --
@@ -373,7 +417,7 @@ mod tests {
     #[test]
     fn test_k_navigates_up() {
         let mut app = make_app(3);
-        app.selected_index = 2;
+        cursor_to(&mut app, 2);
         let action = handle_key(&mut app, key(KeyCode::Char('k')));
         assert_eq!(action, InputAction::None);
         assert_eq!(app.selected_index, 1);
@@ -390,7 +434,7 @@ mod tests {
     #[test]
     fn test_up_arrow_navigates_up() {
         let mut app = make_app(3);
-        app.selected_index = 1;
+        cursor_to(&mut app, 1);
         let action = handle_key(&mut app, key(KeyCode::Up));
         assert_eq!(action, InputAction::None);
         assert_eq!(app.selected_index, 0);
@@ -424,7 +468,10 @@ mod tests {
     #[test]
     fn test_d_returns_delete_with_cursor_target() {
         let mut app = make_app(3);
-        app.selected_index = 2;
+        // Drive the outline cursor (the source of truth the cursor-target
+        // helpers resolve through), mirroring the real input path.
+        app.outline.set_cursor(2);
+        app.realign_selection_to_outline();
         let action = handle_key(&mut app, key(KeyCode::Char('d')));
         assert_eq!(action, InputAction::Delete(vec!["s2".to_string()]));
     }
@@ -453,7 +500,8 @@ mod tests {
     #[test]
     fn test_r_returns_reset_for_cursor_step() {
         let mut app = make_app(3);
-        app.selected_index = 1;
+        app.outline.set_cursor(1);
+        app.realign_selection_to_outline();
         let action = handle_key(&mut app, key(KeyCode::Char('r')));
         assert_eq!(action, InputAction::Reset("s1".to_string()));
     }
@@ -520,13 +568,6 @@ mod tests {
     }
 
     #[test]
-    fn test_shift_q_emits_toggle_questions_enabled() {
-        let mut app = make_app(3);
-        let action = handle_key(&mut app, key(KeyCode::Char('Q')));
-        assert_eq!(action, InputAction::ToggleQuestionsEnabled);
-    }
-
-    #[test]
     fn test_shift_p_emits_toggle_pause_when_run_live() {
         // P is gated on `is_run_live()`, which is true once a subscription
         // is wired (TUI-spawned runner) or a LiveRun row is observed.
@@ -547,14 +588,6 @@ mod tests {
     }
 
     #[test]
-    fn test_locked_suppresses_shift_q_toggle_questions() {
-        let mut app = make_app(3);
-        lock_app(&mut app);
-        let action = handle_key(&mut app, key(KeyCode::Char('Q')));
-        assert_eq!(action, InputAction::None);
-    }
-
-    #[test]
     fn test_shift_d_emits_open_dependencies_action() {
         let mut app = make_app(3);
         let action = handle_key(&mut app, key(KeyCode::Char('D')));
@@ -571,7 +604,7 @@ mod tests {
     #[test]
     fn test_enter_emits_open_step_detail_for_cursor() {
         let mut app = make_app(3);
-        app.selected_index = 1;
+        cursor_to(&mut app, 1);
         let action = handle_key(&mut app, key(KeyCode::Enter));
         assert_eq!(action, InputAction::OpenStepDetail("s1".to_string()));
     }
@@ -579,7 +612,7 @@ mod tests {
     #[test]
     fn test_right_arrow_emits_open_step_detail() {
         let mut app = make_app(3);
-        app.selected_index = 2;
+        cursor_to(&mut app, 2);
         let action = handle_key(&mut app, key(KeyCode::Right));
         assert_eq!(action, InputAction::OpenStepDetail("s2".to_string()));
     }
@@ -596,6 +629,61 @@ mod tests {
         let mut app = make_app(0);
         let action = handle_key(&mut app, key(KeyCode::Enter));
         assert_eq!(action, InputAction::None);
+    }
+
+    /// FIX B: Enter/`l`/`→` must resolve the target through the outline's
+    /// selected VISIBLE row, never `self.steps[self.selected_index]`. Under a
+    /// focus cone the visible set is a strict subset, so a stale flat
+    /// `selected_index` could point at a step outside the cone — pressing
+    /// Enter must open the cone-selected step, not the flat-vec step.
+    #[test]
+    fn test_enter_resolves_through_outline_under_focus_not_flat_index() {
+        use std::collections::{HashMap, HashSet};
+
+        // Build a real DAG: s0 → s1 → s2 (s1 deps s0, s2 deps s1).
+        let mut app = make_app(3);
+        let mut deps: HashMap<String, Vec<String>> = HashMap::new();
+        deps.insert("s1".to_string(), vec!["s0".to_string()]);
+        deps.insert("s2".to_string(), vec!["s1".to_string()]);
+        app.outline.sync(app.steps.clone(), deps, HashSet::new());
+
+        // Cursor on s1, then focus → cone = {s1, s2}; s0 is OUT of the cone.
+        app.outline.set_cursor(1);
+        assert!(app.outline.focus_cursor());
+        assert_eq!(app.outline.selected_step_id().as_deref(), Some("s1"));
+
+        // Poke the flat index to the out-of-cone step (the stale-desync the
+        // old fallthrough would have opened).
+        app.selected_index = 0;
+
+        let action = handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(
+            action,
+            InputAction::OpenStepDetail("s1".to_string()),
+            "Enter must open the outline-selected cone step, not steps[selected_index]"
+        );
+    }
+
+    /// FIX B: with no selected visible row (empty outline), Enter is a no-op
+    /// even when `selected_index` is non-zero — it must NOT open an arbitrary
+    /// flat-vec step.
+    #[test]
+    fn test_enter_noop_when_no_visible_row_even_with_stale_flat_index() {
+        use std::collections::{HashMap, HashSet};
+
+        let mut app = make_app(3);
+        // Empty the outline's visible set (no steps) while leaving the flat
+        // `selected_index` pointing into the stale `self.steps` vec.
+        app.outline.sync(Vec::new(), HashMap::new(), HashSet::new());
+        app.selected_index = 2;
+        assert!(app.outline.selected_step_id().is_none());
+
+        let action = handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(
+            action,
+            InputAction::None,
+            "no visible row ⇒ no-op, not steps[selected_index]"
+        );
     }
 
     #[test]

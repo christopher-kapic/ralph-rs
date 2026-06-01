@@ -524,6 +524,21 @@ pub(crate) fn is_binary_available(binary: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// True when the configured global review harness exists, is defined in
+/// `config.harnesses`, and its command is on PATH. Shared by `doctor` and
+/// strict import so the two surfaces cannot drift on what counts as
+/// "review-capable on this machine".
+pub(crate) fn review_harness_is_usable(config: &Config) -> bool {
+    let name = config.review.harness.trim();
+    if name.is_empty() {
+        return false;
+    }
+    match config.harnesses.get(name) {
+        Some(hc) => is_binary_available(&hc.command),
+        None => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Doctor checks
 // ---------------------------------------------------------------------------
@@ -543,14 +558,17 @@ pub fn run_doctor_checks(config: &Config, workdir: &Path) -> Vec<CheckResult> {
         message: "configuration loaded successfully".to_string(),
     });
 
-    // 2. Database check
-    match crate::db::open() {
-        Ok(_) => {
+    // 2. Database check. Keep the opened connection so the review-harness
+    //    check (step 7) can probe for review-enabled plans/steps without a
+    //    second open.
+    let db_conn = match crate::db::open() {
+        Ok(conn) => {
             checks.push(CheckResult {
                 name: "database".to_string(),
                 severity: CheckSeverity::Pass,
                 message: "database opens and migrations applied".to_string(),
             });
+            Some(conn)
         }
         Err(e) => {
             checks.push(CheckResult {
@@ -558,8 +576,9 @@ pub fn run_doctor_checks(config: &Config, workdir: &Path) -> Vec<CheckResult> {
                 severity: CheckSeverity::Error,
                 message: format!("database error: {e}"),
             });
+            None
         }
-    }
+    };
 
     // 3. Check each configured harness binary, plus its args for known
     //    foot-guns (codex without --sandbox, claude -p without
@@ -650,7 +669,73 @@ pub fn run_doctor_checks(config: &Config, workdir: &Path) -> Vec<CheckResult> {
     //    user may have deliberately replaced it.
     checks.push(check_global_prompt(config));
 
+    // 7. Review-harness sanity (STEP 44 / docs/dag-redesign.md §13.3).
+    //    If review is turned on for ANY plan/step but no usable review
+    //    harness is configured, surface it — NON-FATAL (same severity/shape
+    //    as the global-prompt check; doctor still exits success). Skipped
+    //    silently when the DB didn't open (that failure is already a
+    //    standalone Error check above) or when review is on nowhere.
+    if let Some(conn) = &db_conn {
+        match crate::storage::any_review_enabled(conn, config.review.enabled.unwrap_or(false)) {
+            Ok(true) => checks.push(check_review_harness(config)),
+            Ok(false) => {}
+            Err(e) => checks.push(CheckResult {
+                name: "review-harness".to_string(),
+                severity: CheckSeverity::Warning,
+                message: format!("could not check review configuration: {e}"),
+            }),
+        }
+    }
+
     checks
+}
+
+/// Verify a usable review harness is configured, given that review is
+/// effective-enabled somewhere (the caller gates on
+/// [`crate::storage::any_review_enabled`]).
+///
+/// Mirrors [`check_global_prompt`] exactly: pure, unit-testable without a
+/// terminal, and always `Pass` or `Warning` — **never** `Error` — so
+/// `ralph doctor` keeps exiting success. Three cases:
+/// - no review harness named in `config.review.harness` ⇒ Warning;
+/// - a harness named but absent from `config.harnesses` ⇒ Warning;
+/// - a harness named + defined but its `command` is off PATH ⇒ Warning;
+/// - otherwise ⇒ Pass.
+pub(crate) fn check_review_harness(config: &Config) -> CheckResult {
+    let name = config.review.harness.trim();
+    if name.is_empty() {
+        return CheckResult {
+            name: "review-harness".to_string(),
+            severity: CheckSeverity::Warning,
+            message: "review is enabled for a plan/step but no review harness is configured \
+                      (set one via `ralph config review set --harness <name>`)"
+                .to_string(),
+        };
+    }
+    match config.harnesses.get(name) {
+        None => CheckResult {
+            name: "review-harness".to_string(),
+            severity: CheckSeverity::Warning,
+            message: format!(
+                "review harness `{name}` is not defined in config.json \
+                 (define it under `harnesses`, or pick another via \
+                 `ralph config review set --harness <name>`)"
+            ),
+        },
+        Some(hc) if !is_binary_available(&hc.command) => CheckResult {
+            name: "review-harness".to_string(),
+            severity: CheckSeverity::Warning,
+            message: format!(
+                "review harness `{name}` command `{}` not found in PATH",
+                hc.command
+            ),
+        },
+        Some(_) => CheckResult {
+            name: "review-harness".to_string(),
+            severity: CheckSeverity::Pass,
+            message: format!("review harness `{name}` configured and on PATH"),
+        },
+    }
 }
 
 /// Verify the global prompt still carries ralph's CLI-hints marker.
@@ -946,6 +1031,7 @@ mod tests {
             min_free_disk_mb: 1024,
             display_timezone: "UTC".to_string(),
             harness_chunk_max_bytes: 4096,
+            review: crate::config::ReviewConfig::default(),
             harnesses,
         };
         let now = chrono::Utc::now();
@@ -962,13 +1048,13 @@ mod tests {
             plan_harness: None,
             created_at: now,
             updated_at: now,
-            questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
-            retry_strategy: None,
+            review_enabled: None,
+            max_review_corrections: None,
         };
         let results = run_preflight_checks(&plan, &[], &config, tmp.path()).unwrap();
         let auth = results
@@ -1005,6 +1091,7 @@ mod tests {
         let now = chrono::Utc::now();
         Step {
             id: "id".to_string(),
+            short_id: String::new(),
             plan_id: "plan".to_string(),
             sort_key: "0".to_string(),
             title: title.to_string(),
@@ -1021,7 +1108,9 @@ mod tests {
             skipped_reason: None,
             change_policy: crate::plan::ChangePolicy::Required,
             tags: vec![],
-            retry_strategy: None,
+            review_enabled: None,
+            review_status: None,
+            corrects_step_id: None,
         }
     }
 
@@ -1144,6 +1233,7 @@ mod tests {
             min_free_disk_mb: 1024,
             display_timezone: "UTC".to_string(),
             harness_chunk_max_bytes: 4096,
+            review: crate::config::ReviewConfig::default(),
             harnesses: HashMap::new(),
         };
         let tmp = tempfile::tempdir().unwrap();
@@ -1179,6 +1269,7 @@ mod tests {
             min_free_disk_mb: 1024,
             display_timezone: "UTC".to_string(),
             harness_chunk_max_bytes: 4096,
+            review: crate::config::ReviewConfig::default(),
             harnesses,
         };
         let tmp = tempfile::tempdir().unwrap();
@@ -1238,6 +1329,7 @@ mod tests {
             min_free_disk_mb: 1024,
             display_timezone: "UTC".to_string(),
             harness_chunk_max_bytes: 4096,
+            review: crate::config::ReviewConfig::default(),
             harnesses,
         };
         let tmp = tempfile::tempdir().unwrap();
@@ -1340,6 +1432,7 @@ mod tests {
             min_free_disk_mb: 1024,
             display_timezone: "UTC".to_string(),
             harness_chunk_max_bytes: 4096,
+            review: crate::config::ReviewConfig::default(),
             harnesses: HashMap::new(),
         }
     }
@@ -1409,6 +1502,129 @@ mod tests {
             .find(|c| c.name == "global-prompt")
             .expect("global-prompt check must be present");
         assert_eq!(gp.severity, CheckSeverity::Pass);
+    }
+
+    // -----------------------------------------------------------------
+    // STEP 44 — doctor review-harness warning (docs/dag-redesign.md §13.3)
+    // -----------------------------------------------------------------
+
+    /// Build a Config whose review block is `enabled`/`harness` per args.
+    /// `defined` controls whether the named harness exists under
+    /// `harnesses`; its `command` is `which`-resolvable (`sh`) so the
+    /// PASS path is reachable without depending on `claude`/`codex`.
+    fn config_with_review_harness(harness: &str, defined: bool) -> Config {
+        let mut harnesses = HashMap::new();
+        if defined {
+            let mut hc = crate::config::Config::default().harnesses["claude"].clone();
+            hc.command = "sh".to_string(); // always on PATH in CI
+            harnesses.insert(harness.to_string(), hc);
+        }
+        let review = crate::config::ReviewConfig {
+            enabled: Some(true),
+            harness: harness.to_string(),
+            ..Default::default()
+        };
+        Config {
+            default_harness: "claude".to_string(),
+            max_retries_per_step: 3,
+            timeout_secs: Some(300),
+            hook_timeout_secs: 120,
+            auto_stash: true,
+            prompt: None,
+            min_free_disk_mb: 1024,
+            display_timezone: "UTC".to_string(),
+            harness_chunk_max_bytes: 4096,
+            review,
+            harnesses,
+        }
+    }
+
+    #[test]
+    fn test_check_review_harness_pass_when_defined_and_on_path() {
+        let cfg = config_with_review_harness("rev", true);
+        let r = check_review_harness(&cfg);
+        assert_eq!(r.name, "review-harness");
+        assert_eq!(r.severity, CheckSeverity::Pass);
+    }
+
+    #[test]
+    fn test_check_review_harness_warns_when_unconfigured() {
+        // review.harness empty ⇒ Warning pointing at the fix.
+        let mut cfg = config_with_review_harness("rev", true);
+        cfg.review.harness = String::new();
+        let r = check_review_harness(&cfg);
+        assert_eq!(r.severity, CheckSeverity::Warning);
+        assert!(
+            r.message.contains("ralph config review set --harness"),
+            "warning must point at the fix, got: {}",
+            r.message
+        );
+    }
+
+    #[test]
+    fn test_check_review_harness_warns_when_named_but_undefined() {
+        // harness named but not present under `harnesses`.
+        let cfg = config_with_review_harness("ghost", false);
+        let r = check_review_harness(&cfg);
+        assert_eq!(r.severity, CheckSeverity::Warning);
+        assert!(
+            r.message.contains("not defined in config.json"),
+            "{}",
+            r.message
+        );
+    }
+
+    #[test]
+    fn test_check_review_harness_warns_when_command_off_path() {
+        let mut cfg = config_with_review_harness("rev", true);
+        // Point the defined harness at a binary that is definitely absent.
+        cfg.harnesses.get_mut("rev").unwrap().command =
+            "definitely-not-a-real-binary-xyz-123".to_string();
+        let r = check_review_harness(&cfg);
+        assert_eq!(r.severity, CheckSeverity::Warning);
+        assert!(r.message.contains("not found in PATH"), "{}", r.message);
+    }
+
+    /// The review-harness check NEVER escalates to Error — doctor stays
+    /// green (only `CheckSeverity::Error` rows fail the dispatcher).
+    #[test]
+    fn test_review_harness_warning_is_non_fatal() {
+        let mut cfg = config_with_review_harness("rev", true);
+        cfg.review.harness = String::new(); // force the warning
+        let r = check_review_harness(&cfg);
+        assert_eq!(r.severity, CheckSeverity::Warning);
+        let results = PreflightResults {
+            checks: vec![r.clone()],
+        };
+        assert!(
+            results.is_ok(),
+            "a review-harness warning must not be treated as a failure"
+        );
+    }
+
+    /// The review-harness check fires ONLY when review is enabled
+    /// somewhere: `run_doctor_checks` gates on
+    /// `storage::any_review_enabled`, so with no review-enabled plan/step
+    /// in the DB there must be NO `review-harness` row at all (even with a
+    /// misconfigured review block) — and doctor stays non-fatal.
+    #[test]
+    fn test_doctor_omits_review_harness_check_when_no_review_enabled() {
+        // A misconfigured review block (enabled, empty harness) that would
+        // warn IF review were on anywhere. The shared dev DB may or may
+        // not have a review-enabled plan, so we assert the conditional
+        // contract directly via the pure helper + gate rather than a
+        // global DB scan: helper warns, gate decides emission.
+        let mut cfg = config_with_review_harness("rev", true);
+        cfg.review.harness = String::new();
+        // Helper alone would warn …
+        assert_eq!(check_review_harness(&cfg).severity, CheckSeverity::Warning);
+        // … but the gate (any_review_enabled) on a fresh isolated DB is
+        // false, so no row is emitted. Prove the gate predicate.
+        let conn = crate::db::open_memory().unwrap();
+        assert!(
+            !crate::storage::any_review_enabled(&conn, false).unwrap(),
+            "a DB with no review-enabled plan/step must not trigger the check"
+        );
     }
 
     // -----------------------------------------------------------------

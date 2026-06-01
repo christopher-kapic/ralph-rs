@@ -1,19 +1,15 @@
 // Prompt generation
 
-use crate::plan::{AnsweredQuestion, Plan, Step, StepStatus};
+use crate::plan::{Interruption, Plan, Step, StepStatus};
 
-/// Default "how to introspect this plan" block prepended to every step's
-/// prompt. Injected verbatim — there is no per-plan override.
-///
-/// Trailing instruction appended to every step prompt when the plan has
-/// `questions_enabled = true` (TUI-plan.md §17). Verbatim from the spec —
-/// case, punctuation, and line breaks are load-bearing.
+/// Trailing instruction appended to every step prompt (questions are always
+/// enabled — there is no per-plan opt-out). Verbatim from the spec — case,
+/// punctuation, and line breaks are load-bearing.
 pub const QUESTION_ASK_INSTRUCTION: &str = "\
 ## Asking the user a question
 
-This plan has questions enabled, so you may pause and ask the user for
-clarification when you're genuinely blocked on a decision they need to
-make.
+You may pause and ask the user for clarification when you're genuinely
+blocked on a decision they need to make.
 
 Before asking, seriously consider whether the answer is already
 recoverable from:
@@ -65,11 +61,20 @@ acceptance criteria are below.
 
 ## Adding follow-up steps
 
-- `ralph step add --next \"title\" -d \"...\"` — insert immediately after current
-- `ralph step add \"title\"` — append at end of plan
+If you discover work that should become its own step, add it with an
+explicit dependency so the scheduler runs it in the right order. Run
+`ralph step list` first to read each step's stable 8-char `short_id`.
 
-Do NOT use `--after <N>` during a run — positions shift as steps are added,
-and inserting before the current step is a no-op for this execution.
+- `ralph step add \"title\" -d \"...\" --after <short_id>` — new step runs
+  after `<short_id>` completes (use the current step's `short_id` to queue
+  follow-up work)
+- `ralph step add \"title\" -d \"...\" --depends-on <short_id>...` — new step
+  runs only after every listed step completes (a join)
+- `ralph step add \"title\" -d \"...\" --root` — independent step with no
+  dependencies
+
+Prefer `short_id` handles over list positions (`#N`): a `short_id` is
+stable for the life of the plan, but positions shift as steps are added.
 
 ---
 
@@ -77,41 +82,48 @@ and inserting before the current step is a no-op for this execution.
 
 /// Context from a previous failed attempt, used when retrying a step.
 ///
-/// The diff/files fields are **strategy-scoped** (Step 22):
+/// Failed attempts leave the dirty tree on disk for the next attempt; this
+/// context carries only the test output (and commit-hook output, if
+/// applicable) plus the failure reason from the prior attempt.
 ///
-/// - Under [`RetryStrategy::Rollback`](crate::plan::RetryStrategy::Rollback)
-///   the working tree was reverted before the retry, so the agent can no
-///   longer see its prior work on disk. We therefore feed the rolled-back
-///   diff and changed-file list back through this struct so the agent can
-///   still learn from — without inheriting — that work.
-/// - Under [`RetryStrategy::Keep`](crate::plan::RetryStrategy::Keep) (the
-///   default) the dirty tree is carried forward, so the prior work is
-///   already on disk for the agent to inspect via `git diff`. Re-sending the
-///   same diff in the prompt would be redundant and confusing, so the
-///   executor leaves `previous_diff = None` and `files_modified = []`;
-///   [`format_retry_context`] then omits those sections entirely.
+/// Post test-then-commit (Phase A): the per-iteration commit happens only
+/// after tests pass, so a failed attempt has no committed diff to feed back.
+/// The `previous_diff` and `files_modified` fields are retained for
+/// audit and external callers, but the
+/// executor currently populates them lazily/never — the dirty tree is always
+/// on disk for the agent to inspect via `git diff`. The retry-context render
+/// is therefore typically just the failure reason + previous test output.
 ///
-/// `previous_failure_reason` is populated under **both** strategies — it's a
-/// short human-readable note (derived from the prior attempt's
-/// [`TerminationReason`](crate::plan::TerminationReason)) so the Keep prompt
-/// still conveys *why* the last attempt failed even without the diff section.
+/// When a pre-commit hook rejects the commit (tests passed, commit refused),
+/// the captured hook stderr is concatenated into `previous_test_output`
+/// under a `[Commit hook output]` header so the next attempt's prompt
+/// surfaces both the test output and the hook output in a single section.
+///
+/// `previous_failure_reason` is a short human-readable note (derived from
+/// the prior attempt's
+/// [`TerminationReason`](crate::plan::TerminationReason)) so the prompt
+/// states *why* the last attempt failed even without a diff section.
 #[derive(Debug, Clone)]
 pub struct RetryContext {
     /// Which attempt number this is (1-indexed, so attempt 2 means first retry).
     pub attempt: i32,
     /// Maximum number of attempts allowed.
     pub max_attempts: i32,
-    /// The diff produced by the previous attempt. `None` under `Keep` (the
-    /// diff is already on disk) and when the prior attempt produced no diff.
+    /// The diff produced by the previous attempt. Typically `None` post
+    /// test-then-commit: the dirty tree is on disk for the agent to inspect
+    /// via `git diff`, so re-sending the same diff in the prompt would be
+    /// redundant and confusing.
     pub previous_diff: Option<String>,
-    /// Test output from the previous attempt (if tests were run).
+    /// Test output from the previous attempt (if tests were run). On
+    /// commit-hook rejection, the hook stderr is concatenated here under a
+    /// `[Commit hook output]` header so the prompt surfaces both signals.
     pub previous_test_output: Option<String>,
-    /// Files that were modified in the previous attempt. Empty under `Keep`
-    /// (the changes are already on disk) and when nothing was modified.
+    /// Files that were modified in the previous attempt. Typically empty
+    /// post test-then-commit (the changes are already on disk).
     pub files_modified: Vec<String>,
     /// Short human-readable reason the previous attempt failed (e.g. "tests
     /// failed", "harness exited non-zero", "no changes produced"). Always
-    /// set on a real retry so the Keep prompt — which omits the diff — still
+    /// set on a real retry so the prompt — which omits the diff — still
     /// states what went wrong. `None` only when no reason was available.
     pub previous_failure_reason: Option<String>,
 }
@@ -166,7 +178,9 @@ fn non_empty(s: Option<&str>) -> Option<&str> {
 ///    place the plan description is emitted.
 /// 4. Agent pointer (instructs the harness to fetch the agent profile itself)
 /// 5. Retry context (if this is a retry attempt)
-/// 6. Previously answered questions (only if `answered_questions` is non-empty)
+/// 6. Resolved interruptions — bounded (only if `resolved_interruptions` is
+///    non-empty; the slice is the last *N*, newest-first, from the bounded
+///    storage query)
 /// 7. Step details (title and description of current step) + acceptance
 ///    criteria
 /// 8. Plan step map — a compact titles-only list of ALL steps in the plan
@@ -174,7 +188,7 @@ fn non_empty(s: Option<&str>) -> Option<&str> {
 ///    sequence without us paying O(n²) bytes for full prior descriptions
 /// 9. Deterministic tests (test commands that will be run after)
 /// 10. Focus instruction (reminder to stay focused on just this step)
-/// 11. Question-ask instruction (only if `plan.questions_enabled`)
+/// 11. Question-ask instruction (always appended — questions are always on)
 ///
 /// Assembly is pure prefix-stacking — there is no suffix stage and no
 /// auto-injected context prepend (the global layer carries that block).
@@ -182,22 +196,45 @@ fn non_empty(s: Option<&str>) -> Option<&str> {
 /// `all_steps` is the full ordered list of steps in the plan (as returned by
 /// `storage::list_steps`). `step` must be one of them — matched by `id`.
 ///
-/// `answered_questions` is the chronological list of Q&A pairs for this step
-/// (from [`crate::storage::list_answered_questions_for_step`]). When non-empty
-/// the prompt injects a "Previously answered questions" section between Plan
-/// context and Step details so the harness sees the user's clarifications
-/// verbatim before re-attacking the step.
-#[allow(clippy::too_many_arguments)]
-pub fn build_step_prompt(
-    plan: &Plan,
-    step: &Step,
-    all_steps: &[Step],
-    agent_name: Option<&str>,
-    retry_context: Option<&RetryContext>,
-    harness_supports_agent_file: bool,
-    prompts: &Prompts,
-    answered_questions: &[AnsweredQuestion],
-) -> String {
+/// `resolved_interruptions` is the **bounded** (last *N*, newest-first) list
+/// of resolved interruptions for this step, from
+/// [`crate::storage::list_resolved_interruptions_for_step`]. When non-empty
+/// the prompt injects a "Resolved interruptions" section between Plan context
+/// and Step details so the harness sees the human's clarifications/unblocks
+/// verbatim before re-attacking the step. This section is the §8/§4 cutover:
+/// it replaces the old unbounded "Previously answered questions" section and
+/// is bounded in **both** entry count (the caller's `LIMIT`) **and**
+/// per-field length (every body/resolution/comment is `truncate_text`'d),
+/// closing the one pre-existing unbounded-context leak (docs/dag-redesign.md
+/// §4). Callers must pass the result of the bounded query — there is no
+/// unbounded slice anywhere in prompt assembly.
+/// Grouped inputs to [`build_step_prompt`]. Bundles the step's plan/step
+/// context, the four-layer `prompts`, retry context, and the bounded
+/// resolved-interruptions slice into one cohesive argument so the builder
+/// reads as a single "what goes into this prompt" payload.
+#[derive(Debug)]
+pub struct BuildStepPromptArgs<'a> {
+    pub plan: &'a Plan,
+    pub step: &'a Step,
+    pub all_steps: &'a [Step],
+    pub agent_name: Option<&'a str>,
+    pub retry_context: Option<&'a RetryContext>,
+    pub harness_supports_agent_file: bool,
+    pub prompts: &'a Prompts,
+    pub resolved_interruptions: &'a [Interruption],
+}
+
+pub fn build_step_prompt(args: &BuildStepPromptArgs<'_>) -> String {
+    let BuildStepPromptArgs {
+        plan,
+        step,
+        all_steps,
+        agent_name,
+        retry_context,
+        harness_supports_agent_file,
+        prompts,
+        resolved_interruptions,
+    } = *args;
     let mut sections: Vec<String> = Vec::new();
 
     // Plan layer — the plan-context block. This is the SINGLE place the plan
@@ -224,12 +261,14 @@ pub fn build_step_prompt(
         sections.push(format_retry_context(retry));
     }
 
-    // Previously answered questions — injected between plan context and
-    // step details so the harness sees the user's clarifications before
-    // re-reading the step description (TUI-plan.md §17 "Retry context after
-    // answering"). Empty slice contributes nothing.
-    if !answered_questions.is_empty() {
-        sections.push(format_answered_questions(answered_questions));
+    // Resolved interruptions — injected between plan context and step
+    // details so the harness sees the human's clarifications/unblocks before
+    // re-reading the step description (docs/dag-redesign.md §8 item 1). The
+    // slice is already bounded by the caller's `LIMIT`; each field is
+    // additionally `truncate_text`'d inside the formatter, so this section is
+    // doubly bounded (count + per-field). Empty slice contributes nothing.
+    if !resolved_interruptions.is_empty() {
+        sections.push(format_resolved_interruptions(resolved_interruptions));
     }
 
     // Step details (with 1-based position in the plan)
@@ -260,12 +299,9 @@ pub fn build_step_prompt(
     // Focus instruction.
     sections.push(format_focus_instruction(step));
 
-    // Question-ask instruction — appended at the very end (after the
-    // focus instruction) when the plan opted into questions (TUI-plan.md §17
-    // "Prompt injection (when enabled)").
-    if plan.questions_enabled {
-        sections.push(QUESTION_ASK_INSTRUCTION.to_string());
-    }
+    // Question-ask instruction — appended at the very end (after the focus
+    // instruction). Questions are always enabled, so this always renders.
+    sections.push(QUESTION_ASK_INSTRUCTION.to_string());
 
     // Stack the global/project layers as prefix sections ahead of the joined
     // body. Each layer is inserted as its own `\n\n`-separated section,
@@ -278,6 +314,151 @@ pub fn build_step_prompt(
     all.extend(sections);
 
     all.join("\n\n")
+}
+
+// ---------------------------------------------------------------------------
+// Reviewer prompt (docs/dag-redesign.md §8, §9-inv-2, Decision 5)
+// ---------------------------------------------------------------------------
+
+/// The structured-verdict contract the reviewer harness MUST emit.
+///
+/// The reviewer is a *separate* nondeterministic harness invocation
+/// (docs/dag-redesign.md §3.2/§9). Its only machine-consumed output is a
+/// single verdict line, which `crate::review::parse_review_verdict` parses:
+///
+/// - `REVIEW PASS` — no real defect found in *this step's* implementation.
+///   The step is `Complete` with `review_status = Passed`.
+/// - `REVIEW FAIL — N issue(s)` — a real defect was found; the orchestrator
+///   (sole DAG writer — §9-inv-3) inserts a corrective step and re-parents
+///   dependents (§10). The em-dash and `N` are advisory; the parser keys off
+///   the leading `REVIEW FAIL` token so a hyphen/spacing wobble can't flip a
+///   FAIL into a silently-ignored line.
+///
+/// This text is embedded verbatim in the reviewer prompt so the contract is
+/// stated *to the harness* exactly as the parser enforces it — the two must
+/// never drift. Case, the two literal tokens, and the read-only mandate are
+/// load-bearing.
+pub const REVIEW_VERDICT_CONTRACT: &str = "\
+## Your verdict (REQUIRED — exact format)
+
+End your reply with EXACTLY ONE of these two lines, on its own line, as the
+final line of your output:
+
+    REVIEW PASS
+    REVIEW FAIL — N issue(s)
+
+(`N` is the count of real defects you found; the wording after `REVIEW FAIL`
+is free text.) Emit nothing after the verdict line.";
+
+/// Build the **read-only reviewer prompt** for one committed iteration.
+///
+/// This is deliberately a SEPARATE builder from [`build_step_prompt`] with
+/// **no shared assembly** (docs/dag-redesign.md §8): the four-layer
+/// Global/Project/Plan/Step stack, retry context, resolved-interruptions,
+/// step map, deterministic-tests, and question-ask sections are all
+/// irrelevant to a reviewer and would dilute the verdict. The reviewer sees
+/// only:
+///
+/// 1. Plan + step context — **titles and acceptance criteria ONLY** (no plan
+///    description body, no other steps' descriptions). The acceptance
+///    criteria ARE the review rubric.
+/// 2. The **single** commit diff for the reviewed iteration, supplied by the
+///    caller as the verbatim output of `git show <sha>` (one commit, never a
+///    cumulative `a..b` range and never a dependency's diff — Decision 5 /
+///    §4: the reviewer prompt is O(1) in plan size).
+/// 3. The §8 instruction (read-only; request a corrective step only on a
+///    real defect in *this step's* implementation) + the verdict contract
+///    ([`REVIEW_VERDICT_CONTRACT`]).
+///
+/// `commit_diff` MUST be exactly one commit's `git show` patch. The caller
+/// (`crate::review`) is the single place that produces it via
+/// `git::show_commit_diff`; passing a range diff here would violate the §9
+/// hard invariant — the dedicated unit test asserts the assembled prompt
+/// contains exactly one diff and zero dependency/cumulative diffs.
+pub fn build_review_prompt(
+    plan: &Plan,
+    step: &Step,
+    short_commit: &str,
+    iteration: i32,
+    commit_diff: &str,
+) -> String {
+    let mut sections: Vec<String> = Vec::new();
+
+    // (1) Plan + step context — titles + acceptance criteria ONLY. We
+    // intentionally do NOT emit `plan.description` (the Plan prompt layer)
+    // or any other step's body: the review rubric is this step's acceptance
+    // criteria, and pulling in surrounding context would both dilute the
+    // verdict and risk re-introducing cross-step accumulation (§4).
+    sections.push(format!(
+        "# Review task\n\n\
+         You are reviewing one committed iteration of a single step in the \
+         `{slug}` plan. This is a **read-only code review** — see the rules \
+         below.\n\n\
+         **Plan:** {slug}\n\
+         **Step:** {title}",
+        slug = plan.slug,
+        title = step.title,
+    ));
+
+    if step.acceptance_criteria.is_empty() {
+        sections.push(
+            "## Acceptance criteria\n\n\
+             _This step declared no explicit acceptance criteria. Judge the \
+             commit against the step title and whether the change is a \
+             coherent, defect-free implementation of it._"
+                .to_string(),
+        );
+    } else {
+        let mut lines = vec![
+            "## Acceptance criteria".to_string(),
+            String::new(),
+            "Review the commit against THESE criteria and nothing else:".to_string(),
+            String::new(),
+        ];
+        for c in &step.acceptance_criteria {
+            lines.push(format!("- {c}"));
+        }
+        sections.push(lines.join("\n"));
+    }
+
+    // (2) The SINGLE commit diff (O(1) — Decision 5). Fenced as ```diff so
+    // the harness reads it as one patch; this is the verbatim
+    // `git show <sha>` output for exactly the reviewed iteration's commit.
+    sections.push(format!(
+        "## Commit under review: `{short_commit}` ({sid}.{n})\n\n\
+         This is the **entire** change introduced by this one commit — the \
+         only thing you are reviewing. Do not request, fetch, or reason about \
+         any other commit's diff.\n\n\
+         ```diff\n{diff}\n```",
+        short_commit = short_commit,
+        sid = step.short_id,
+        n = iteration,
+        diff = commit_diff,
+    ));
+
+    // (3) The §8 read-only instruction + verdict contract.
+    sections.push(format!(
+        "## Review rules (READ-ONLY)\n\n\
+         Review commit `{sid}.{n}` against this step's acceptance criteria.\n\n\
+         - You are **read-only**. Do NOT modify, create, or delete any files. \
+           Do NOT run commands that change the working tree or git state. The \
+           commit is fixed history; your job is solely to judge it.\n\
+         - Only if you find a **real defect in THIS step's implementation** \
+           (a criterion genuinely unmet, a bug introduced by this commit, a \
+           regression) should you fail the review. Style nits, hypothetical \
+           future concerns, or pre-existing issues NOT introduced by this \
+           commit are NOT grounds to fail.\n\
+         - If you fail it, a **corrective step** will be inserted immediately \
+           after this step, and everything that depended on this step will be \
+           re-pointed at the correction. You do not create that step — you \
+           only deliver the verdict; the orchestrator performs the change.\n\n\
+         {contract}",
+        sid = step.short_id,
+        n = iteration,
+        contract = REVIEW_VERDICT_CONTRACT,
+    ));
+
+    sections.join("\n\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -300,8 +481,9 @@ fn format_retry_context(ctx: &RetryContext) -> String {
         max = ctx.max_attempts,
     );
     if let Some(reason) = &ctx.previous_failure_reason {
-        // Under `Keep` the diff section is omitted (the work is on disk), so
-        // this line is the only thing telling the agent *what* failed —
+        // Post test-then-commit the diff section is omitted (the failed
+        // attempt's work is on disk for the agent to inspect via `git diff`),
+        // so this line is the only thing telling the agent *what* failed —
         // keep it on the header so it's the first thing read.
         header.push_str(&format!("\n\nPrevious failure: {reason}."));
     }
@@ -319,12 +501,16 @@ fn format_retry_context(ctx: &RetryContext) -> String {
     }
 
     if let Some(diff) = &ctx.previous_diff {
-        let truncated = truncate_text(diff, 200);
+        // 200 lines × ~256 bytes-per-line headroom ≈ 50 KiB cap on the diff
+        // pane — large but bounded so a single attempt's previous-diff
+        // section can't blow the prompt up.
+        let truncated = truncate_text(diff, 200, 50 * 1024);
         parts.push(format!("## Previous Diff\n\n```diff\n{truncated}\n```"));
     }
 
     if let Some(test_output) = &ctx.previous_test_output {
-        let truncated = truncate_text(test_output, 100);
+        // 100 lines × ~256 bytes headroom ≈ 25 KiB cap.
+        let truncated = truncate_text(test_output, 100, 25 * 1024);
         parts.push(format!("## Previous Test Output\n\n```\n{truncated}\n```"));
     }
 
@@ -359,21 +545,74 @@ fn format_plan_context(plan: &Plan, plan_layer: Option<&str>) -> String {
     )
 }
 
-/// Render the "Previously answered questions" section. Each Q&A pair becomes
-/// two markdown blockquote lines (`> Q: ...` / `> A: ...`) separated by a
-/// blank line, in chronological order. Verbatim shape from TUI-plan.md §17.
-fn format_answered_questions(answered: &[AnsweredQuestion]) -> String {
-    let mut lines = vec![
-        "## Previously answered questions".to_string(),
-        String::new(),
-    ];
-    let last = answered.len().saturating_sub(1);
-    for (i, qa) in answered.iter().enumerate() {
-        lines.push(format!("> Q: {}", qa.question));
-        lines.push(format!("> A: {}", qa.answer));
+/// Max lines kept per interruption field (body / resolution / comment) when
+/// rendering the "Resolved interruptions" section. The *count* of entries is
+/// bounded upstream by [`crate::storage::list_resolved_interruptions_for_step`]
+/// (its `LIMIT`); this is the **per-field** half of the §4 fix — the same
+/// `truncate_text` helper used for the 200-line diff truncation, applied here
+/// so a single pathologically long answer/blocker explanation cannot blow the
+/// prompt up.
+const RESOLVED_INTERRUPTION_FIELD_MAX_LINES: usize = 20;
+
+/// Render the bounded "Resolved interruptions" section (docs/dag-redesign.md
+/// §8 item 1). Each resolved interruption becomes a markdown blockquote
+/// carrying its **kind**, **body**, the chosen **resolution**, and any human
+/// **comment** — every free-text field run through [`truncate_text`] so the
+/// section is bounded in per-field length (the entry *count* is already
+/// bounded by the caller's `LIMIT`). The input is newest-first (as the
+/// bounded query returns it); we render in that order so the freshest
+/// clarification leads.
+///
+/// This replaces the pre-Phase-2 unbounded `format_answered_questions` —
+/// there is no longer any unbounded vector anywhere in prompt assembly.
+fn format_resolved_interruptions(resolved: &[Interruption]) -> String {
+    let mut lines = vec!["## Resolved interruptions".to_string(), String::new()];
+    let last = resolved.len().saturating_sub(1);
+    for (i, intr) in resolved.iter().enumerate() {
+        let body = truncate_text(
+            &intr.body,
+            RESOLVED_INTERRUPTION_FIELD_MAX_LINES,
+            RESOLVED_INTERRUPTION_FIELD_MAX_BYTES,
+        );
+        lines.push(format!("> **{kind}**", kind = intr.kind.as_str()));
+        // Each multi-line field is re-quoted line-by-line so the blockquote
+        // stays well-formed even after truncation inserts its elision line.
+        for bl in body.lines() {
+            lines.push(format!("> {bl}"));
+        }
+        if let Some(resolution) = &intr.resolution {
+            let r = truncate_text(
+                resolution,
+                RESOLVED_INTERRUPTION_FIELD_MAX_LINES,
+                RESOLVED_INTERRUPTION_FIELD_MAX_BYTES,
+            );
+            lines.push(">".to_string());
+            for (j, rl) in r.lines().enumerate() {
+                lines.push(if j == 0 {
+                    format!("> Resolution: {rl}")
+                } else {
+                    format!("> {rl}")
+                });
+            }
+        }
+        if let Some(comment) = &intr.comment {
+            let c = truncate_text(
+                comment,
+                RESOLVED_INTERRUPTION_FIELD_MAX_LINES,
+                RESOLVED_INTERRUPTION_FIELD_MAX_BYTES,
+            );
+            lines.push(">".to_string());
+            for (j, cl) in c.lines().enumerate() {
+                lines.push(if j == 0 {
+                    format!("> Comment: {cl}")
+                } else {
+                    format!("> {cl}")
+                });
+            }
+        }
         if i != last {
-            // Blank line between pairs to keep each blockquote distinct in
-            // markdown rendering. The trailing pair has no separator.
+            // Blank line between entries to keep each blockquote distinct in
+            // markdown rendering. The trailing entry has no separator.
             lines.push(String::new());
         }
     }
@@ -424,6 +663,11 @@ fn status_label(status: StepStatus) -> &'static str {
         StepStatus::InProgress => "IN_PROGRESS",
         StepStatus::Failed => "FAILED",
         StepStatus::Aborted => "ABORTED",
+        // `Blocked` is a derived overlay never stored on `steps.status`, so
+        // the plan-step-map (built from stored statuses) won't normally see
+        // it; label it explicitly for exhaustiveness if a derived value is
+        // ever passed in.
+        StepStatus::Blocked => "BLOCKED",
     }
 }
 
@@ -468,19 +712,81 @@ fn format_focus_instruction(step: &Step) -> String {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Truncate text to a maximum number of lines, appending an elision marker
-/// when truncated. Keeps the first `max_lines` because the top of a diff or
-/// test output usually carries the most context — file headers, the first
-/// failing assertion — and losing the tail is the cheaper choice.
-fn truncate_text(text: &str, max_lines: usize) -> String {
+/// Per-field byte cap for the bounded "Resolved interruptions" section.
+/// 8 KiB ≈ ~2k tokens — generous for a single body/resolution/comment while
+/// keeping the total per-step prompt growth bounded even when a single
+/// pathological line slips past the line cap (e.g. a multi-MB base64 blob
+/// pasted into a resolution comment). Three fields × `MAX_RESOLVED_INTERRUPTIONS`
+/// (capped upstream by the storage query) × this cap is the real upper bound
+/// on the section's contribution to the prompt.
+pub(crate) const RESOLVED_INTERRUPTION_FIELD_MAX_BYTES: usize = 8 * 1024;
+
+/// Truncate text to both a maximum number of lines AND a maximum byte count,
+/// appending an elision marker when truncated. Keeps the **head** (first
+/// `max_lines` / first `max_bytes`) because the top of a diff or test output
+/// usually carries the most context — file headers, the first failing
+/// assertion — and losing the tail is the cheaper choice.
+///
+/// The byte cap closes the §4 prompt-growth hole that the pre-fix
+/// line-only cap left open: a single line of arbitrarily large size
+/// (multi-MB JSON dump, base64 blob, output-without-newlines) used to slip
+/// straight through unmodified. The byte cap is enforced on the head slice
+/// (or on the whole text on the no-line-cap-hit path) at a UTF-8 char
+/// boundary so we never slice mid-codepoint.
+fn truncate_text(text: &str, max_lines: usize, max_bytes: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
-    if lines.len() <= max_lines {
-        text.to_string()
-    } else {
-        let omitted = lines.len() - max_lines;
-        let head = &lines[..max_lines];
-        format!("{}\n... ({omitted} lines omitted) ...", head.join("\n"))
+    let line_overflow = lines.len() > max_lines;
+    let byte_overflow = text.len() > max_bytes;
+
+    // Fast path — neither bound exceeded.
+    if !line_overflow && !byte_overflow {
+        return text.to_string();
     }
+
+    // Decide the body to truncate by line bound first. If lines overflow,
+    // take the first `max_lines`; otherwise keep the whole text. Then apply
+    // the byte cap on whatever's left.
+    let (line_body, omitted_lines) = if line_overflow {
+        let head = &lines[..max_lines];
+        (head.join("\n"), lines.len() - max_lines)
+    } else {
+        (text.to_string(), 0)
+    };
+
+    let original_bytes = text.len();
+    let original_lines = lines.len();
+    let body_bytes_truncated = line_body.len() > max_bytes;
+    let body = if body_bytes_truncated {
+        // Walk char boundaries to a cut <= max_bytes (UTF-8-safe).
+        let mut cut = 0;
+        for (i, _) in line_body.char_indices() {
+            if i > max_bytes {
+                break;
+            }
+            cut = i;
+        }
+        line_body[..cut].to_string()
+    } else {
+        line_body
+    };
+
+    // Build the elision marker. Mention whichever cap(s) tripped so a human
+    // reading the prompt can tell why context was lost.
+    let marker = if line_overflow && body_bytes_truncated {
+        format!(
+            "\n... [truncated; original was {original_lines} lines, {original_bytes} bytes; \
+             {omitted_lines} lines omitted then byte-capped at {max_bytes}] ..."
+        )
+    } else if line_overflow {
+        format!("\n... ({omitted_lines} lines omitted) ...")
+    } else {
+        format!(
+            "\n... [truncated; original was {original_lines} lines, {original_bytes} bytes; \
+             byte-capped at {max_bytes}] ..."
+        )
+    };
+
+    format!("{body}{marker}")
 }
 
 // ---------------------------------------------------------------------------
@@ -490,8 +796,30 @@ fn truncate_text(text: &str, max_lines: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::{ChangePolicy, Plan, PlanStatus};
+    use crate::plan::{ChangePolicy, InterruptionKind, InterruptionState, Plan, PlanStatus};
     use chrono::Utc;
+
+    /// Build a resolved [`Interruption`] for prompt-rendering tests.
+    fn resolved_intr(
+        kind: InterruptionKind,
+        body: &str,
+        resolution: Option<&str>,
+        comment: Option<&str>,
+    ) -> Interruption {
+        Interruption {
+            id: "i-test".to_string(),
+            step_id: "s1".to_string(),
+            attempt: 1,
+            kind,
+            body: body.to_string(),
+            options: vec![],
+            resolution: resolution.map(str::to_string),
+            comment: comment.map(str::to_string),
+            state: InterruptionState::Resolved,
+            asked_at: Utc::now(),
+            resolved_at: Some(Utc::now()),
+        }
+    }
 
     fn make_plan() -> Plan {
         Plan {
@@ -511,19 +839,20 @@ mod tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
-            retry_strategy: None,
+            review_enabled: None,
+            max_review_corrections: None,
         }
     }
 
     fn make_step_with(id: &str, title: &str, status: StepStatus) -> Step {
         Step {
             id: id.to_string(),
+            short_id: String::new(),
             plan_id: "p1".to_string(),
             sort_key: id.to_string(),
             title: title.to_string(),
@@ -540,13 +869,16 @@ mod tests {
             skipped_reason: None,
             change_policy: ChangePolicy::Required,
             tags: vec![],
-            retry_strategy: None,
+            review_enabled: None,
+            review_status: None,
+            corrects_step_id: None,
         }
     }
 
     fn make_step() -> Step {
         Step {
             id: "s1".to_string(),
+            short_id: String::new(),
             plan_id: "p1".to_string(),
             sort_key: "a0".to_string(),
             title: "Implement harness spawning".to_string(),
@@ -566,7 +898,9 @@ mod tests {
             skipped_reason: None,
             change_policy: ChangePolicy::Required,
             tags: vec![],
-            retry_strategy: None,
+            review_enabled: None,
+            review_status: None,
+            corrects_step_id: None,
         }
     }
 
@@ -582,16 +916,16 @@ mod tests {
             project: None,
             plan: Some(plan.description.clone()),
         };
-        let prompt = build_step_prompt(
-            &plan,
-            &step,
-            &all_steps,
-            None,
-            None,
-            true, // harness supports agent file natively
-            &prompts,
-            &[],
-        );
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all_steps,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &prompts,
+            resolved_interruptions: &[],
+        });
 
         // Should contain plan context
         assert!(prompt.contains("# Plan: test-plan"));
@@ -647,7 +981,16 @@ mod tests {
             plan: Some(plan.description.clone()),
         };
 
-        let prompt = build_step_prompt(&plan, &step, &all_steps, None, None, true, &prompts, &[]);
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all_steps,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &prompts,
+            resolved_interruptions: &[],
+        });
 
         assert_eq!(
             prompt.matches("ZZZ_UNIQUE_PLAN_DESCRIPTION_MARKER").count(),
@@ -681,20 +1024,20 @@ mod tests {
         let step = make_step();
         let all_steps = vec![step.clone()];
 
-        let prompt = build_step_prompt(
-            &plan,
-            &step,
-            &all_steps,
-            None,
-            None,
-            true,
-            &Prompts::default(),
-            &[],
-        );
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all_steps,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &Prompts::default(),
+            resolved_interruptions: &[],
+        });
 
         assert!(!prompt.contains("# Ralph context"));
         assert!(!prompt.contains("## Introspecting the plan"));
-        assert!(!prompt.contains("Do NOT use `--after <N>` during a run"));
+        assert!(!prompt.contains("## Adding follow-up steps"));
     }
 
     #[test]
@@ -711,12 +1054,21 @@ mod tests {
             plan: None,
         };
 
-        let prompt = build_step_prompt(&plan, &step, &all_steps, None, None, true, &prompts, &[]);
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all_steps,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &prompts,
+            resolved_interruptions: &[],
+        });
 
         assert!(prompt.contains("# Ralph context"));
         assert!(prompt.contains("## Introspecting the plan"));
         assert!(prompt.contains("`ralph status`"));
-        assert!(prompt.contains("Do NOT use `--after <N>` during a run"));
+        assert!(prompt.contains("## Adding follow-up steps"));
         assert!(prompt.starts_with("# Ralph context"));
     }
 
@@ -730,16 +1082,16 @@ mod tests {
         let s3 = make_step_with("s3", "Future thing", StepStatus::Pending);
         let all_steps = vec![s1.clone(), s2.clone(), s3.clone()];
 
-        let prompt = build_step_prompt(
-            &plan,
-            &s2,
-            &all_steps,
-            None,
-            None,
-            true,
-            &Prompts::default(),
-            &[],
-        );
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &s2,
+            all_steps: &all_steps,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &Prompts::default(),
+            resolved_interruptions: &[],
+        });
 
         // Titles ARE present in the step map.
         assert!(prompt.contains("Done thing"));
@@ -773,16 +1125,16 @@ mod tests {
         let s3 = make_step_with("s3", "Gamma", StepStatus::Pending);
         let all_steps = vec![s1.clone(), s2.clone(), s3.clone()];
 
-        let prompt = build_step_prompt(
-            &plan,
-            &s2,
-            &all_steps,
-            None,
-            None,
-            true,
-            &Prompts::default(),
-            &[],
-        );
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &s2,
+            all_steps: &all_steps,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &Prompts::default(),
+            resolved_interruptions: &[],
+        });
 
         // Only the current step line has the arrow prefix.
         assert!(prompt.contains("→ #2. [IN_PROGRESS] Beta"));
@@ -799,16 +1151,16 @@ mod tests {
         let step = make_step();
         let all_steps = vec![step.clone()];
 
-        let prompt = build_step_prompt(
-            &plan,
-            &step,
-            &all_steps,
-            Some("senior-engineer"),
-            None,
-            false, // harness does NOT support agent file natively
-            &Prompts::default(),
-            &[],
-        );
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all_steps,
+            agent_name: Some("senior-engineer"),
+            retry_context: None,
+            harness_supports_agent_file: false,
+            prompts: &Prompts::default(),
+            resolved_interruptions: &[],
+        });
 
         // Pointer section should be present telling the agent to run
         // `ralph agents show <name>` rather than inlining the full file.
@@ -822,16 +1174,16 @@ mod tests {
         let step = make_step();
         let all_steps = vec![step.clone()];
 
-        let prompt = build_step_prompt(
-            &plan,
-            &step,
-            &all_steps,
-            Some("senior-engineer"),
-            None,
-            true, // harness supports agent file natively
-            &Prompts::default(),
-            &[],
-        );
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all_steps,
+            agent_name: Some("senior-engineer"),
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &Prompts::default(),
+            resolved_interruptions: &[],
+        });
 
         // Pointer section should NOT be in the prompt — the harness gets
         // the agent file by reference via its native flag/env var.
@@ -845,16 +1197,16 @@ mod tests {
         let step = make_step();
         let all_steps = vec![step.clone()];
 
-        let prompt = build_step_prompt(
-            &plan,
-            &step,
-            &all_steps,
-            None,
-            None,
-            false, // non-native, but no agent assigned
-            &Prompts::default(),
-            &[],
-        );
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all_steps,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: false,
+            prompts: &Prompts::default(),
+            resolved_interruptions: &[],
+        });
 
         assert!(!prompt.contains("# Agent Profile"));
     }
@@ -873,16 +1225,16 @@ mod tests {
             previous_failure_reason: Some("tests failed".to_string()),
         };
 
-        let prompt = build_step_prompt(
-            &plan,
-            &step,
-            &all_steps,
-            None,
-            Some(&retry),
-            true,
-            &Prompts::default(),
-            &[],
-        );
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all_steps,
+            agent_name: None,
+            retry_context: Some(&retry),
+            harness_supports_agent_file: true,
+            prompts: &Prompts::default(),
+            resolved_interruptions: &[],
+        });
 
         assert!(prompt.contains("# Retry Context"));
         assert!(prompt.contains("attempt 2 of 3"));
@@ -901,16 +1253,16 @@ mod tests {
         step.acceptance_criteria = vec![];
         let all_steps = vec![step.clone()];
 
-        let prompt = build_step_prompt(
-            &plan,
-            &step,
-            &all_steps,
-            None,
-            None,
-            true,
-            &Prompts::default(),
-            &[],
-        );
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all_steps,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &Prompts::default(),
+            resolved_interruptions: &[],
+        });
 
         assert!(!prompt.contains("Acceptance criteria"));
     }
@@ -922,16 +1274,16 @@ mod tests {
         let step = make_step();
         let all_steps = vec![step.clone()];
 
-        let prompt = build_step_prompt(
-            &plan,
-            &step,
-            &all_steps,
-            None,
-            None,
-            true,
-            &Prompts::default(),
-            &[],
-        );
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all_steps,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &Prompts::default(),
+            resolved_interruptions: &[],
+        });
 
         assert!(!prompt.contains("Post-harness validation"));
     }
@@ -945,16 +1297,16 @@ mod tests {
         let plan = make_plan();
         let step = make_step();
         let all_steps = vec![step.clone()];
-        let prompt = build_step_prompt(
-            &plan,
-            &step,
-            &all_steps,
-            None,
-            None,
-            true,
-            &Prompts::default(),
-            &[],
-        );
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all_steps,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &Prompts::default(),
+            resolved_interruptions: &[],
+        });
         assert!(
             !prompt.contains("All must pass"),
             "imperative wording re-introduced: prompt should frame tests as ralph-owned \
@@ -969,7 +1321,7 @@ mod tests {
     #[test]
     fn test_truncate_text_short() {
         let text = "line 1\nline 2\nline 3";
-        let result = truncate_text(text, 10);
+        let result = truncate_text(text, 10, 8 * 1024);
         assert_eq!(result, text);
     }
 
@@ -977,7 +1329,7 @@ mod tests {
     fn test_truncate_text_long_keeps_head() {
         let lines: Vec<String> = (0..20).map(|i| format!("line {i}")).collect();
         let text = lines.join("\n");
-        let result = truncate_text(&text, 5);
+        let result = truncate_text(&text, 5, 8 * 1024);
 
         assert!(result.contains("(15 lines omitted)"));
         // First five lines preserved in order.
@@ -1000,6 +1352,74 @@ mod tests {
         assert!(head_end < marker);
     }
 
+    /// Fix #2: a single line of arbitrarily large size used to slip through
+    /// the line-only cap unmodified — `lines().count() == 1` short-circuits
+    /// the head-truncation path. The byte cap closes that hole. 100 KiB of
+    /// one-line text must come back capped to roughly `max_bytes` (plus the
+    /// elision marker).
+    #[test]
+    fn test_truncate_text_single_huge_line_byte_capped() {
+        let max_bytes = 8 * 1024;
+        let text: String = "x".repeat(100 * 1024);
+        let result = truncate_text(&text, 100, max_bytes);
+
+        // The text payload must NOT exceed max_bytes; the elision marker
+        // adds a bounded suffix on top.
+        assert!(
+            result.starts_with(&"x".repeat(max_bytes)),
+            "head must be the byte-capped prefix",
+        );
+        assert!(
+            result.contains("truncated"),
+            "elision marker must mark the truncation",
+        );
+        // The overall length is the cap plus the elision marker — call it
+        // `cap + 512` to be safe.
+        assert!(
+            result.len() <= max_bytes + 512,
+            "total length must be within cap + marker; got {} (cap {})",
+            result.len(),
+            max_bytes,
+        );
+    }
+
+    /// Multi-byte UTF-8 inputs must never be sliced mid-codepoint. Feed a
+    /// long stream of 4-byte chars and confirm the cap lands on a char
+    /// boundary (the cut bytes are a valid UTF-8 string in the output).
+    #[test]
+    fn test_truncate_text_utf8_safe() {
+        let max_bytes = 1000;
+        let text: String = "\u{1F600}".repeat(2000); // grinning-face = 4 bytes each
+        let result = truncate_text(&text, 100, max_bytes);
+
+        // Output is still valid UTF-8 (we'd panic on a malformed slice in
+        // the `format!` above; this assertion documents the invariant).
+        assert!(!result.is_empty());
+        // The leading run of chars is whole grinning-faces, not partial.
+        let leading: String = result.chars().take_while(|c| *c == '\u{1F600}').collect();
+        assert!(!leading.is_empty(), "the head must contain whole chars");
+        assert_eq!(
+            leading.len() % 4,
+            0,
+            "leading byte count must be a multiple of the 4-byte char width",
+        );
+    }
+
+    /// Both bounds tripped → the elision marker calls both out.
+    #[test]
+    fn test_truncate_text_both_bounds_tripped() {
+        let max_lines = 3;
+        let max_bytes = 50;
+        // 10 lines of 100 bytes each — exceeds both caps.
+        let text: String = (0..10)
+            .map(|i| format!("{:0>100}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let result = truncate_text(&text, max_lines, max_bytes);
+        assert!(result.contains("truncated"));
+        assert!(result.contains("lines omitted") || result.contains("byte-capped"));
+    }
+
     #[test]
     fn test_format_retry_context_minimal() {
         let ctx = RetryContext {
@@ -1019,8 +1439,8 @@ mod tests {
     }
 
     #[test]
-    fn test_format_retry_context_keep_scoped_no_diff_but_reason_and_output() {
-        // Step 22: under `Keep` the executor passes diff=None / files=[] but
+    fn test_format_retry_context_no_diff_but_reason_and_output() {
+        // Post test-then-commit the executor passes diff=None / files=[] but
         // still sets previous_test_output + previous_failure_reason. The
         // formatter must convey attempt N/M, the failure reason, and the
         // test output, while OMITTING the diff/files sections entirely.
@@ -1037,7 +1457,7 @@ mod tests {
         assert!(result.contains("Previous failure: tests failed."));
         assert!(result.contains("Previous Test Output"));
         assert!(result.contains("assertion failed: foo == bar"));
-        // Diff/files sections are absent under Keep.
+        // Diff/files sections are absent post test-then-commit.
         assert!(!result.contains("Previous Diff"));
         assert!(!result.contains("Files Modified"));
     }
@@ -1063,8 +1483,7 @@ mod tests {
 
     #[test]
     fn test_prompt_section_order() {
-        let mut plan = make_plan();
-        plan.questions_enabled = true;
+        let plan = make_plan();
         let s1 = make_step_with("s1", "Prior", StepStatus::Complete);
         let s2 = make_step();
         let all_steps = vec![s1, s2.clone()];
@@ -1076,10 +1495,12 @@ mod tests {
             files_modified: vec![],
             previous_failure_reason: Some("tests failed".to_string()),
         };
-        let answered = vec![AnsweredQuestion {
-            question: "Which DB?".to_string(),
-            answer: "SQLite".to_string(),
-        }];
+        let resolved = vec![resolved_intr(
+            InterruptionKind::Question,
+            "Which DB?",
+            Some("SQLite"),
+            None,
+        )];
 
         let prompts = Prompts {
             global: Some(DEFAULT_CONTEXT_PREPEND.to_string()),
@@ -1087,26 +1508,26 @@ mod tests {
             plan: Some(plan.description.clone()),
         };
 
-        let prompt = build_step_prompt(
-            &plan,
-            &s2,
-            &all_steps,
-            Some("senior-engineer"),
-            Some(&retry),
-            false,
-            &prompts,
-            &answered,
-        );
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &s2,
+            all_steps: &all_steps,
+            agent_name: Some("senior-engineer"),
+            retry_context: Some(&retry),
+            harness_supports_agent_file: false,
+            prompts: &prompts,
+            resolved_interruptions: &resolved,
+        });
 
         // Verify ordering:
-        // global -> project -> plan -> agent -> retry -> answered_questions
+        // global -> project -> plan -> agent -> retry -> resolved-interruptions
         // -> step -> criteria -> step map -> tests -> focus -> ask-instruction
         let global_pos = prompt.find("# Ralph context").unwrap();
         let project_pos = prompt.find("PROJECT-LAYER").unwrap();
         let plan_pos = prompt.find("# Plan:").unwrap();
         let agent_pos = prompt.find("# Agent Profile").unwrap();
         let retry_pos = prompt.find("# Retry Context").unwrap();
-        let answered_pos = prompt.find("## Previously answered questions").unwrap();
+        let answered_pos = prompt.find("## Resolved interruptions").unwrap();
         let step_pos = prompt.find("## Your step").unwrap();
         let criteria_pos = prompt.find("Acceptance criteria").unwrap();
         let map_pos = prompt.find("## Plan step map").unwrap();
@@ -1138,7 +1559,16 @@ mod tests {
             plan: Some("PLAN-LAYER".to_string()),
         };
 
-        let prompt = build_step_prompt(&plan, &step, &all_steps, None, None, true, &prompts, &[]);
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all_steps,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &prompts,
+            resolved_interruptions: &[],
+        });
 
         // Global and Project stack as plain prefix sections in
         // global → project order. The Plan layer is rendered through
@@ -1156,14 +1586,13 @@ mod tests {
             "plan-layer text must sit inside the # Plan block"
         );
 
-        // Global layer is the very start; the body's focus instruction is
-        // the tail — nothing is appended after it.
+        // Global layer is the very start; the always-on question-ask
+        // instruction is the tail (it stacks after the focus instruction).
         assert!(prompt.starts_with("GLOBAL-LAYER"));
-        assert!(
-            prompt
-                .trim_end()
-                .ends_with(&format!("Focus on: {}", step.title))
-        );
+        let focus_pos = prompt.find(&format!("Focus on: {}", step.title)).unwrap();
+        let ask_pos = prompt.find("## Asking the user a question").unwrap();
+        assert!(focus_pos < ask_pos);
+        assert!(prompt.contains("## Asking the user a question"));
         // The configured plan-layer string appears exactly once (no bare
         // prefix + format_plan_context double-emission).
         assert_eq!(prompt.matches("PLAN-LAYER").count(), 1);
@@ -1184,7 +1613,16 @@ mod tests {
             plan: Some("PLAN-LAYER".to_string()),
         };
 
-        let prompt = build_step_prompt(&plan, &step, &all_steps, None, None, true, &prompts, &[]);
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all_steps,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &prompts,
+            resolved_interruptions: &[],
+        });
 
         // Global is blank and Project is None, so the first section is the
         // Plan-context block. The configured plan-layer text lives inside it.
@@ -1194,37 +1632,34 @@ mod tests {
             !prompt.contains("\n\n\n"),
             "should not produce blank sections"
         );
-        // Pure prefix-stacking — focus instruction is still the tail.
-        assert!(
-            prompt
-                .trim_end()
-                .ends_with(&format!("Focus on: {}", step.title))
-        );
+        // Pure prefix-stacking — the always-on question-ask instruction is
+        // the tail, stacked after the focus instruction.
+        let focus_pos = prompt.find(&format!("Focus on: {}", step.title)).unwrap();
+        let ask_pos = prompt.find("## Asking the user a question").unwrap();
+        assert!(focus_pos < ask_pos);
     }
 
-    // ---- Question injection (TUI-plan.md §17) ----
+    // ---- Question injection (always on — no per-plan opt-out) ----
 
     #[test]
-    fn test_question_ask_instruction_appended_when_questions_enabled() {
-        let mut plan = make_plan();
-        plan.questions_enabled = true;
+    fn test_question_ask_instruction_always_appended() {
+        let plan = make_plan();
         let step = make_step();
         let all_steps = vec![step.clone()];
 
-        let prompt = build_step_prompt(
-            &plan,
-            &step,
-            &all_steps,
-            None,
-            None,
-            true,
-            &Prompts::default(),
-            &[],
-        );
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all_steps,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &Prompts::default(),
+            resolved_interruptions: &[],
+        });
 
-        // Header + a few load-bearing markers from the §17 spec text.
+        // Header + a few load-bearing markers from the ask block.
         assert!(prompt.contains("## Asking the user a question"));
-        assert!(prompt.contains("This plan has questions enabled"));
         assert!(prompt.contains("ralph question ask"));
         assert!(prompt.contains("Most decisions belong in the plan"));
 
@@ -1236,148 +1671,294 @@ mod tests {
     }
 
     #[test]
-    fn test_question_ask_instruction_absent_when_questions_disabled() {
-        let plan = make_plan(); // make_plan() hard-codes questions_enabled = false
-        assert!(!plan.questions_enabled);
-        let step = make_step();
-        let all_steps = vec![step.clone()];
-
-        let prompt = build_step_prompt(
-            &plan,
-            &step,
-            &all_steps,
-            None,
-            None,
-            true,
-            &Prompts::default(),
-            &[],
-        );
-
-        // No header, and no body text from the §17 ask block.
-        assert!(!prompt.contains("## Asking the user a question"));
-        assert!(!prompt.contains("This plan has questions enabled"));
-        // The body text uses unique phrasing — make sure it's gone too.
-        assert!(!prompt.contains("Most decisions belong in the plan"));
-    }
-
-    #[test]
-    fn test_previously_answered_questions_section_renders_qa_pairs() {
+    fn test_resolved_interruptions_section_renders_kind_body_resolution_comment() {
         let plan = make_plan();
         let step = make_step();
         let all_steps = vec![step.clone()];
-        let answered = vec![
-            AnsweredQuestion {
-                question: "Should this use Postgres or SQLite?".to_string(),
-                answer: "SQLite (already a dep)".to_string(),
-            },
-            AnsweredQuestion {
-                question: "Pick a logging crate.".to_string(),
-                answer: "tracing".to_string(),
-            },
+        // Newest-first (as the bounded query returns it).
+        let resolved = vec![
+            resolved_intr(
+                InterruptionKind::Blocker,
+                "Needs sudo to install libfoo",
+                Some("Installed by operator"),
+                Some("ran apt-get install libfoo-dev"),
+            ),
+            resolved_intr(
+                InterruptionKind::Question,
+                "Should this use Postgres or SQLite?",
+                Some("SQLite (already a dep)"),
+                None,
+            ),
         ];
 
-        let prompt = build_step_prompt(
-            &plan,
-            &step,
-            &all_steps,
-            None,
-            None,
-            true,
-            &Prompts::default(),
-            &answered,
-        );
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all_steps,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &Prompts::default(),
+            resolved_interruptions: &resolved,
+        });
 
-        // Section heading is present.
-        assert!(prompt.contains("## Previously answered questions"));
-        // Each Q&A pair renders as a `> Q:` / `> A:` blockquote pair.
-        assert!(prompt.contains("> Q: Should this use Postgres or SQLite?"));
-        assert!(prompt.contains("> A: SQLite (already a dep)"));
-        assert!(prompt.contains("> Q: Pick a logging crate."));
-        assert!(prompt.contains("> A: tracing"));
+        // Section heading present; old heading gone.
+        assert!(prompt.contains("## Resolved interruptions"));
+        assert!(!prompt.contains("## Previously answered questions"));
 
-        // The section sits between Plan context and Step details.
+        // Kind, body, resolution, and comment all render.
+        assert!(prompt.contains("> **blocker**"));
+        assert!(prompt.contains("> Needs sudo to install libfoo"));
+        assert!(prompt.contains("> Resolution: Installed by operator"));
+        assert!(prompt.contains("> Comment: ran apt-get install libfoo-dev"));
+        assert!(prompt.contains("> **question**"));
+        assert!(prompt.contains("> Should this use Postgres or SQLite?"));
+        assert!(prompt.contains("> Resolution: SQLite (already a dep)"));
+
+        // Section sits between Plan context and Step details.
         let plan_pos = prompt.find("# Plan:").unwrap();
-        let answered_pos = prompt.find("## Previously answered questions").unwrap();
+        let sec_pos = prompt.find("## Resolved interruptions").unwrap();
         let step_pos = prompt.find("## Your step").unwrap();
-        assert!(plan_pos < answered_pos);
-        assert!(answered_pos < step_pos);
+        assert!(plan_pos < sec_pos);
+        assert!(sec_pos < step_pos);
 
-        // Pairs render in the order supplied (chronological).
-        let q1_pos = prompt.find("Postgres or SQLite").unwrap();
-        let q2_pos = prompt.find("Pick a logging crate").unwrap();
-        assert!(q1_pos < q2_pos);
+        // Rendered in the order supplied (newest-first).
+        let blocker_pos = prompt.find("> **blocker**").unwrap();
+        let question_pos = prompt.find("> **question**").unwrap();
+        assert!(blocker_pos < question_pos);
     }
 
     #[test]
-    fn test_previously_answered_questions_absent_when_empty() {
+    fn test_resolved_interruptions_absent_when_empty() {
         let plan = make_plan();
         let step = make_step();
         let all_steps = vec![step.clone()];
 
-        let prompt = build_step_prompt(
-            &plan,
-            &step,
-            &all_steps,
-            None,
-            None,
-            true,
-            &Prompts::default(),
-            &[],
-        );
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all_steps,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &Prompts::default(),
+            resolved_interruptions: &[],
+        });
 
-        assert!(!prompt.contains("## Previously answered questions"));
-        // No stray blockquote markers from this section either.
-        assert!(!prompt.contains("> Q:"));
-        assert!(!prompt.contains("> A:"));
+        assert!(!prompt.contains("## Resolved interruptions"));
+        // No stray section blockquote markers.
+        assert!(!prompt.contains("> Resolution:"));
+        assert!(!prompt.contains("> Comment:"));
     }
 
     #[test]
-    fn test_question_features_independent() {
-        // The "Previously answered questions" section is gated on the
-        // `answered_questions` slice, NOT on `questions_enabled`. If a plan
-        // had questions enabled, got answers, and then the user toggled the
-        // flag off, we still want the harness to see the answers it received
-        // on the prior attempt — otherwise the user's input is silently
-        // dropped from the next retry. Conversely, enabling questions on a
-        // fresh plan must not synthesize an empty section.
-        let mut plan = make_plan();
+    fn test_resolved_interruptions_gated_only_on_the_slice() {
+        // The "Resolved interruptions" section is gated solely on the
+        // `resolved_interruptions` slice: present when there's a resolution,
+        // absent when empty. The ask-instruction is always present (questions
+        // are always enabled), independent of whether anything was resolved.
+        let plan = make_plan();
         let step = make_step();
         let all_steps = vec![step.clone()];
-        let answered = vec![AnsweredQuestion {
-            question: "Q?".to_string(),
-            answer: "A.".to_string(),
-        }];
+        let resolved = vec![resolved_intr(
+            InterruptionKind::Question,
+            "Q?",
+            Some("A."),
+            None,
+        )];
 
-        // Case 1: questions disabled, but answers exist (toggled-off-after-
-        // answering). Section IS rendered; ask-instruction is NOT.
-        plan.questions_enabled = false;
-        let prompt = build_step_prompt(
-            &plan,
-            &step,
-            &all_steps,
-            None,
-            None,
-            true,
-            &Prompts::default(),
-            &answered,
-        );
-        assert!(prompt.contains("## Previously answered questions"));
-        assert!(!prompt.contains("## Asking the user a question"));
-
-        // Case 2: questions enabled, but no answers yet. Ask-instruction IS
-        // rendered; previously-answered section is NOT.
-        plan.questions_enabled = true;
-        let prompt = build_step_prompt(
-            &plan,
-            &step,
-            &all_steps,
-            None,
-            None,
-            true,
-            &Prompts::default(),
-            &[],
-        );
-        assert!(!prompt.contains("## Previously answered questions"));
+        // Case 1: a resolution exists. Section IS rendered; ask-instruction
+        // is ALSO rendered.
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all_steps,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &Prompts::default(),
+            resolved_interruptions: &resolved,
+        });
+        assert!(prompt.contains("## Resolved interruptions"));
         assert!(prompt.contains("## Asking the user a question"));
+
+        // Case 2: nothing resolved yet. Ask-instruction IS rendered; resolved
+        // section is NOT.
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all_steps,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &Prompts::default(),
+            resolved_interruptions: &[],
+        });
+        assert!(!prompt.contains("## Resolved interruptions"));
+        assert!(prompt.contains("## Asking the user a question"));
+    }
+
+    // ---- Reviewer prompt (STEP 36; §8 / §9-inv-2 / Decision 5) ----
+
+    #[test]
+    fn test_build_review_prompt_basic_structure() {
+        let plan = make_plan();
+        let mut step = make_step();
+        step.short_id = "abcd1234".to_string();
+        step.acceptance_criteria = vec![
+            "spawn_harness() works".to_string(),
+            "Tests pass".to_string(),
+        ];
+
+        let diff = "diff --git a/src/x.rs b/src/x.rs\n\
+                    @@ -1 +1 @@\n-old\n+new";
+        let prompt = build_review_prompt(&plan, &step, "deadbee", 2, diff);
+
+        // Plan + step titles, NOT the plan description body.
+        assert!(prompt.contains("**Plan:** test-plan"));
+        assert!(prompt.contains("Implement harness spawning"));
+        assert!(
+            !prompt.contains("Build a new feature for the project"),
+            "reviewer prompt must NOT carry the plan description (§8: titles \
+             + acceptance criteria only)"
+        );
+
+        // Acceptance criteria ARE the rubric.
+        assert!(prompt.contains("## Acceptance criteria"));
+        assert!(prompt.contains("- spawn_harness() works"));
+        assert!(prompt.contains("- Tests pass"));
+
+        // The single commit diff, framed with the <short_id>.<n> handle.
+        assert!(prompt.contains("abcd1234.2"));
+        assert!(prompt.contains("deadbee"));
+        assert!(prompt.contains("+new"));
+
+        // §8 read-only instruction + verdict contract.
+        assert!(prompt.contains("READ-ONLY"));
+        assert!(prompt.contains("Do NOT modify"));
+        assert!(prompt.contains("corrective step"));
+        assert!(prompt.contains("REVIEW PASS"));
+        assert!(prompt.contains("REVIEW FAIL"));
+
+        // NONE of build_step_prompt's sections leak in (separate assembly).
+        assert!(!prompt.contains("## Plan step map"));
+        assert!(!prompt.contains("Post-harness validation"));
+        assert!(!prompt.contains("## Asking the user a question"));
+        assert!(!prompt.contains("# Retry Context"));
+    }
+
+    /// HARD-INVARIANT PROOF (Decision 5 / §4 / §9): the reviewer prompt
+    /// carries **exactly one** commit's diff and **zero** cumulative or
+    /// dependency diffs. We feed a single-commit `git show`-shaped patch and
+    /// assert there is exactly one diff fence and exactly one `diff --git`
+    /// header — i.e. the prompt did not (and structurally cannot) splice in a
+    /// prior step's / dependency's / range diff.
+    #[test]
+    fn test_review_prompt_is_o1_single_commit_diff_only() {
+        let plan = make_plan();
+        let mut step = make_step();
+        step.short_id = "ff00ff00".to_string();
+
+        // One commit's `git show --patch` output: a single `diff --git`
+        // header. (A cumulative/range diff would contain several.)
+        let one_commit_diff = "diff --git a/src/a.rs b/src/a.rs\n\
+             index 111..222 100644\n\
+             --- a/src/a.rs\n\
+             +++ b/src/a.rs\n\
+             @@ -1,2 +1,2 @@\n\
+             -let x = 1;\n\
+             +let x = 2;";
+
+        let prompt = build_review_prompt(&plan, &step, "abc1234", 1, one_commit_diff);
+
+        // Exactly one fenced ```diff block.
+        assert_eq!(
+            prompt.matches("```diff").count(),
+            1,
+            "reviewer prompt must contain exactly ONE diff block (O(1) — \
+             Decision 5). Prompt:\n{prompt}"
+        );
+        // Exactly one `diff --git` header — proves no cumulative/dependency
+        // diff was concatenated in (those carry one header per file/commit).
+        assert_eq!(
+            prompt.matches("diff --git").count(),
+            1,
+            "reviewer prompt must carry exactly one commit's diff, never a \
+             cumulative or dependency diff (§9 hard invariant). Prompt:\n{prompt}"
+        );
+        // And the diff content is precisely what the caller supplied,
+        // verbatim — the builder neither expands nor accumulates it.
+        assert!(prompt.contains(one_commit_diff));
+    }
+
+    /// §4 fix proof: even when many resolved interruptions with very long
+    /// fields are passed, the rendered section is bounded in BOTH
+    /// dimensions — entry count (caller's slice, which in production is the
+    /// bounded query) AND per-field length (`truncate_text` inside the
+    /// formatter). This test feeds the formatter a deliberately oversized
+    /// input and asserts the output is small.
+    #[test]
+    fn test_resolved_interruptions_section_is_bounded_in_count_and_per_field() {
+        let plan = make_plan();
+        let step = make_step();
+        let all_steps = vec![step.clone()];
+
+        // Production passes at most DEFAULT_RESOLVED_INTERRUPTION_LIMIT (5)
+        // entries; emulate that bound here and make every field pathological
+        // (5000 lines each).
+        const N: usize = crate::storage::DEFAULT_RESOLVED_INTERRUPTION_LIMIT;
+        let huge = (0..5000)
+            .map(|i| format!("line-{i}-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let resolved: Vec<Interruption> = (0..N)
+            .map(|_| resolved_intr(InterruptionKind::Question, &huge, Some(&huge), Some(&huge)))
+            .collect();
+
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all_steps,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &Prompts::default(),
+            resolved_interruptions: &resolved,
+        });
+
+        // Isolate the rendered section (from its heading to the next `## `
+        // heading) so we measure only this section's contribution.
+        let start = prompt.find("## Resolved interruptions").unwrap();
+        let rest = &prompt[start + "## Resolved interruptions".len()..];
+        let end = rest
+            .find("\n## ")
+            .map(|p| start + p)
+            .unwrap_or(prompt.len());
+        let section = &prompt[start..end];
+
+        // (1) Per-field truncation fired — the elision marker is present and
+        // the raw 5000-line field did NOT survive intact.
+        assert!(
+            section.contains("lines omitted"),
+            "each oversized field must be truncate_text'd"
+        );
+        assert!(
+            !section.contains("line-4999-"),
+            "the tail of a 5000-line field must be dropped"
+        );
+
+        // (2) Hard upper bound on the whole section's line count:
+        // N entries × (1 kind line + 3 separators + 3 fields ×
+        // (FIELD_MAX_LINES + 1 elision + 1 label)) + heading/blank/sep slack.
+        // Use a generous but FINITE ceiling that does NOT scale with the
+        // 5000-line input.
+        let section_lines = section.lines().count();
+        let ceiling = N * (3 * (RESOLVED_INTERRUPTION_FIELD_MAX_LINES + 4) + 8) + 8;
+        assert!(
+            section_lines <= ceiling,
+            "section must be bounded: {section_lines} lines > ceiling {ceiling}"
+        );
+        // Sanity: the ceiling is far below the unbounded size (≈ N×3×5000).
+        assert!(ceiling < N * 3 * 5000 / 10);
     }
 }

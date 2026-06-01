@@ -21,6 +21,7 @@ use crate::tui::help::HelpState;
 use crate::tui::read_only::ReadOnly;
 use crate::tui::selection::Selection;
 use crate::tui::toast::ToastQueue;
+use crate::tui::views::outline_view::OutlineState;
 use crate::tui::widgets::palette_bar::PaletteBarState;
 
 // ---------------------------------------------------------------------------
@@ -148,7 +149,7 @@ pub struct PlanDetailApp {
     /// dispatcher updates this each poll tick via [`Self::set_read_only`].
     pub read_only: ReadOnly,
 
-    /// Open (unanswered) `step_questions` rows for this plan, ordered oldest
+    /// Open question `interruptions` rows for this plan, ordered oldest
     /// first per [`crate::storage::list_open_questions`]. Drives the §17
     /// banner pane and the `A` keybinding that pushes step-detail focused on
     /// the originating step. Refreshed by the dispatcher each poll tick.
@@ -204,6 +205,16 @@ pub struct PlanDetailApp {
     /// opens step-detail (the same effect as pressing `Enter`), then
     /// clears it. `None` means no pending mouse-driven open.
     pub pending_open_step: Option<String>,
+
+    /// Dependency-outline state (docs/dag-redesign.md §12.1/§12.2): the
+    /// topological projection of `steps` + the focus/re-root stack. The
+    /// dispatcher refreshes it each poll tick from
+    /// `storage::list_step_dependency_edges` + the open-interruption set;
+    /// the renderer draws `outline.visible_rows()` instead of the flat
+    /// `steps` list. `selected_index` is mirrored to/from
+    /// `outline.cursor()` so the existing skip/reset/delete cursor-target
+    /// helpers keep working against the visible row.
+    pub outline: OutlineState,
 }
 
 impl PlanDetailApp {
@@ -211,6 +222,7 @@ impl PlanDetailApp {
     pub fn new(plan: Plan, steps: Vec<Step>, config: &Config) -> Self {
         let mut list_state = ListState::default();
         list_state.select(Some(0));
+        let outline = OutlineState::new(steps.clone(), Default::default(), Default::default());
         Self {
             plan,
             steps,
@@ -246,6 +258,12 @@ impl PlanDetailApp {
             dragging_split: false,
             step_list_area: Rect::default(),
             pending_open_step: None,
+            // Edges/blocked set are unknown at construction (no DB handle
+            // here); the dispatcher populates them on the first poll via
+            // [`Self::sync_outline`]. Until then the outline degrades to the
+            // bare step set with synthesized depth 0 — identical rows to the
+            // old flat list, so first-frame rendering never regresses.
+            outline,
         }
     }
 
@@ -279,15 +297,23 @@ impl PlanDetailApp {
         }
     }
 
-    /// Map a click at `(column, row)` to a step index in the left-pane
-    /// list, accounting for the persistent chrome (the `step_list_area`
-    /// already excludes the top/bottom chrome rows because it's the
-    /// post-`chrome::render` body), the `Block::borders(ALL)` 1-cell frame
-    /// the `step_list` widget draws, and the scroll-aware `ListState`
-    /// offset. Returns `None` for clicks on the border or outside the list,
-    /// or before the first draw. Single-line rows, so the row delta maps
-    /// 1:1 to the visible item.
-    fn step_at(&self, column: u16, row: u16) -> Option<usize> {
+    /// Map a click at `(column, row)` to **the clicked outline row's index
+    /// and its step id**, accounting for the persistent chrome (the
+    /// `step_list_area` already excludes the top/bottom chrome rows because
+    /// it's the post-`chrome::render` body), the `Block::borders(ALL)`
+    /// 1-cell frame the `step_list` widget draws, and the scroll-aware
+    /// `ListState` offset. Returns `None` for clicks on the border or
+    /// outside the list, or before the first draw. Single-line rows, so the
+    /// row delta maps 1:1 to the visible item.
+    ///
+    /// The rendered rows are `outline.visible_rows()` (topological,
+    /// focus-filtered) — docs/dag-redesign.md §12.1/§12.2 — *not* the flat
+    /// `self.steps` order. So the hit-test must index into
+    /// `outline.visible_rows()` (the same index space the cursor lives in),
+    /// never `self.steps`, or a non-linear / focused DAG resolves the wrong
+    /// step. Returns the outline row index (for moving the outline cursor)
+    /// paired with that row's step id (the open-step-detail target).
+    fn step_at(&self, column: u16, row: u16) -> Option<(usize, String)> {
         use ratatui::layout::Position;
 
         let area = self.step_list_area;
@@ -308,11 +334,12 @@ impl PlanDetailApp {
         }
         let visible_row = (row - inner.y) as usize;
         let idx = self.list_state.offset() + visible_row;
-        if idx < self.steps.len() {
-            Some(idx)
-        } else {
-            None
-        }
+        // Hit-test against the *outline's* visible rows (same index space as
+        // `outline.cursor()`), respecting the scroll offset + focus filter.
+        self.outline
+            .visible_rows()
+            .get(idx)
+            .map(|r| (idx, r.step_id.clone()))
     }
 
     /// Mouse-event entry point routed from the dispatcher's event loop.
@@ -322,10 +349,19 @@ impl PlanDetailApp {
     /// list doesn't get reinterpreted as a row click. Otherwise:
     ///
     /// * a left press within ±1 column of the divider arms a resize drag;
-    /// * a left press on a step row selects it, and a second press on the
-    ///   *already-highlighted* row drills into step-detail (the same effect
-    ///   as `Enter`) via [`Self::pending_open_step`];
-    /// * the scroll wheel maps to `k` / `j` (cursor up / down).
+    /// * a left press on a step row moves the **outline** cursor to it
+    ///   (then realigns `selected_index`), and a second press on the
+    ///   *already-selected* outline row drills into step-detail (the same
+    ///   effect as `Enter`) via [`Self::pending_open_step`];
+    /// * the scroll wheel moves the **outline** cursor up / down (mirrors
+    ///   `k` / `j`), then realigns `selected_index`.
+    ///
+    /// Both the click and scroll paths route through `self.outline`
+    /// (docs/dag-redesign.md §12.1/§12.2) so the rendered highlight — which
+    /// follows `outline.cursor()` — tracks the mouse on **any** DAG shape
+    /// (linear, non-linear, focused/re-rooted), exactly as the keyboard
+    /// path does. For the degenerate no-edge linear case the outline order
+    /// equals construction order, so behavior is identical to before.
     ///
     /// Subsequent drags recompute `split_pct` from
     /// `cursor_column / last_body_width` (clamped 20..=80); release clears
@@ -334,14 +370,21 @@ impl PlanDetailApp {
         use crossterm::event::{MouseButton, MouseEventKind};
 
         // Scroll wheel works regardless of body width / draw state and is
-        // independent of the divider drag — mirror `k` / `j`.
+        // independent of the divider drag — mirror `k` / `j`. The keyboard
+        // path moves the *outline* cursor then realigns `selected_index`
+        // (plan_detail_input.rs), so the scroll wheel must too: driving the
+        // flat navigators would leave the rendered highlight (which follows
+        // `outline.cursor()`) frozen on a non-linear / focused DAG
+        // (docs/dag-redesign.md §12.1).
         match event.kind {
             MouseEventKind::ScrollUp => {
-                self.navigate_up();
+                self.outline.navigate_up();
+                self.realign_selection_to_outline();
                 return;
             }
             MouseEventKind::ScrollDown => {
-                self.navigate_down();
+                self.outline.navigate_down();
+                self.realign_selection_to_outline();
                 return;
             }
             _ => {}
@@ -366,13 +409,24 @@ impl PlanDetailApp {
                     self.dragging_split = true;
                     return;
                 }
-                if let Some(idx) = self.step_at(event.column, event.row) {
-                    if idx == self.selected_index {
+                if let Some((idx, step_id)) = self.step_at(event.column, event.row) {
+                    // Compare the clicked row's step id against the outline's
+                    // currently-selected step id — same index space (the
+                    // rendered highlight is driven by `outline.cursor()`),
+                    // so the "second click on the already-selected row enters
+                    // it" contract (CLAUDE.md) can't misfire across the flat
+                    // vs. outline index spaces on a non-linear/focused DAG.
+                    if self.outline.selected_step_id().as_deref() == Some(step_id.as_str()) {
                         // Click on the highlighted row → same as Enter.
-                        self.pending_open_step = Some(self.steps[idx].id.clone());
+                        self.pending_open_step = Some(step_id);
                     } else {
-                        // Click on a different row → just move the cursor.
-                        self.selected_index = idx;
+                        // Click on a different row → move the OUTLINE cursor
+                        // to it (mirrors the keyboard / `/focus` palette
+                        // path; never pokes a divergent flat index), then
+                        // realign `selected_index` so the cursor-target
+                        // helpers (skip/reset/delete) stay correct.
+                        self.outline.set_cursor(idx);
+                        self.realign_selection_to_outline();
                     }
                 }
             }
@@ -500,15 +554,13 @@ impl PlanDetailApp {
     /// Returns `Some(step_id)` if the selected step is in a skippable status,
     /// or `None` if skipping is not allowed (e.g. step is already complete).
     pub fn request_skip(&self) -> Option<String> {
-        if self.steps.is_empty() {
-            return None;
-        }
-        let step = &self.steps[self.selected_index];
+        let step = self.selected_step()?;
         match step.status {
             StepStatus::Pending
             | StepStatus::InProgress
             | StepStatus::Failed
-            | StepStatus::Aborted => Some(step.id.clone()),
+            | StepStatus::Aborted
+            | StepStatus::Blocked => Some(step.id.clone()),
             StepStatus::Complete | StepStatus::Skipped => None,
         }
     }
@@ -586,8 +638,8 @@ impl PlanDetailApp {
     pub fn delete_targets(&self) -> Vec<String> {
         if !self.selection.is_empty() {
             self.selection.as_slice().to_vec()
-        } else if !self.steps.is_empty() {
-            vec![self.steps[self.selected_index].id.clone()]
+        } else if let Some(step) = self.selected_step() {
+            vec![step.id.clone()]
         } else {
             Vec::new()
         }
@@ -598,11 +650,7 @@ impl PlanDetailApp {
     /// Step ID to reset, or `None` when the step list is empty. Cursor-only
     /// (selection is ignored — reset is a single-step operation).
     pub fn reset_target(&self) -> Option<String> {
-        if self.steps.is_empty() {
-            None
-        } else {
-            Some(self.steps[self.selected_index].id.clone())
-        }
+        self.selected_step().map(|s| s.id.clone())
     }
 
     // -- Move (Shift-J / Shift-K) -----------------------------------------
@@ -740,6 +788,61 @@ impl PlanDetailApp {
         let valid: std::collections::HashSet<String> =
             self.steps.iter().map(|s| s.id.clone()).collect();
         self.selection.retain(|id| valid.contains(id));
+    }
+
+    /// Refresh the dependency-outline projection from a DB poll
+    /// (docs/dag-redesign.md §12.1). `deps_of` is
+    /// `storage::list_step_dependency_edges`; `blocked_ids` is the set of
+    /// step ids with ≥1 open interruption (drives the derived `Blocked`
+    /// overlay — §3.3). The focus stack + cursor are preserved by id via
+    /// [`OutlineState::sync`]. After syncing, `selected_index` is realigned
+    /// to the visible-row cursor so the existing cursor-target helpers
+    /// (`request_skip`, `reset_target`, …) operate on the row the user
+    /// actually sees.
+    pub fn sync_outline(
+        &mut self,
+        deps_of: std::collections::HashMap<String, Vec<String>>,
+        blocked_ids: std::collections::HashSet<String>,
+    ) {
+        self.outline.sync(self.steps.clone(), deps_of, blocked_ids);
+        self.realign_selection_to_outline();
+    }
+
+    /// Mirror the outline's visible-row cursor onto `selected_index` so the
+    /// flat-list cursor-target helpers stay correct under the topological /
+    /// focused ordering. `selected_index` indexes `self.steps`; the outline
+    /// cursor indexes the *visible* rows, so we resolve the cursor's step id
+    /// back to its `self.steps` position.
+    pub fn realign_selection_to_outline(&mut self) {
+        if let Some(step_id) = self.outline.selected_step_id()
+            && let Some(idx) = self.steps.iter().position(|s| s.id == step_id)
+        {
+            self.selected_index = idx;
+        }
+    }
+
+    /// Resolve the step the cursor-target helpers (skip/reset/delete) should
+    /// act on, going through the outline — the source of truth for what the
+    /// user actually sees — first. On a focused / re-rooted DAG,
+    /// [`Self::realign_selection_to_outline`] can fail to resolve the outline's
+    /// selected id back into `self.steps`, leaving `selected_index` stale; so
+    /// we resolve `outline.selected_step_id()` against `self.steps` here and
+    /// only fall back to the `selected_index` path when the outline yields
+    /// nothing (e.g. an empty outline). Mirrors the Enter/open path, which was
+    /// already hardened to resolve through the outline.
+    fn selected_step(&self) -> Option<&Step> {
+        if let Some(id) = self.outline.selected_step_id()
+            && let Some(s) = self.steps.iter().find(|s| s.id == id)
+        {
+            return Some(s);
+        }
+        self.steps.get(self.selected_index)
+    }
+
+    /// True while the outline is re-rooted on a focus step (§12.2). Drives
+    /// the breadcrumb suffix and the `Z`/Esc pop affordance.
+    pub fn outline_focused(&self) -> bool {
+        self.outline.focus_root().is_some()
     }
 
     // -- Live-run snapshot ------------------------------------------------
@@ -976,6 +1079,8 @@ impl PlanDetailApp {
             StepStatus::Failed => "✘",
             StepStatus::Skipped => "⊘",
             StepStatus::Aborted => "⊘",
+            // §3.3 derived overlay (open interruption — question or blocker).
+            StepStatus::Blocked => "?",
         }
     }
 }
@@ -1024,7 +1129,6 @@ fn visible_window(tail: &VecDeque<String>, visible: usize, scroll: usize) -> Vec
     tail.iter().skip(start).take(end - start).cloned().collect()
 }
 
-#[allow(dead_code)]
 const _: () = {
     // Sanity check: we expect the visible window default to be smaller than
     // the buffered total so users can scroll beyond the on-screen tail.
@@ -1053,13 +1157,13 @@ mod tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
-            retry_strategy: None,
+            review_enabled: None,
+            max_review_corrections: None,
         }
     }
 
@@ -1067,6 +1171,7 @@ mod tests {
         (0..n)
             .map(|i| Step {
                 id: format!("s{i}"),
+                short_id: String::new(),
                 plan_id: "p1".to_string(),
                 // Use a0, a1, a2, ... so we have valid frac-index keys with
                 // room between them (a0 < a1 admits a midpoint via key_between).
@@ -1091,7 +1196,9 @@ mod tests {
                 skipped_reason: None,
                 change_policy: crate::plan::ChangePolicy::Required,
                 tags: vec![],
-                retry_strategy: None,
+                review_enabled: None,
+                review_status: None,
+                corrects_step_id: None,
             })
             .collect()
     }
@@ -1266,8 +1373,10 @@ mod tests {
         let steps = make_steps(3);
         let mut app = PlanDetailApp::new(plan, steps, &Config::default());
 
-        // Select the in_progress step
-        app.selected_index = 1;
+        // Select the in_progress step via the outline cursor (the source of
+        // truth the cursor-target helpers resolve through).
+        app.outline.set_cursor(1);
+        app.realign_selection_to_outline();
         let result = app.request_skip();
         assert!(result.is_some());
         assert_eq!(result.unwrap(), "s1"); // step index 1 = id "s1"
@@ -1279,8 +1388,9 @@ mod tests {
         let steps = make_steps(3);
         let mut app = PlanDetailApp::new(plan, steps, &Config::default());
 
-        // Select the complete step
-        app.selected_index = 0;
+        // Select the complete step via the outline cursor.
+        app.outline.set_cursor(0);
+        app.realign_selection_to_outline();
         let result = app.request_skip();
         assert!(result.is_none()); // Can't skip a completed step
     }
@@ -1351,6 +1461,7 @@ mod tests {
 
         let new_step = Step {
             id: "s_new".to_string(),
+            short_id: String::new(),
             plan_id: "p1".to_string(),
             sort_key: "a0V".to_string(),
             title: "Inserted step".to_string(),
@@ -1367,7 +1478,9 @@ mod tests {
             skipped_reason: None,
             change_policy: crate::plan::ChangePolicy::Required,
             tags: vec![],
-            retry_strategy: None,
+            review_enabled: None,
+            review_status: None,
+            corrects_step_id: None,
         };
 
         app.insert_step(new_step);
@@ -1567,7 +1680,8 @@ mod tests {
         let plan = make_plan();
         let steps = make_steps(3);
         let mut app = PlanDetailApp::new(plan, steps, &Config::default());
-        app.selected_index = 2;
+        app.outline.set_cursor(2);
+        app.realign_selection_to_outline();
         assert_eq!(app.delete_targets(), vec!["s2".to_string()]);
     }
 
@@ -1603,9 +1717,11 @@ mod tests {
         let plan = make_plan();
         let steps = make_steps(3);
         let mut app = PlanDetailApp::new(plan, steps, &Config::default());
-        app.selected_index = 0;
+        app.outline.set_cursor(0);
+        app.realign_selection_to_outline();
         assert_eq!(app.reset_target(), Some("s0".to_string()));
-        app.selected_index = 2;
+        app.outline.set_cursor(2);
+        app.realign_selection_to_outline();
         assert_eq!(app.reset_target(), Some("s2".to_string()));
     }
 
@@ -2366,11 +2482,24 @@ mod tests {
         app
     }
 
+    /// Park the outline cursor on visible row `idx` (the §12.1 cursor source
+    /// of truth) the way the keyboard / `/focus` path does, then realign
+    /// `selected_index`. The pre-overhaul mouse tests poked `selected_index`
+    /// directly; after the §12.1 outline cutover the rendered highlight is
+    /// driven by `outline.cursor()`, so tests must move the cursor through
+    /// the outline. `make_steps` has empty `short_id` + ascending
+    /// `sort_key`, so with no edges the outline order == construction order
+    /// == `idx`.
+    fn outline_cursor_to(app: &mut PlanDetailApp, idx: usize) {
+        app.outline.set_cursor(idx);
+        app.realign_selection_to_outline();
+    }
+
     #[test]
     fn click_on_highlighted_step_enters_detail() {
         use crossterm::event::{MouseButton, MouseEventKind};
         let mut app = list_app(4);
-        app.selected_index = 2;
+        outline_cursor_to(&mut app, 2);
         // Inner list row for index 2 is y = 1 (area.y) + 1 (border) + 2.
         app.handle_mouse(mouse_event(5, 4, MouseEventKind::Down(MouseButton::Left)));
         assert_eq!(
@@ -2379,6 +2508,11 @@ mod tests {
             "click on the highlighted row should request opening that step"
         );
         assert_eq!(app.selected_index, 2, "selection unchanged");
+        assert_eq!(
+            app.outline.selected_step_id().as_deref(),
+            Some("s2"),
+            "outline cursor unchanged on the re-click"
+        );
         assert!(!app.dragging_split);
     }
 
@@ -2386,10 +2520,15 @@ mod tests {
     fn click_on_other_step_selects_only() {
         use crossterm::event::{MouseButton, MouseEventKind};
         let mut app = list_app(4);
-        app.selected_index = 0;
+        outline_cursor_to(&mut app, 0);
         // Row for index 3: y = 1 + 1 + 3 = 5.
         app.handle_mouse(mouse_event(5, 5, MouseEventKind::Down(MouseButton::Left)));
-        assert_eq!(app.selected_index, 3, "click moves the cursor");
+        assert_eq!(app.selected_index, 3, "click moves the flat cursor");
+        assert_eq!(
+            app.outline.selected_step_id().as_deref(),
+            Some("s3"),
+            "click moves the OUTLINE cursor (drives the rendered highlight)"
+        );
         assert!(
             app.take_pending_open_step().is_none(),
             "a non-highlighted click must not enter detail"
@@ -2400,15 +2539,30 @@ mod tests {
     fn click_accounts_for_scroll_offset() {
         use crossterm::event::{MouseButton, MouseEventKind};
         let mut app = list_app(20);
-        // Scrolled so the first visible item is index 5.
+        // Scrolled so the first visible item is *outline* row 5. The click
+        // must hit-test against `outline.visible_rows()[offset + visible_row]`
+        // (the rendered index space — §12.1), not `self.steps[idx]`; compute
+        // the expected target from the outline so the assertion tracks the
+        // real rendered order rather than a fragile hard-coded ordinal.
+        let expected = app.outline.visible_rows()[5].step_id.clone();
         app.list_state.select(Some(7));
         *app.list_state.offset_mut() = 5;
-        app.selected_index = 7;
-        // First inner row (y = 2) maps to offset 5 + 0 = index 5.
+        outline_cursor_to(&mut app, 7);
+        // First inner row (y = 2) maps to offset 5 + 0 = outline row 5.
         app.handle_mouse(mouse_event(3, 2, MouseEventKind::Down(MouseButton::Left)));
         assert_eq!(
-            app.selected_index, 5,
-            "row→index must add the scroll offset"
+            app.outline.cursor(),
+            5,
+            "outline row→cursor must add the scroll offset"
+        );
+        assert_eq!(
+            app.outline.selected_step_id(),
+            Some(expected.clone()),
+            "the offset-adjusted outline row drives the cursor"
+        );
+        assert_eq!(
+            app.steps[app.selected_index].id, expected,
+            "selected_index realigns onto the same step the outline resolved"
         );
         assert!(app.take_pending_open_step().is_none());
     }
@@ -2417,12 +2571,17 @@ mod tests {
     fn click_on_border_or_outside_is_ignored() {
         use crossterm::event::{MouseButton, MouseEventKind};
         let mut app = list_app(4);
-        app.selected_index = 1;
+        outline_cursor_to(&mut app, 1);
         // The top border row (y == area.y == 1) is not a content row.
         app.handle_mouse(mouse_event(5, 1, MouseEventKind::Down(MouseButton::Left)));
         // A click well past the last step (only 4 steps) is also ignored.
         app.handle_mouse(mouse_event(5, 18, MouseEventKind::Down(MouseButton::Left)));
         assert_eq!(app.selected_index, 1, "out-of-list clicks change nothing");
+        assert_eq!(
+            app.outline.selected_step_id().as_deref(),
+            Some("s1"),
+            "out-of-list clicks must not move the outline cursor"
+        );
         assert!(app.take_pending_open_step().is_none());
     }
 
@@ -2431,12 +2590,16 @@ mod tests {
         use crossterm::event::MouseEventKind;
         let mut app = list_app(5);
         assert_eq!(app.selected_index, 0);
+        assert_eq!(app.outline.cursor(), 0);
         app.handle_mouse(mouse_event(5, 4, MouseEventKind::ScrollDown));
         assert_eq!(app.selected_index, 1, "ScrollDown behaves like j");
+        assert_eq!(app.outline.cursor(), 1, "scroll moves the OUTLINE cursor");
         app.handle_mouse(mouse_event(5, 4, MouseEventKind::ScrollDown));
         assert_eq!(app.selected_index, 2);
+        assert_eq!(app.outline.cursor(), 2);
         app.handle_mouse(mouse_event(5, 4, MouseEventKind::ScrollUp));
         assert_eq!(app.selected_index, 1, "ScrollUp behaves like k");
+        assert_eq!(app.outline.cursor(), 1);
     }
 
     #[test]
@@ -2470,5 +2633,199 @@ mod tests {
         app.handle_mouse(mouse_event(2, 2, MouseEventKind::Down(MouseButton::Left)));
         assert_eq!(app.selected_index, 0);
         assert!(app.take_pending_open_step().is_none());
+    }
+
+    // -- Mouse on the dependency outline (docs/dag-redesign.md §12.1/§12.2) -
+    //
+    // These pin the §12.1 defect fix: the mouse path must hit-test /
+    // navigate in `outline.visible_rows()`'s index space (topological,
+    // focus-filtered), not the flat `self.steps` order, so click + scroll
+    // behave correctly on a non-linear and a focused/re-rooted DAG.
+
+    fn dag_step(id: &str, short_id: &str, sort_key: &str) -> Step {
+        Step {
+            id: id.to_string(),
+            short_id: short_id.to_string(),
+            plan_id: "p1".to_string(),
+            sort_key: sort_key.to_string(),
+            title: format!("step {short_id}"),
+            description: String::new(),
+            agent: None,
+            harness: None,
+            acceptance_criteria: vec![],
+            status: StepStatus::Pending,
+            attempts: 0,
+            max_retries: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            model: None,
+            skipped_reason: None,
+            change_policy: crate::plan::ChangePolicy::Required,
+            tags: vec![],
+            review_enabled: None,
+            review_status: None,
+            corrects_step_id: None,
+        }
+    }
+
+    /// A diamond DAG (a → {b, c} → d) whose `self.steps` storage order is
+    /// deliberately *scrambled* (`[d, b, a, c]`) so it differs from the
+    /// topological `visible_rows()` order (`[a, b, c, d]`). Any hit-test
+    /// that indexed `self.steps` would resolve the wrong step here.
+    fn diamond_app() -> PlanDetailApp {
+        let steps = vec![
+            dag_step("ud", "dddd", "a3"),
+            dag_step("ub", "bbbb", "a1"),
+            dag_step("ua", "aaaa", "a0"),
+            dag_step("uc", "cccc", "a2"),
+        ];
+        let mut app = PlanDetailApp::new(make_plan(), steps, &Config::default());
+        app.last_body_width = 100;
+        app.step_list_area = ratatui::layout::Rect {
+            x: 0,
+            y: 1,
+            width: 40,
+            height: 20,
+        };
+        let mut deps_of: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        deps_of.insert("ub".to_string(), vec!["ua".to_string()]);
+        deps_of.insert("uc".to_string(), vec!["ua".to_string()]);
+        deps_of.insert("ud".to_string(), vec!["ub".to_string(), "uc".to_string()]);
+        app.sync_outline(deps_of, std::collections::HashSet::new());
+        app
+    }
+
+    #[test]
+    fn click_on_nonlinear_dag_resolves_outline_row_not_steps_index() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = diamond_app();
+        // Topological visible order: [aaaa(ua), bbbb(ub), cccc(uc), dddd(ud)].
+        let rows = app.outline.visible_rows();
+        assert_eq!(
+            rows.iter().map(|r| r.short_id.as_str()).collect::<Vec<_>>(),
+            vec!["aaaa", "bbbb", "cccc", "dddd"],
+        );
+        // Click visible row k = 2 (cccc / "uc"). Inner row y = 1 + 1 + 2 = 4.
+        app.handle_mouse(mouse_event(5, 4, MouseEventKind::Down(MouseButton::Left)));
+        // Outline cursor + selected_index + resolved step id all agree, and
+        // they point at visible_rows()[2] = uc — NOT self.steps[2] (= "ua").
+        assert_eq!(app.outline.cursor(), 2);
+        assert_eq!(app.outline.selected_step_id().as_deref(), Some("uc"));
+        assert_eq!(
+            app.selected_index, 3,
+            "self.steps position of uc (scrambled order)"
+        );
+        assert_eq!(app.steps[app.selected_index].id, "uc");
+        assert!(
+            app.take_pending_open_step().is_none(),
+            "first click only selects"
+        );
+
+        // Second click on the SAME visible row → open that exact step.
+        app.handle_mouse(mouse_event(5, 4, MouseEventKind::Down(MouseButton::Left)));
+        assert_eq!(
+            app.take_pending_open_step(),
+            Some("uc".to_string()),
+            "repeat click on the selected outline row opens that step"
+        );
+        assert_eq!(app.outline.cursor(), 2, "cursor unchanged on the re-click");
+    }
+
+    #[test]
+    fn click_on_focused_rerooted_outline_resolves_correct_step() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = diamond_app();
+        // Focus on bbbb(ub): downstream cone = {bbbb, dddd}. The visible
+        // rows shrink to [bbbb, dddd] — a different index space again.
+        app.outline.set_cursor(1); // bbbb
+        assert!(app.outline.focus_cursor());
+        app.realign_selection_to_outline();
+        let rows = app.outline.visible_rows();
+        assert_eq!(
+            rows.iter().map(|r| r.short_id.as_str()).collect::<Vec<_>>(),
+            vec!["bbbb", "dddd"],
+            "focus re-roots to the downstream cone"
+        );
+
+        // Click visible row k = 1 (dddd / "ud") within the focused outline.
+        // Inner row y = 1 + 1 + 1 = 3.
+        app.handle_mouse(mouse_event(5, 3, MouseEventKind::Down(MouseButton::Left)));
+        assert_eq!(app.outline.cursor(), 1);
+        assert_eq!(app.outline.selected_step_id().as_deref(), Some("ud"));
+        assert_eq!(app.steps[app.selected_index].id, "ud");
+        assert!(app.take_pending_open_step().is_none());
+
+        // Repeat click on that focused row opens dddd, not whatever the flat
+        // index space would have resolved at row 1.
+        app.handle_mouse(mouse_event(5, 3, MouseEventKind::Down(MouseButton::Left)));
+        assert_eq!(app.take_pending_open_step(), Some("ud".to_string()));
+
+        // A click below the focused cone (only 2 rows visible) is ignored —
+        // it must not resolve into a hidden / unrelated step.
+        app.handle_mouse(mouse_event(5, 6, MouseEventKind::Down(MouseButton::Left)));
+        assert_eq!(app.outline.cursor(), 1, "out-of-cone click changes nothing");
+        assert!(app.take_pending_open_step().is_none());
+    }
+
+    #[test]
+    fn scroll_wheel_moves_outline_cursor_on_nonlinear_dag() {
+        use crossterm::event::MouseEventKind;
+        let mut app = diamond_app();
+        assert_eq!(app.outline.cursor(), 0);
+        assert_eq!(app.outline.selected_step_id().as_deref(), Some("ua"));
+
+        app.handle_mouse(mouse_event(5, 4, MouseEventKind::ScrollDown));
+        assert_eq!(app.outline.cursor(), 1, "scroll moves the OUTLINE cursor");
+        assert_eq!(app.outline.selected_step_id().as_deref(), Some("ub"));
+        // selected_index follows via realign — into the scrambled steps vec.
+        assert_eq!(app.steps[app.selected_index].id, "ub");
+
+        app.handle_mouse(mouse_event(5, 4, MouseEventKind::ScrollDown));
+        assert_eq!(app.outline.selected_step_id().as_deref(), Some("uc"));
+        assert_eq!(app.steps[app.selected_index].id, "uc");
+
+        app.handle_mouse(mouse_event(5, 4, MouseEventKind::ScrollUp));
+        assert_eq!(
+            app.outline.cursor(),
+            1,
+            "ScrollUp moves the outline cursor back"
+        );
+        assert_eq!(app.outline.selected_step_id().as_deref(), Some("ub"));
+        assert_eq!(app.steps[app.selected_index].id, "ub");
+    }
+
+    #[test]
+    fn linear_no_edge_mouse_behavior_unchanged_regression() {
+        // The degenerate linear / no-edge case must behave EXACTLY as before
+        // the §12.1 cutover: outline order == construction order, so a click
+        // on inner row k selects step `sk`, and a re-click opens it; scroll
+        // walks the cursor 1:1. Pins "no regression for linear plans".
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = list_app(5);
+        // No edges installed: visible_rows() == construction order s0..s4.
+        let rows = app.outline.visible_rows();
+        assert_eq!(
+            rows.iter().map(|r| r.step_id.as_str()).collect::<Vec<_>>(),
+            vec!["s0", "s1", "s2", "s3", "s4"],
+        );
+
+        // Click row 3 (y = 1 + 1 + 3 = 5) selects s3 (cursor + flat agree).
+        app.handle_mouse(mouse_event(5, 5, MouseEventKind::Down(MouseButton::Left)));
+        assert_eq!(app.outline.cursor(), 3);
+        assert_eq!(app.selected_index, 3);
+        assert_eq!(app.outline.selected_step_id().as_deref(), Some("s3"));
+        assert!(app.take_pending_open_step().is_none());
+        // Re-click same row opens s3.
+        app.handle_mouse(mouse_event(5, 5, MouseEventKind::Down(MouseButton::Left)));
+        assert_eq!(app.take_pending_open_step(), Some("s3".to_string()));
+
+        // Scroll from s3: down → s4, up → s3 (1:1, identical to old j/k).
+        app.handle_mouse(mouse_event(5, 5, MouseEventKind::ScrollDown));
+        assert_eq!(app.selected_index, 4);
+        assert_eq!(app.outline.cursor(), 4);
+        app.handle_mouse(mouse_event(5, 5, MouseEventKind::ScrollUp));
+        assert_eq!(app.selected_index, 3);
+        assert_eq!(app.outline.cursor(), 3);
     }
 }

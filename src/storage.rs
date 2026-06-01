@@ -2,13 +2,15 @@
 
 use anyhow::{Context, Result};
 use rusqlite::types::Value;
-use rusqlite::{Connection, params, params_from_iter};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use uuid::Uuid;
 
 use crate::frac_index;
+#[cfg(test)]
+use crate::plan::InterruptionState;
 use crate::plan::{
-    AnsweredQuestion, ChangePolicy, ExecutionLog, PLAN_COLUMNS, Phase, Plan, PlanStatus,
-    RetryStrategy, Step, StepStatus,
+    ChangePolicy, ExecutionLog, Interruption, InterruptionKind, InterruptionOption, PLAN_COLUMNS,
+    Phase, Plan, PlanStatus, Step, StepStatus,
 };
 use crate::run_lock::{LIVE_RUN_COLUMNS, LiveRun};
 
@@ -18,36 +20,52 @@ use crate::run_lock::{LIVE_RUN_COLUMNS, LiveRun};
 /// can index by column position. Kept as a single shared constant so adding a
 /// new column (V13+ tags etc.) only requires editing one place instead of the
 /// dozen scattered SELECTs.
-const STEP_COLUMNS: &str = "id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason, change_policy, tags, retry_strategy";
+const STEP_COLUMNS: &str = "id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason, change_policy, tags, short_id, review_enabled, review_status, corrects_step_id, current_cycle_index";
+
+/// Durably parked working-tree state for a step paused on a human-side
+/// interruption. The stash SHA identifies the parked git stash entry;
+/// `staged_files` records which paths were staged when the worktree was
+/// parked so a failed parking attempt can reconstruct the original state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParkedWorktreeState {
+    pub stash_sha: String,
+    pub staged_files: Vec<String>,
+}
 
 // ---------------------------------------------------------------------------
 // Plan operations
 // ---------------------------------------------------------------------------
 
 /// Insert a new plan and return it.
-#[allow(clippy::too_many_arguments)]
-pub fn create_plan(
-    conn: &Connection,
-    slug: &str,
-    project: &str,
-    branch_name: &str,
-    description: &str,
-    harness: Option<&str>,
-    agent: Option<&str>,
-    deterministic_tests: &[String],
-) -> Result<Plan> {
+/// The columns of a new plan row, passed to [`create_plan`]. Groups the
+/// identity (`slug` / `project` / `branch_name`), the `description`, the
+/// optional default `harness` / `agent`, and the plan's deterministic tests.
+pub struct NewPlan<'a> {
+    pub slug: &'a str,
+    pub project: &'a str,
+    pub branch_name: &'a str,
+    pub description: &'a str,
+    pub harness: Option<&'a str>,
+    pub agent: Option<&'a str>,
+    pub deterministic_tests: &'a [String],
+}
+
+pub fn create_plan(conn: &Connection, new: NewPlan<'_>) -> Result<Plan> {
+    let NewPlan {
+        slug,
+        project,
+        branch_name,
+        description,
+        harness,
+        agent,
+        deterministic_tests,
+    } = new;
     let id = Uuid::new_v4().to_string();
     let tests_json = serde_json::to_string(deterministic_tests)?;
 
-    // `questions_enabled` is set explicitly to 1 here rather than relying on
-    // the V16 column `DEFAULT 0`. New plans opt INTO the pause-for-question
-    // feature by default; existing rows are untouched (no migration), so only
-    // plans created via this path get the new default. The SQL column default
-    // stays 0 so a bare INSERT (e.g. an import path that omits the column)
-    // still behaves as before.
     conn.execute(
-        "INSERT INTO plans (id, slug, project, branch_name, description, harness, agent, deterministic_tests, questions_enabled)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
+        "INSERT INTO plans (id, slug, project, branch_name, description, harness, agent, deterministic_tests)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![id, slug, project, branch_name, description, harness, agent, tests_json],
     )
     .with_context(|| format!("Failed to insert plan '{slug}' for project '{project}'"))?;
@@ -271,22 +289,6 @@ pub fn update_plan_status(conn: &Connection, plan_id: &str, status: PlanStatus) 
     Ok(())
 }
 
-/// Set the `plans.questions_enabled` flag and bump `updated_at`.
-///
-/// Drives the `Q` keybinding in the TUI plan list (TUI-plan.md §17) and the
-/// `ralph plan questions on|off` CLI commands. SQLite has no native bool, so
-/// the value is stored as INTEGER 0/1.
-pub fn set_plan_questions_enabled(conn: &Connection, plan_id: &str, enabled: bool) -> Result<()> {
-    let affected = conn.execute(
-        "UPDATE plans SET questions_enabled = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
-        params![enabled as i64, plan_id],
-    )?;
-    if affected == 0 {
-        anyhow::bail!("Plan not found: {plan_id}");
-    }
-    Ok(())
-}
-
 /// Record the git branch the plan most recently started a run on AND the
 /// wall-clock timestamp at which that run started.
 ///
@@ -299,7 +301,7 @@ pub fn set_plan_questions_enabled(conn: &Connection, plan_id: &str, enabled: boo
 /// The same UPDATE also stamps `last_run_started_at` so the resume
 /// resolver's `ORDER BY` can sort by "when did this plan last actually run"
 /// rather than `updated_at` (which is bumped by unrelated edits like
-/// toggling `questions_enabled` or `pause_requested`).
+/// toggling `pause_requested`).
 pub fn set_plan_last_run_branch(conn: &Connection, plan_id: &str, branch: &str) -> Result<()> {
     let affected = conn.execute(
         "UPDATE plans SET last_run_branch = ?1, \
@@ -665,13 +667,30 @@ pub fn clear_skip_request(conn: &Connection, plan_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// One open (unanswered) `step_questions` row enriched with the plan + step
-/// context the CLI list/show commands need to render. Driven by
-/// [`list_open_questions`].
+/// Clear a pending skip request only when it targets `step_id`. Idempotent —
+/// a no-op when nothing is pending or the pending request targets a different
+/// step. Used by the executor's `Completed` arm to tidy a request for the step
+/// that just finished naturally without clobbering a request a concurrent
+/// `ralph skip` queued for a different, not-yet-running step.
+pub fn clear_skip_request_for_step(conn: &Connection, plan_id: &str, step_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE plans SET skip_requested_step_id = NULL, skip_changes = NULL \
+         WHERE id = ?1 AND skip_requested_step_id = ?2",
+        params![plan_id, step_id],
+    )?;
+    Ok(())
+}
+
+/// One open interruption enriched with the plan + step context the CLI
+/// list/show commands and the TUI inbox need to render. Driven by
+/// [`list_open_questions`] (questions only) and
+/// [`list_open_interruptions_enriched`] (questions *and* blockers).
 ///
-/// `step_id` and `plan_id` are exposed for upcoming runner + TUI consumers
-/// (TUI-plan.md §17 steps 42–43, which need to scope by plan id and locate
-/// the originating step row).
+/// Native: this is a projection of the `interruptions` table (state='open'),
+/// **not** the dropped `step_questions` view. The struct name / `question`
+/// field name are kept so existing TUI consumers (`plan_detail`, `run.rs`)
+/// compile unchanged through the cutover; `kind` is added so a caller can
+/// tell a blocker from a question.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct OpenQuestion {
@@ -684,38 +703,68 @@ pub struct OpenQuestion {
     pub step_num: usize,
     pub step_title: String,
     pub attempt: i32,
+    /// The interruption body (the question text, or the blocker
+    /// explanation). Named `question` for TUI source-compat.
     pub question: String,
+    /// Proposed-answer texts in priority order (empty for blockers and
+    /// freeform-only questions).
     pub suggestions: Vec<String>,
+    pub kind: InterruptionKind,
     pub asked_at: String,
 }
 
-/// List unanswered questions for plans in `project`, optionally filtered to a
-/// single plan slug. Ordered by `asked_at` ASC then `id` ASC so the index of
-/// any given question is stable as new questions arrive.
-pub fn list_open_questions(
+/// Shared native query behind [`list_open_questions`] /
+/// [`list_open_interruptions_enriched`]: every *open* interruption for
+/// `project` (optionally one plan slug), ordered `asked_at` ASC then `id`
+/// ASC so an index is stable as new ones arrive. `kind_filter` of
+/// `Some(InterruptionKind::Question)` restricts to questions only;
+/// `None` returns questions *and* blockers (the `interruption list` surface).
+fn list_open_interruptions_enriched_impl(
     conn: &Connection,
     project: &str,
     plan_slug: Option<&str>,
+    kind_filter: Option<InterruptionKind>,
 ) -> Result<Vec<OpenQuestion>> {
-    // Compute each step's 1-based position via a window function so the result
-    // matches the numbering users see in `ralph step list`.
-    let base = "WITH step_pos AS (
+    use std::str::FromStr;
+
+    // Compute each step's 1-based position via a window function so the
+    // result matches the numbering users see in `ralph step list`.
+    let mut base = String::from(
+        "WITH step_pos AS (
             SELECT id, plan_id,
                    ROW_NUMBER() OVER (PARTITION BY plan_id ORDER BY sort_key) AS step_num
             FROM steps
         )
-        SELECT q.id, q.step_id, s.plan_id, p.slug, sp.step_num,
-               s.title, q.attempt, q.question, q.suggestions, q.asked_at
-        FROM step_questions q
-        JOIN steps s ON s.id = q.step_id
+        SELECT i.id, i.step_id, s.plan_id, p.slug, sp.step_num,
+               s.title, i.attempt, i.body, i.options, i.kind, i.asked_at
+        FROM interruptions i
+        JOIN steps s ON s.id = i.step_id
         JOIN plans p ON p.id = s.plan_id
-        JOIN step_pos sp ON sp.id = q.step_id
-        WHERE q.answer IS NULL AND p.project = ?1";
+        JOIN step_pos sp ON sp.id = i.step_id
+        WHERE i.state = 'open' AND p.project = ?1",
+    );
+    if let Some(k) = kind_filter {
+        base.push_str(&format!(" AND i.kind = '{}'", k.as_str()));
+    }
 
     let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<OpenQuestion> {
-        let suggestions_json: String = row.get(8)?;
-        let suggestions: Vec<String> = serde_json::from_str(&suggestions_json).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(e))
+        let options_json: String = row.get(8)?;
+        let options: Vec<InterruptionOption> =
+            serde_json::from_str(&options_json).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    8,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+        // Project options → priority-ordered texts so the legacy
+        // `suggestions` shape is preserved for existing consumers.
+        let mut ordered = options;
+        ordered.sort_by_key(|o| o.priority);
+        let suggestions: Vec<String> = ordered.into_iter().map(|o| o.text).collect();
+        let kind_str: String = row.get(9)?;
+        let kind = InterruptionKind::from_str(&kind_str).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(9, rusqlite::types::Type::Text, Box::new(e))
         })?;
         let step_num: i64 = row.get(4)?;
         Ok(OpenQuestion {
@@ -728,20 +777,21 @@ pub fn list_open_questions(
             attempt: row.get(6)?,
             question: row.get(7)?,
             suggestions,
-            asked_at: row.get(9)?,
+            kind,
+            asked_at: row.get(10)?,
         })
     };
 
     let mut out = Vec::new();
     if let Some(slug) = plan_slug {
-        let sql = format!("{base} AND p.slug = ?2 ORDER BY q.asked_at ASC, q.id ASC");
+        let sql = format!("{base} AND p.slug = ?2 ORDER BY i.asked_at ASC, i.id ASC");
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params![project, slug], map_row)?;
         for row in rows {
             out.push(row?);
         }
     } else {
-        let sql = format!("{base} ORDER BY q.asked_at ASC, q.id ASC");
+        let sql = format!("{base} ORDER BY i.asked_at ASC, i.id ASC");
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params![project], map_row)?;
         for row in rows {
@@ -751,68 +801,59 @@ pub fn list_open_questions(
     Ok(out)
 }
 
-/// List answered questions for a step in chronological order (oldest first).
-///
-/// Drives the "Previously answered questions" section that the prompt builder
-/// injects between Plan context and Step details on the next attempt after a
-/// pause (TUI-plan.md §17). Rows where `answer IS NULL` are excluded — those
-/// are still pending and would be rendered in a different surface.
-///
-/// Ordering uses `asked_at ASC` then `id ASC` to match
-/// [`list_open_questions`], so the harness sees Q&A pairs in the same sequence
-/// it asked them.
-pub fn list_answered_questions_for_step(
+/// List open *question* interruptions for plans in `project`, optionally
+/// filtered to one plan slug. Native (`interruptions` table, `kind=question`,
+/// `state=open`). Ordered `asked_at` ASC then `id` ASC so an index is stable
+/// as new questions arrive. Used by the TUI's per-plan open-question surface
+/// (and `list_open_interruptions_enriched` for the full view).
+pub fn list_open_questions(
     conn: &Connection,
-    step_id: &str,
-) -> Result<Vec<AnsweredQuestion>> {
-    let mut stmt = conn.prepare(
-        "SELECT question, answer
-         FROM step_questions
-         WHERE step_id = ?1 AND answer IS NOT NULL
-         ORDER BY asked_at ASC, id ASC",
-    )?;
-    let rows = stmt.query_map(params![step_id], |row| {
-        Ok(AnsweredQuestion {
-            question: row.get(0)?,
-            answer: row.get(1)?,
-        })
-    })?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
+    project: &str,
+    plan_slug: Option<&str>,
+) -> Result<Vec<OpenQuestion>> {
+    list_open_interruptions_enriched_impl(
+        conn,
+        project,
+        plan_slug,
+        Some(InterruptionKind::Question),
+    )
 }
 
-/// Write an answer to a `step_questions` row, stamping `answered_at` with
-/// the current SQLite UTC time. Errors if no row matches `question_id`.
-pub fn set_question_answer(conn: &Connection, question_id: &str, answer: &str) -> Result<()> {
-    let affected = conn.execute(
-        "UPDATE step_questions
-         SET answer = ?1, answered_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-         WHERE id = ?2",
-        params![answer, question_id],
-    )?;
-    if affected == 0 {
-        anyhow::bail!("Question not found: {question_id}");
-    }
-    Ok(())
+/// List *every* open interruption (questions **and** blockers) for plans in
+/// `project`, optionally filtered to one plan slug. Drives `ralph
+/// interruption list` (docs/dag-redesign.md §7). Same ordering / stability
+/// guarantee as [`list_open_questions`].
+pub fn list_open_interruptions_enriched(
+    conn: &Connection,
+    project: &str,
+    plan_slug: Option<&str>,
+) -> Result<Vec<OpenQuestion>> {
+    list_open_interruptions_enriched_impl(conn, project, plan_slug, None)
 }
 
-/// Count unanswered `step_questions` rows for a specific (step, attempt) pair.
+// `list_answered_questions_for_step` (the unbounded "Previously answered
+// questions" prompt feed) was removed in the §8/§4 cutover. Prompt assembly
+// now uses the **bounded** `list_resolved_interruptions_for_step` above,
+// which `LIMIT`s to the most-recent N resolved interruptions and is
+// interruption-native (questions *and* blockers).
+
+/// Count *open* interruptions (questions **or** blockers) for a specific
+/// (step, attempt) pair.
 ///
 /// Driven by [`crate::executor::execute_step`] after the harness exits to
-/// detect whether the harness called `ralph question ask` during this attempt
-/// (TUI-plan.md §17 "Runner integration"). A non-zero count means the runner
-/// must skip tests + commit, roll back any diff, and pause the plan.
+/// detect whether the harness called `ralph question ask` / `ralph block`
+/// during this attempt (docs/dag-redesign.md §7 "harness protocol"). A
+/// non-zero count means the orchestrator skips tests + commit, rolls back
+/// any diff, marks the branch `Blocked`, and — per §3.4/§9 invariant 4 —
+/// consumes **no** retry budget.
 pub fn count_unanswered_questions_for_attempt(
     conn: &Connection,
     step_id: &str,
     attempt: i32,
 ) -> Result<i64> {
     let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM step_questions
-         WHERE step_id = ?1 AND attempt = ?2 AND answer IS NULL",
+        "SELECT COUNT(*) FROM interruptions
+         WHERE step_id = ?1 AND attempt = ?2 AND state = 'open'",
         params![step_id, attempt],
         |row| row.get(0),
     )?;
@@ -821,26 +862,28 @@ pub fn count_unanswered_questions_for_attempt(
 
 /// Compute the *effective* status of a plan.
 ///
-/// Per TUI-plan.md §17, [`PlanStatus::Question`] is a derived state — never
-/// written to the `plans.status` column. A plan reports `Question` whenever
-/// any unanswered `step_questions` row exists for one of its steps; the
-/// underlying lifecycle column un-shadows automatically once the user
-/// answers the last open question.
+/// Per docs/dag-redesign.md §3.4/§6, [`PlanStatus::Interrupted`] is a derived
+/// state — never written to the `plans.status` column. A plan reports
+/// `Interrupted` whenever any **open interruption** (a question *or* a
+/// blocker) exists for one of its steps; the underlying lifecycle column
+/// un-shadows automatically once the human resolves the last open
+/// interruption.
 ///
 /// This helper is the single source of truth for that derivation: read the
-/// stored status, then upgrade to `Question` if any open question exists.
-/// Used by upcoming TUI question surfaces (TUI-plan §17 step 43).
-#[allow(dead_code)]
+/// stored status, then upgrade to `Interrupted` if any open interruption
+/// exists. Reads the native `interruptions` table directly, so a blocker
+/// (a question *or* a blocker) interrupts the plan.
+#[allow(dead_code)] // TUI plan-status derivation lands in Phase 4.
 pub fn plan_effective_status(conn: &Connection, plan_id: &str) -> Result<PlanStatus> {
     let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM step_questions q
-         JOIN steps s ON s.id = q.step_id
-         WHERE s.plan_id = ?1 AND q.answer IS NULL",
+        "SELECT COUNT(*) FROM interruptions i
+         JOIN steps s ON s.id = i.step_id
+         WHERE s.plan_id = ?1 AND i.state = 'open'",
         params![plan_id],
         |row| row.get(0),
     )?;
     if count > 0 {
-        return Ok(PlanStatus::Question);
+        return Ok(PlanStatus::Interrupted);
     }
     let status_str: String = conn.query_row(
         "SELECT status FROM plans WHERE id = ?1",
@@ -850,6 +893,345 @@ pub fn plan_effective_status(conn: &Connection, plan_id: &str) -> Result<PlanSta
     use std::str::FromStr;
     PlanStatus::from_str(&status_str)
         .map_err(|e| anyhow::anyhow!("Invalid plan status '{status_str}' for plan {plan_id}: {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// Interruptions (native `interruptions` table, V26)
+// ---------------------------------------------------------------------------
+
+/// Canonical column list for `SELECT` queries against the `interruptions`
+/// table, in the physical order [`Interruption::from_row`] expects. Every
+/// `Interruption`-returning query must use this list so the positional
+/// indices line up.
+const INTERRUPTION_COLUMNS: &str =
+    "id, step_id, attempt, kind, body, options, resolution, comment, state, asked_at, resolved_at";
+
+/// Default cap for [`list_resolved_interruptions_for_step`]. Bounding the
+/// resolved-interruption injection to the most-recent N entries closes the
+/// §4 unbounded-context leak the old "Previously answered questions" section
+/// had (no `LIMIT`, no per-entry truncation).
+pub const DEFAULT_RESOLVED_INTERRUPTION_LIMIT: usize = 5;
+
+/// Insert a fresh (open) interruption for a step+attempt.
+///
+/// The agent calls this (via `ralph question ask` / `ralph block`) from
+/// inside a running step. The row starts `Open` with no resolution/comment;
+/// the orchestrator observes the open row after the harness returns and marks
+/// the branch `Blocked` (no retry budget consumed — docs/dag-redesign.md
+/// §3.4). Returns the generated interruption id.
+pub fn insert_interruption(
+    conn: &Connection,
+    step_id: &str,
+    attempt: i32,
+    kind: InterruptionKind,
+    body: &str,
+    options: &[InterruptionOption],
+) -> Result<String> {
+    let id = Uuid::new_v4().to_string();
+    let options_json =
+        serde_json::to_string(options).context("serializing interruption options for insert")?;
+    conn.execute(
+        "INSERT INTO interruptions \
+            (id, step_id, attempt, kind, body, options, state, asked_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', \
+                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        params![id, step_id, attempt, kind.as_str(), body, options_json],
+    )?;
+    Ok(id)
+}
+
+/// List every *open* interruption across `project`, optionally narrowed to a
+/// single plan slug. Ordered `asked_at ASC, id ASC` so an interruption's
+/// index is stable as new ones arrive (mirrors [`list_open_questions`]).
+#[allow(dead_code)] // `interruption list` CLI + TUI inbox land in later steps.
+pub fn list_open_interruptions(
+    conn: &Connection,
+    project: &str,
+    plan_slug: Option<&str>,
+) -> Result<Vec<Interruption>> {
+    let base = format!(
+        "SELECT {cols} FROM interruptions i \
+         JOIN steps s ON s.id = i.step_id \
+         JOIN plans p ON p.id = s.plan_id \
+         WHERE i.state = 'open' AND p.project = ?1",
+        cols = INTERRUPTION_COLUMNS
+            .split(", ")
+            .map(|c| format!("i.{c}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    let mut out = Vec::new();
+    if let Some(slug) = plan_slug {
+        let sql = format!("{base} AND p.slug = ?2 ORDER BY i.asked_at ASC, i.id ASC");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![project, slug], Interruption::from_row)?;
+        for row in rows {
+            out.push(row?);
+        }
+    } else {
+        let sql = format!("{base} ORDER BY i.asked_at ASC, i.id ASC");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![project], Interruption::from_row)?;
+        for row in rows {
+            out.push(row?);
+        }
+    }
+    Ok(out)
+}
+
+/// List every *open* interruption whose step belongs to `plan_id`. Ordered
+/// `asked_at ASC, id ASC`. Drives the per-plan derived `Interrupted` status
+/// and the plan-scoped inbox.
+pub fn list_open_interruptions_for_plan(
+    conn: &Connection,
+    plan_id: &str,
+) -> Result<Vec<Interruption>> {
+    let sql = format!(
+        "SELECT {cols} FROM interruptions i \
+         JOIN steps s ON s.id = i.step_id \
+         WHERE i.state = 'open' AND s.plan_id = ?1 \
+         ORDER BY i.asked_at ASC, i.id ASC",
+        cols = INTERRUPTION_COLUMNS
+            .split(", ")
+            .map(|c| format!("i.{c}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![plan_id], Interruption::from_row)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// List *every* interruption (open and resolved) for a single step, oldest
+/// first. Used by the step-detail TUI surface. NOT used for prompt assembly —
+/// the prompt path uses the bounded [`list_resolved_interruptions_for_step`].
+#[allow(dead_code)] // step-detail TUI surface lands in a later step.
+pub fn list_interruptions_for_step(conn: &Connection, step_id: &str) -> Result<Vec<Interruption>> {
+    let sql = format!(
+        "SELECT {INTERRUPTION_COLUMNS} FROM interruptions \
+         WHERE step_id = ?1 \
+         ORDER BY asked_at ASC, id ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![step_id], Interruption::from_row)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Fetch a single interruption by its uuid. Errors with a precise
+/// "interruption not found" anyhow context if no row matches — distinct from
+/// `resolve_interruption`'s "already resolved" so callers (Phase C's shared
+/// retry-exhausted resolution helper, the CLI `interruption show`) can give
+/// the human a useful message. Selects via [`INTERRUPTION_COLUMNS`] so the
+/// row->[`Interruption`] mapping stays in lockstep with
+/// [`list_interruptions_for_step`] (any column drift breaks both at once
+/// rather than silently desynchronizing).
+pub fn get_interruption(conn: &Connection, id: &str) -> Result<Interruption> {
+    let sql = format!("SELECT {INTERRUPTION_COLUMNS} FROM interruptions WHERE id = ?1");
+    conn.query_row(&sql, params![id], Interruption::from_row)
+        .with_context(|| format!("interruption not found: {id}"))
+}
+
+/// One row for the cross-branch interruptions inbox (docs/dag-redesign.md
+/// §12.3): the full [`Interruption`] plus the owning plan slug and the
+/// step's short id, for display without a second lookup.
+#[derive(Debug, Clone)]
+pub struct InboxRow {
+    pub interruption: Interruption,
+    pub plan_slug: String,
+    pub step_short_id: String,
+}
+
+/// Every interruption (open **and** resolved) for `project`, joined to its
+/// plan slug + step short id, ordered so OPEN items come first (oldest
+/// first), then RESOLVED items (most-recently resolved first) which the TUI
+/// keeps visible but dimmed for recent context (§12.3). `resolved_limit`
+/// bounds the trailing resolved tail so the inbox doesn't grow unbounded.
+///
+/// The bound is **SQL-side**: a `UNION ALL` of "all open rows (oldest
+/// first)" + "the most-recent `resolved_limit` resolved rows" — neither
+/// branch ever fetches a row past its own bound. The pre-fix implementation
+/// pulled *every* row in the project and discarded the post-limit resolved
+/// tail in Rust, which scaled poorly once a project accumulated thousands
+/// of resolved interruptions. The Rust side is now a thin row-mapper.
+pub fn list_inbox_rows(
+    conn: &Connection,
+    project: &str,
+    resolved_limit: usize,
+) -> Result<Vec<InboxRow>> {
+    let cols = INTERRUPTION_COLUMNS
+        .split(", ")
+        .map(|c| format!("i.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // Open branch + resolved branch UNION ALL'd; each branch carries its
+    // own ORDER BY + (for resolved) LIMIT, and a final ORDER BY on a
+    // synthesized `bucket` column re-imposes the "open first, then
+    // resolved" wrapper. Open rows order by `asked_at ASC` (oldest first,
+    // the §12.3 inbox UX); resolved rows order by `resolved_at DESC`
+    // (most-recently resolved first) — same ordering the Rust filter
+    // produced post-fetch, now done by SQLite.
+    //
+    // `resolved_limit = 0` legitimately means "no resolved tail" — the
+    // resolved branch's LIMIT 0 returns nothing and the Rust loop never
+    // sees a resolved row.
+    // Two prepared statements (open, resolved) executed back-to-back —
+    // simpler than a UNION ALL that would need a column shift to keep
+    // `Interruption::from_row` happy, and gives the resolved branch its
+    // own `LIMIT ?` natively without juggling parameter positions across
+    // dialect quirks. Both queries share the same projection shape, so
+    // the row mapper is one closure.
+    let open_sql = format!(
+        "SELECT {cols}, p.slug, s.short_id, i.state, i.resolved_at \
+         FROM interruptions i \
+         JOIN steps s ON s.id = i.step_id \
+         JOIN plans p ON p.id = s.plan_id \
+         WHERE p.project = ?1 AND i.state = 'open' \
+         ORDER BY i.asked_at ASC, i.id ASC"
+    );
+    let resolved_sql = format!(
+        "SELECT {cols}, p.slug, s.short_id, i.state, i.resolved_at \
+         FROM interruptions i \
+         JOIN steps s ON s.id = i.step_id \
+         JOIN plans p ON p.id = s.plan_id \
+         WHERE p.project = ?1 AND i.state = 'resolved' \
+         ORDER BY i.resolved_at DESC, i.id ASC \
+         LIMIT ?2"
+    );
+    let n_cols = INTERRUPTION_COLUMNS.split(", ").count();
+    let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<InboxRow> {
+        let interruption = Interruption::from_row(row)?;
+        let plan_slug: String = row.get(n_cols)?;
+        let step_short_id: String = row.get(n_cols + 1)?;
+        Ok(InboxRow {
+            interruption,
+            plan_slug,
+            step_short_id,
+        })
+    };
+
+    let mut out = Vec::new();
+    let mut open_stmt = conn.prepare(&open_sql)?;
+    let open_rows = open_stmt.query_map(params![project], map_row)?;
+    for row in open_rows {
+        out.push(row?);
+    }
+    // Resolved branch: SQL-side LIMIT means even when the project has
+    // 10k resolved rows we only fetch `resolved_limit` of them. `LIMIT 0`
+    // is a legitimate "no resolved tail" request — SQLite returns zero
+    // rows and the loop is a no-op.
+    let mut resolved_stmt = conn.prepare(&resolved_sql)?;
+    let resolved_rows =
+        resolved_stmt.query_map(params![project, resolved_limit as i64], map_row)?;
+    for row in resolved_rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// The **bounded** resolved-interruption query — the centerpiece of the §4
+/// fix. Returns at most `limit` (the most-recent) *resolved* interruptions
+/// for `step_id`, **newest first**. The prompt builder feeds these into the
+/// bounded "Resolved interruptions" section so a step that has been
+/// blocked/answered many times does not accumulate unbounded prompt context
+/// (the pre-existing leak documented in docs/dag-redesign.md §4).
+///
+/// `limit` of 0 returns nothing. Ordering is `resolved_at DESC` (then
+/// `asked_at DESC`, then `id DESC` as a stable tie-break) so the freshest
+/// clarifications win the budget; callers that want chronological order can
+/// reverse the result.
+pub fn list_resolved_interruptions_for_step(
+    conn: &Connection,
+    step_id: &str,
+    limit: usize,
+) -> Result<Vec<Interruption>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "SELECT {INTERRUPTION_COLUMNS} FROM interruptions \
+         WHERE step_id = ?1 AND state = 'resolved' \
+         ORDER BY resolved_at DESC, asked_at DESC, id DESC \
+         LIMIT ?2"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![step_id, limit as i64], Interruption::from_row)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Resolve an open interruption: record the chosen `resolution` (an option
+/// text or a freeform answer) and an optional `comment`, flip `state` to
+/// `resolved`, and stamp `resolved_at`. Errors if no row matches `id`
+/// ("Interruption not found") or it is already resolved.
+///
+/// Targets the native `interruptions` table directly, so `execute`'s
+/// changed-row count is accurate; the post-resolve open count dropping to
+/// zero for the step is what un-shadows its `Blocked` overlay and lets the
+/// scheduler re-queue it (docs/dag-redesign.md §3.4/§3.5).
+pub fn resolve_interruption(
+    conn: &Connection,
+    id: &str,
+    resolution: &str,
+    comment: Option<&str>,
+) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE interruptions \
+         SET resolution = ?1, comment = ?2, state = 'resolved', \
+             resolved_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+         WHERE id = ?3 AND state = 'open'",
+        params![resolution, comment, id],
+    )?;
+    if affected == 0 {
+        // Distinguish "no such id" from "already resolved" for a precise
+        // error (the row exists but isn't open).
+        let exists: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM interruptions WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )?;
+        if exists == 0 {
+            anyhow::bail!("Interruption not found: {id}");
+        }
+        anyhow::bail!("Interruption already resolved: {id}");
+    }
+    Ok(())
+}
+
+/// Resolve **every still-open** interruption for `step_id` with `resolution`
+/// (and no human comment), returning how many rows were closed.
+///
+/// Used when a step is skipped. A skipped step's pending question/blocker is
+/// moot — the work it asked about will never run — so the interruption must
+/// not keep the step derived-`Blocked`, must not keep the plan derived
+/// `Interrupted`, and (the actual bug this fixes) must not let the plan
+/// finalize `Complete` while an interruption is still open: a skipped step
+/// counts toward "all done", so without this a `ralph skip` on a
+/// derived-`Blocked` step left a permanently-open interruption behind a
+/// `Complete` plan. Idempotent — `Ok(0)` when nothing is open.
+pub fn resolve_open_interruptions_for_step(
+    conn: &Connection,
+    step_id: &str,
+    resolution: &str,
+) -> Result<usize> {
+    let affected = conn.execute(
+        "UPDATE interruptions \
+         SET resolution = ?1, state = 'resolved', \
+             resolved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \
+         WHERE step_id = ?2 AND state = 'open'",
+        params![resolution, step_id],
+    )?;
+    Ok(affected)
 }
 
 /// Delete a plan (cascades to steps and execution_logs via FK).
@@ -873,23 +1255,74 @@ pub fn set_plan_harness_gen(conn: &Connection, plan_id: &str, harness: Option<&s
     Ok(())
 }
 
-/// Set (or clear) the plan-level retry-strategy override and bump
-/// `updated_at`.
-///
-/// `Some(strategy)` records a plan-wide default; `None` writes SQL NULL,
-/// meaning "no plan-level override" — resolution then falls through to the
-/// global default ([`RetryStrategy::Keep`]) unless a step overrides it.
-/// Kept as a dedicated setter (rather than threaded through `create_plan`)
-/// to mirror [`set_plan_harness_gen`] and avoid churning every existing
-/// `create_plan` callsite.
-pub fn set_plan_retry_strategy(
+/// Set (or clear) a plan's `review_enabled` override (V27,
+/// docs/dag-redesign.md §6/§7) and bump `updated_at`. Stored as a nullable
+/// INTEGER: `Some(true)`/`Some(false)` write 1/0 (an explicit per-plan
+/// on/off that wins over the global `config.review.enabled`), `None` writes
+/// NULL so the plan inherits the global default. `Plan::from_row` coerces
+/// the column back to `Option<bool>`. The per-plan way to scope review
+/// on/off, resolved by [`crate::config::effective_review_enabled`].
+pub fn set_plan_review_enabled(
     conn: &Connection,
     plan_id: &str,
-    strategy: Option<RetryStrategy>,
+    enabled: Option<bool>,
 ) -> Result<()> {
     let affected = conn.execute(
-        "UPDATE plans SET retry_strategy = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
-        params![strategy.map(|s| s.as_str()), plan_id],
+        "UPDATE plans SET review_enabled = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+        params![enabled.map(|b| if b { 1 } else { 0 }), plan_id],
+    )?;
+    if affected == 0 {
+        anyhow::bail!("Plan not found: {plan_id}");
+    }
+    Ok(())
+}
+
+/// True when review is effective-enabled anywhere in the DB after applying
+/// the full precedence chain
+/// `step.review_enabled ?? plan.review_enabled ?? global_review_enabled`.
+/// Drives the `ralph doctor` non-fatal review-harness warning (STEP 44,
+/// docs/dag-redesign.md §13.3): if review is effectively on somewhere but no
+/// usable review harness is configured, doctor surfaces it without failing.
+/// Project-independent because the review harness is *global* config — a
+/// review-enabled plan in any project means a missing review harness is worth
+/// flagging. Cheap: two `EXISTS` probes, no row materialization.
+///
+/// Mirrors `import::bundle_requests_review` so doctor and `--strict` import
+/// agree on what counts as review-enabled. The plan-half intentionally checks
+/// only an *explicit* `review_enabled = 1` (no `COALESCE` against the global
+/// default): a plan whose `review_enabled` is NULL gets its review state from
+/// its steps, and the step-half already evaluates the full precedence chain
+/// with step-level OFF overrides respected. Without this, a plan with
+/// `review_enabled = NULL`, all steps explicitly `Some(false)`, and a global
+/// default of ON would warn even though no review will ever run.
+pub fn any_review_enabled(conn: &Connection, global_review_enabled: bool) -> Result<bool> {
+    let global = if global_review_enabled { 1 } else { 0 };
+    let found: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM plans WHERE review_enabled = 1) \
+         OR EXISTS(
+             SELECT 1 FROM steps s
+             JOIN plans p ON p.id = s.plan_id
+             WHERE COALESCE(s.review_enabled, p.review_enabled, ?1) = 1
+         )",
+        params![global],
+        |row| row.get(0),
+    )?;
+    Ok(found)
+}
+
+/// Set (or clear) a plan's `max_review_corrections` cap (V30,
+/// docs/dag-redesign.md §10 item 4 / §14.5) and bump `updated_at`. `None`
+/// writes NULL → the runner uses the built-in default
+/// ([`crate::review::DEFAULT_MAX_REVIEW_CORRECTIONS`]); `Some(n)` pins the
+/// per-plan cap. The per-plan way to configure the review recursion bound.
+pub fn set_plan_max_review_corrections(
+    conn: &Connection,
+    plan_id: &str,
+    cap: Option<i32>,
+) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE plans SET max_review_corrections = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+        params![cap, plan_id],
     )?;
     if affected == 0 {
         anyhow::bail!("Plan not found: {plan_id}");
@@ -1090,6 +1523,162 @@ pub fn delete_project_prompt_file(project: &str) -> Result<()> {
 // Step operations
 // ---------------------------------------------------------------------------
 
+/// Length of a step `short_id` (docs/dag-redesign.md §3): the stable,
+/// plan-unique handle that replaces the positional step number as the
+/// user-facing selector once a plan is a dependency DAG.
+const SHORT_ID_LEN: usize = 8;
+
+/// The base-62 alphabet (`0-9A-Za-z`) `short_id`s draw from — the same
+/// alphabet `frac_index` uses for sort keys.
+const SHORT_ID_ALPHABET: &[u8; 62] =
+    b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+/// Generate one random 8-char base-62 candidate `short_id`.
+///
+/// UUID v4 supplies 122 bits of entropy; we consume it as a `u128` and peel
+/// off [`SHORT_ID_LEN`] base-62 digits. 62^8 ≈ 2.18e14 keeps single-plan
+/// collisions astronomically rare; [`mint_short_id`] still re-rolls on the
+/// off chance, so the (negligible) modulo bias here is irrelevant.
+fn random_short_id() -> String {
+    let mut n = Uuid::new_v4().as_u128();
+    let mut buf = [0u8; SHORT_ID_LEN];
+    for slot in buf.iter_mut() {
+        *slot = SHORT_ID_ALPHABET[(n % 62) as usize];
+        n /= 62;
+    }
+    // Invariant: every byte came from SHORT_ID_ALPHABET (ASCII).
+    String::from_utf8(buf.to_vec()).expect("base-62 alphabet is valid ASCII")
+}
+
+/// True when `s` is an all-digit token that the shared step-selector would
+/// also parse as a numeric position.
+fn is_numeric_only_short_id(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Mint a plan-unique 8-char base-62 `short_id`, re-rolling on collision
+/// against existing `steps.short_id` rows for `plan_id`.
+///
+/// The V25 unique index `idx_steps_short_id` (`(plan_id, short_id)`)
+/// enforces uniqueness at the DB layer; checking here avoids the
+/// round-trip insert failure. This is the **single** source of minting
+/// logic: the V25 migration backfill and runtime step creation both call
+/// it, so migration-backfill and import-backfill produce the same DAG for
+/// the same linear input (docs/dag-redesign.md §13.3). The collision check
+/// observes prior same-transaction writes (SQLite read-your-own-writes), so
+/// callers that mint-then-write in a loop on one connection stay unique
+/// without a local "already assigned" set.
+pub fn mint_short_id(conn: &Connection, plan_id: &str) -> Result<String> {
+    loop {
+        let candidate = random_short_id();
+        if is_numeric_only_short_id(&candidate) {
+            continue;
+        }
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM steps WHERE plan_id = ?1 AND short_id = ?2)",
+            params![plan_id, candidate],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Ok(candidate);
+        }
+    }
+}
+
+/// Number of times [`insert_step_minting_short_id`] re-rolls a freshly minted
+/// `short_id` after a concurrent writer beat us to the same value. Collisions
+/// are astronomically unlikely (random 8-char base-62 ≈ 2.18e14 values), so a
+/// small bound is ample — exhausting it signals something pathological, not
+/// genuine space exhaustion.
+const SHORT_ID_MINT_RETRIES: u32 = 8;
+
+/// True when `err` is the `steps (plan_id, short_id)` uniqueness violation —
+/// i.e. a writer in another process committed the same minted handle between
+/// [`mint_short_id`]'s `SELECT EXISTS` check and our `INSERT`. We re-roll on
+/// exactly this error and surface every other error unchanged.
+fn is_short_id_unique_violation(err: &rusqlite::Error) -> bool {
+    // The only unique constraint on `steps` involving short_id is the
+    // `idx_steps_short_id` index on `(plan_id, short_id)`; SQLite reports a
+    // column-based unique-index violation by naming the columns, e.g.
+    // "UNIQUE constraint failed: steps.plan_id, steps.short_id". Match the
+    // qualified `steps.short_id` rather than a bare `short_id` substring so an
+    // unrelated constraint message that merely contains the word can't
+    // mis-trigger a short_id re-roll.
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(e, Some(msg))
+            if e.code == rusqlite::ErrorCode::ConstraintViolation
+                && msg.contains("steps.short_id")
+    )
+}
+
+/// Mint a plan-unique `short_id` and run `insert` with it, re-rolling on a
+/// `short_id` uniqueness violation.
+///
+/// [`mint_short_id`]'s own collision check is *advisory*: it observes this
+/// connection's own (possibly uncommitted) writes, but it cannot see a
+/// concurrent uncommitted insert from another process sharing the same DB
+/// file. So two writers — e.g. a `ralph step add` racing the orchestrator's
+/// corrective-step insert — can both pass the check and then collide on the
+/// `idx_steps_short_id` unique index. Catching that here and re-minting keeps
+/// step creation robust instead of surfacing a generic "Failed to insert
+/// step" to the user (docs/dag-redesign.md §3.1).
+fn insert_step_minting_short_id(
+    conn: &Connection,
+    plan_id: &str,
+    mut insert: impl FnMut(&str) -> rusqlite::Result<usize>,
+) -> Result<()> {
+    let mut retries = 0;
+    loop {
+        let short_id = mint_short_id(conn, plan_id)?;
+        match insert(&short_id) {
+            Ok(_) => return Ok(()),
+            Err(e) if is_short_id_unique_violation(&e) && retries < SHORT_ID_MINT_RETRIES => {
+                retries += 1;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// True when `s` has the exact *shape* of a step `short_id`: precisely
+/// [`SHORT_ID_LEN`] characters, every one drawn from the base-62 alphabet
+/// (`[0-9A-Za-z]`).
+///
+/// Shape only — this never touches the DB. The shared step-selector
+/// resolver (`commands::resolve_step`) calls it to decide whether a
+/// positional token *could* be a short id before checking for an actual
+/// match, so the numeric and short-id selector forms can coexist under
+/// one deterministic rule (docs/dag-redesign.md §7). Single-sources the
+/// length/alphabet so the shape test can never drift from [`mint_short_id`].
+///
+/// Because every accepted byte is ASCII, `s.len() == SHORT_ID_LEN` here is
+/// equivalent to "exactly 8 characters": any multibyte char would push the
+/// byte length off 8 or fail the alphabet check.
+pub fn is_short_id_shaped(s: &str) -> bool {
+    s.len() == SHORT_ID_LEN && s.bytes().all(|b| SHORT_ID_ALPHABET.contains(&b))
+}
+
+/// True when `s` is safe to persist as a step `short_id`.
+///
+/// Persisted `short_id`s are also user-facing selectors, so a pure-digit token
+/// is rejected even though it is syntactically base-62: the shared selector
+/// resolver accepts numeric positions and exact short-id matches under one
+/// token, and an all-digit short id would shadow the positional form.
+pub fn is_persistable_short_id(s: &str) -> bool {
+    is_short_id_shaped(s) && !is_numeric_only_short_id(s)
+}
+
+/// True when this plan already has a step whose persisted `short_id` exactly
+/// equals `short_id`.
+pub fn plan_has_step_short_id(conn: &Connection, plan_id: &str, short_id: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM steps WHERE plan_id = ?1 AND short_id = ?2)",
+        params![plan_id, short_id],
+        |r| r.get(0),
+    )?)
+}
+
 /// Create a new step appended at the end of the plan's step list.
 ///
 /// Automatically generates a sort_key after the last existing step.
@@ -1103,20 +1692,37 @@ pub fn delete_project_prompt_file(project: &str) -> Result<()> {
 /// `tags`: optional per-step free-form string tags. Pass `None` to default
 /// to an empty list (the pre-V13 behavior). Callers that already care about
 /// tags can pass `Some(&tags)` to seed them at creation time.
-#[allow(clippy::too_many_arguments)]
-pub fn create_step(
-    conn: &Connection,
-    plan_id: &str,
-    title: &str,
-    description: &str,
-    agent: Option<&str>,
-    harness: Option<&str>,
-    acceptance_criteria: &[String],
-    max_retries: Option<i32>,
-    model: Option<&str>,
-    change_policy: Option<ChangePolicy>,
-    tags: Option<&[String]>,
-) -> Result<(Step, usize)> {
+/// The authorable columns of a new step row, shared by [`create_step`]
+/// (append) and [`create_step_at`] (positioned). Groups the body
+/// (`title` / `description`), the optional per-step `agent` / `harness` /
+/// `model` overrides, the `acceptance_criteria`, `max_retries`,
+/// `change_policy`, and `tags`. The `plan_id` and `sort_key` placement stay
+/// separate arguments since only one of the two creators takes a `sort_key`.
+#[derive(Default)]
+pub struct NewStep<'a> {
+    pub title: &'a str,
+    pub description: &'a str,
+    pub agent: Option<&'a str>,
+    pub harness: Option<&'a str>,
+    pub acceptance_criteria: &'a [String],
+    pub max_retries: Option<i32>,
+    pub model: Option<&'a str>,
+    pub change_policy: Option<ChangePolicy>,
+    pub tags: Option<&'a [String]>,
+}
+
+pub fn create_step(conn: &Connection, plan_id: &str, new: NewStep<'_>) -> Result<(Step, usize)> {
+    let NewStep {
+        title,
+        description,
+        agent,
+        harness,
+        acceptance_criteria,
+        max_retries,
+        model,
+        change_policy,
+        tags,
+    } = new;
     let id = Uuid::new_v4().to_string();
     let criteria_json = serde_json::to_string(acceptance_criteria)?;
     let change_policy = change_policy.unwrap_or_default();
@@ -1136,11 +1742,17 @@ pub fn create_step(
         None => frac_index::initial_key(),
     };
 
-    conn.execute(
-        "INSERT INTO steps (id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, max_retries, model, change_policy, tags)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-        params![id, plan_id, sort_key, title, description, agent, harness, criteria_json, max_retries, model, change_policy.as_str(), tags_json],
-    )
+    // Mint the plan-unique short_id via the one shared helper so runtime
+    // step creation and the V25 migration/import backfill produce the same
+    // handle for the same input (docs/dag-redesign.md §3.1, §13.3). Re-rolls
+    // if a concurrent writer in another process raced us to the same handle.
+    insert_step_minting_short_id(conn, plan_id, |short_id| {
+        conn.execute(
+            "INSERT INTO steps (id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, max_retries, model, change_policy, tags, short_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![id, plan_id, sort_key, title, description, agent, harness, criteria_json, max_retries, model, change_policy.as_str(), tags_json, short_id],
+        )
+    })
     .with_context(|| format!("Failed to insert step '{title}' for plan '{plan_id}'"))?;
 
     // The new step is always appended, so its position is the total step count.
@@ -1188,6 +1800,64 @@ pub fn get_step_by_id(conn: &Connection, step_id: &str) -> Result<Option<Step>> 
     }
 }
 
+/// Persist the git stash pointer for a step paused on an interruption.
+///
+/// The row is sparse/ephemeral: one parked worktree per step at most. A
+/// duplicate row means the caller is about to overwrite still-unrestored WIP,
+/// which is almost certainly a bug, so we error rather than `REPLACE`.
+pub fn set_step_parked_worktree(
+    conn: &Connection,
+    step_id: &str,
+    stash_sha: &str,
+    staged_files: &[String],
+) -> Result<()> {
+    let staged_json = serde_json::to_string(staged_files)?;
+    conn.execute(
+        "INSERT INTO step_parked_worktrees (step_id, stash_sha, staged_files) VALUES (?1, ?2, ?3)",
+        params![step_id, stash_sha, staged_json],
+    )
+    .with_context(|| format!("Failed to persist parked worktree for step {step_id}"))?;
+    Ok(())
+}
+
+/// Fetch the parked worktree pointer for `step_id`, if one exists.
+pub fn get_step_parked_worktree(
+    conn: &Connection,
+    step_id: &str,
+) -> Result<Option<ParkedWorktreeState>> {
+    conn.query_row(
+        "SELECT stash_sha, staged_files FROM step_parked_worktrees WHERE step_id = ?1",
+        params![step_id],
+        |row| {
+            let stash_sha: String = row.get(0)?;
+            let staged_raw: String = row.get(1)?;
+            let staged_files = serde_json::from_str(&staged_raw).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+            Ok(ParkedWorktreeState {
+                stash_sha,
+                staged_files,
+            })
+        },
+    )
+    .optional()
+    .context("Failed to load parked worktree")
+}
+
+/// Clear any parked worktree pointer for `step_id`. Missing rows are a no-op.
+pub fn clear_step_parked_worktree(conn: &Connection, step_id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM step_parked_worktrees WHERE step_id = ?1",
+        params![step_id],
+    )
+    .with_context(|| format!("Failed to clear parked worktree for step {step_id}"))?;
+    Ok(())
+}
+
 /// Update a step's status. Does not modify `attempts`; use [`set_step_attempts`] for that.
 pub fn update_step_status(conn: &Connection, step_id: &str, status: StepStatus) -> Result<()> {
     let affected = conn.execute(
@@ -1195,6 +1865,68 @@ pub fn update_step_status(conn: &Connection, step_id: &str, status: StepStatus) 
         params![status.as_str(), step_id],
     )?;
 
+    if affected == 0 {
+        anyhow::bail!("Step not found: {step_id}");
+    }
+    Ok(())
+}
+
+/// Set the persisted attempt count for a step to an absolute value (NOT a
+/// delta). `0` resets — the Phase C "retry with parked changes" path uses this to
+/// re-queue a step that exhausted its budget. Sibling helper to
+/// [`update_step_status`] so the shared resolution helper in
+/// `commands/interruption.rs` can `set_step_attempts(.. 0) +
+/// update_step_status(Pending)` atomically inside [`crate::db::with_tx`]
+/// without going through the executor's private function (kept private so
+/// the executor stays the only writer on the hot-loop path).
+pub fn set_step_attempts(conn: &Connection, step_id: &str, attempts: i32) -> Result<()> {
+    // V33 cycle bump: when the new value is 0 AND the prior value was > 0,
+    // we've just reset a step that had real attempts — the "Retry from
+    // scratch" auto-blocker resolver is the canonical example. That's a
+    // new logical cycle (the prior `execution_logs` rows stay as audit
+    // history; future per-iteration commits / logs created after this
+    // reset will pick up the bumped pointer via `create_execution_log`).
+    //
+    // The bump is folded into the same `UPDATE` so the read-and-write is
+    // atomic — a concurrent reader can never observe `(attempts = 0,
+    // current_cycle_index = old)` between the two writes.
+    let affected = conn
+        .execute(
+            "UPDATE steps \
+             SET attempts = ?1, \
+                 current_cycle_index = CASE \
+                    WHEN ?1 = 0 AND attempts > 0 THEN current_cycle_index + 1 \
+                    ELSE current_cycle_index \
+                 END, \
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+             WHERE id = ?2",
+            params![attempts, step_id],
+        )
+        .with_context(|| format!("Failed to update step attempts for {step_id}"))?;
+    if affected == 0 {
+        anyhow::bail!("Step not found: {step_id}");
+    }
+    Ok(())
+}
+
+/// Set the persisted attempt count WITHOUT touching `current_cycle_index`.
+///
+/// Used by the "no budget consumed" rollback paths — a harness interruption
+/// pause and a user `Cancel` skip — which decrement the pre-spawn attempt
+/// bump (e.g. `1 -> 0`) so a later resume doesn't think the budget was
+/// spent. Those are NOT a new retry cycle, so they must not trip the V33
+/// `> 0 -> 0` cycle bump that [`set_step_attempts`] applies (that bump is
+/// reserved for the retry-exhausted "retry from scratch" resolver).
+pub fn set_step_attempts_keep_cycle(conn: &Connection, step_id: &str, attempts: i32) -> Result<()> {
+    let affected = conn
+        .execute(
+            "UPDATE steps \
+             SET attempts = ?1, \
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+             WHERE id = ?2",
+            params![attempts, step_id],
+        )
+        .with_context(|| format!("Failed to update step attempts for {step_id}"))?;
     if affected == 0 {
         anyhow::bail!("Step not found: {step_id}");
     }
@@ -1229,26 +1961,89 @@ pub fn update_step_status_if(
 
 /// Mark a step as skipped and record the operator-supplied reason (if any).
 ///
-/// Writes `status` and `skipped_reason` in a single UPDATE so a concurrent
-/// reader can't observe the skipped status without its reason.
-pub fn mark_step_skipped(conn: &Connection, step_id: &str, reason: Option<&str>) -> Result<()> {
-    let affected = conn.execute(
-        "UPDATE steps SET status = ?1, skipped_reason = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?3",
-        params![StepStatus::Skipped.as_str(), reason, step_id],
-    )?;
-    if affected == 0 {
-        anyhow::bail!("Step not found: {step_id}");
-    }
-    Ok(())
+/// Writes `status` + `skipped_reason` and resolves the step's open
+/// interruptions atomically (one transaction) so a concurrent reader can't
+/// observe the skipped status without its reason, nor a skipped step still
+/// carrying an open interruption. Resolving the interruptions here is what
+/// keeps a `ralph skip` on a derived-`Blocked` step from leaving an
+/// unresolved interruption behind a `Complete` plan (see
+/// [`resolve_open_interruptions_for_step`]).
+pub fn mark_step_skipped(
+    conn: &Connection,
+    step_id: &str,
+    reason: Option<&str>,
+) -> Result<Option<ParkedWorktreeState>> {
+    crate::db::with_tx(conn, |conn| {
+        let affected = conn.execute(
+            "UPDATE steps SET status = ?1, skipped_reason = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?3",
+            params![StepStatus::Skipped.as_str(), reason, step_id],
+        )?;
+        if affected == 0 {
+            anyhow::bail!("Step not found: {step_id}");
+        }
+        resolve_open_interruptions_for_step(
+            conn,
+            step_id,
+            "step skipped — interruption no longer applicable",
+        )?;
+        // A skipped step is `Complete`-for-scheduling, so any open corrective
+        // request against it is no longer actionable. Close it here (symmetric
+        // with resolving its open interruptions) so it can't linger `open` on
+        // a skipped-but-not-deleted step and survive outside the CASCADE that
+        // only fires on step deletion.
+        close_open_corrective_step_requests_for_step(conn, step_id)?;
+        let parked = get_step_parked_worktree(conn, step_id)?;
+        if parked.is_some() {
+            clear_step_parked_worktree(conn, step_id)?;
+        }
+        Ok(parked)
+    })
 }
 
-/// Delete a step (cascades to execution_logs via FK).
+/// Delete a step (cascades to execution_logs and `step_dependencies` via FK).
+///
+/// **Re-parents before deleting** so removing a step from the middle of a
+/// DAG doesn't silently orphan its dependents into new roots. For chain
+/// `A <- B <- C`, deleting `B` must leave `C` depending on `A` (B's
+/// dependencies), preserving the transitive ordering — *not* drop `C`'s only
+/// edge via `ON DELETE CASCADE` and quietly promote `C` to a root that runs
+/// with no gating on `A`'s work. Multi-parent safe: every former dependent
+/// of the deleted step gains an edge to every dependency of the deleted step
+/// (in a tree-shaped plan that is just "inherit the one parent"). Done in a
+/// transaction so the re-parent + delete is atomic.
 pub fn delete_step(conn: &Connection, step_id: &str) -> Result<()> {
-    let affected = conn.execute("DELETE FROM steps WHERE id = ?1", params![step_id])?;
-    if affected == 0 {
-        anyhow::bail!("Step not found: {step_id}");
-    }
-    Ok(())
+    crate::db::with_tx(conn, |conn| {
+        // Preserve the prior "Step not found" contract (was: affected == 0).
+        if get_step_by_id(conn, step_id)?.is_none() {
+            anyhow::bail!("Step not found: {step_id}");
+        }
+        let parents = list_step_dependencies(conn, step_id)?;
+        let dependents = list_step_dependents(conn, step_id)?;
+        for d in &dependents {
+            for p in &parents {
+                if d == p {
+                    continue; // impossible on an acyclic graph; defensive
+                }
+                // Defensive: never close a cycle to delete a step. This
+                // cannot happen for ancestor<-descendant re-parenting on an
+                // acyclic DAG, but skip rather than corrupt the graph.
+                if would_create_step_cycle(conn, d, p)? {
+                    continue;
+                }
+                // `INSERT OR IGNORE`: a dependent may already depend on a
+                // parent directly (diamond); the (step_id, depends_on_step_id)
+                // PK makes a duplicate an error, so ignore it idempotently.
+                conn.execute(
+                    "INSERT OR IGNORE INTO step_dependencies (step_id, depends_on_step_id) \
+                     VALUES (?1, ?2)",
+                    params![d, p],
+                )?;
+            }
+        }
+        // CASCADE drops step_id's own in/out edges with the row.
+        conn.execute("DELETE FROM steps WHERE id = ?1", params![step_id])?;
+        Ok(())
+    })
 }
 
 /// Create a new step inserted at a specific sort_key position.
@@ -1257,31 +2052,38 @@ pub fn delete_step(conn: &Connection, step_id: &str) -> Result<()> {
 /// `change_policy`: see [`create_step`] — `None` defaults to
 /// [`ChangePolicy::Required`].
 /// `tags`: see [`create_step`] — `None` defaults to an empty list.
-#[allow(clippy::too_many_arguments)]
 pub fn create_step_at(
     conn: &Connection,
     plan_id: &str,
     sort_key: &str,
-    title: &str,
-    description: &str,
-    agent: Option<&str>,
-    harness: Option<&str>,
-    acceptance_criteria: &[String],
-    max_retries: Option<i32>,
-    model: Option<&str>,
-    change_policy: Option<ChangePolicy>,
-    tags: Option<&[String]>,
+    new: NewStep<'_>,
 ) -> Result<(Step, usize)> {
+    let NewStep {
+        title,
+        description,
+        agent,
+        harness,
+        acceptance_criteria,
+        max_retries,
+        model,
+        change_policy,
+        tags,
+    } = new;
     let id = Uuid::new_v4().to_string();
     let criteria_json = serde_json::to_string(acceptance_criteria)?;
     let change_policy = change_policy.unwrap_or_default();
     let tags_json = serde_json::to_string(tags.unwrap_or(&[]))?;
 
-    conn.execute(
-        "INSERT INTO steps (id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, max_retries, model, change_policy, tags)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-        params![id, plan_id, sort_key, title, description, agent, harness, criteria_json, max_retries, model, change_policy.as_str(), tags_json],
-    )
+    // See [`create_step`]: same single-source short_id minting helper, with
+    // the same concurrent-collision re-roll, so every step-creation path is
+    // consistent (docs/dag-redesign.md §3.1).
+    insert_step_minting_short_id(conn, plan_id, |short_id| {
+        conn.execute(
+            "INSERT INTO steps (id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, max_retries, model, change_policy, tags, short_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![id, plan_id, sort_key, title, description, agent, harness, criteria_json, max_retries, model, change_policy.as_str(), tags_json, short_id],
+        )
+    })
     .with_context(|| format!("Failed to insert step '{title}' for plan '{plan_id}'"))?;
 
     // Count steps with sort_key <= the new one to get the 1-based position.
@@ -1292,6 +2094,24 @@ pub fn create_step_at(
     )?;
 
     Ok((get_step(conn, &id)?, position as usize))
+}
+
+/// A partial step update for [`update_step_fields_ext`]. Every field is an
+/// "apply this change?" option: `None` leaves the column untouched; the
+/// nested `Option` on the override fields distinguishes set-to-value
+/// (`Some(Some(_))`) from clear-to-NULL (`Some(None)`). `#[derive(Default)]`
+/// lets callers touch one column with `..Default::default()`.
+#[derive(Default)]
+pub struct StepFieldUpdates<'a> {
+    pub title: Option<&'a str>,
+    pub description: Option<&'a str>,
+    pub agent_update: Option<Option<&'a str>>,
+    pub harness_update: Option<Option<&'a str>>,
+    pub criteria_update: Option<&'a [String]>,
+    pub retries_update: Option<Option<i32>>,
+    pub model_update: Option<Option<&'a str>>,
+    pub change_policy_update: Option<ChangePolicy>,
+    pub tags_update: Option<&'a [String]>,
 }
 
 /// Extended step update: title, description, agent, harness, criteria, max_retries, model, change_policy, tags.
@@ -1312,20 +2132,22 @@ pub fn create_step_at(
 ///   for another.
 /// - `tags_update`: `Some(slice)` replaces the entire tag list (pass an
 ///   empty slice to clear all tags), `None` means don't change.
-#[allow(clippy::too_many_arguments)]
 pub fn update_step_fields_ext(
     conn: &Connection,
     step_id: &str,
-    title: Option<&str>,
-    description: Option<&str>,
-    agent_update: Option<Option<&str>>,
-    harness_update: Option<Option<&str>>,
-    criteria_update: Option<&[String]>,
-    retries_update: Option<Option<i32>>,
-    model_update: Option<Option<&str>>,
-    change_policy_update: Option<ChangePolicy>,
-    tags_update: Option<&[String]>,
+    updates: StepFieldUpdates<'_>,
 ) -> Result<()> {
+    let StepFieldUpdates {
+        title,
+        description,
+        agent_update,
+        harness_update,
+        criteria_update,
+        retries_update,
+        model_update,
+        change_policy_update,
+        tags_update,
+    } = updates;
     // Build a single UPDATE with dynamic SET clauses so all changed fields
     // share one `updated_at` and a partial failure can't leave the row half
     // updated.
@@ -1398,25 +2220,49 @@ pub fn update_step_fields_ext(
     Ok(())
 }
 
-/// Set (or clear) the step-level retry-strategy override and bump
-/// `updated_at`.
-///
-/// `Some(strategy)` records a per-step override; `None` writes SQL NULL,
-/// meaning "no step-level override" — resolution falls through to the
-/// plan's value and then the global default ([`RetryStrategy::Keep`]).
-/// Kept as a dedicated setter (rather than a new field on
-/// [`update_step_fields_ext`]) so the ~100 `create_step` callsites and the
-/// existing `update_step_fields_ext` callers stay untouched, mirroring how
-/// `plan_harness` is set via [`set_plan_harness_gen`] after `create_plan`.
-pub fn set_step_retry_strategy(
+/// Set (or clear) a step's `review_enabled` override (V27,
+/// docs/dag-redesign.md §6/§7) and bump `updated_at`. Stored as a nullable
+/// INTEGER: `Some(true)`/`Some(false)` write 1/0 (an explicit per-step
+/// on/off that wins over the plan/global default), `None` writes NULL so
+/// the step inherits the plan (then global) default. The per-step way to
+/// scope review on/off, resolved by
+/// [`crate::config::effective_review_enabled`] (step > plan > config >
+/// false).
+pub fn set_step_review_enabled(
     conn: &Connection,
     step_id: &str,
-    strategy: Option<RetryStrategy>,
+    enabled: Option<bool>,
 ) -> Result<()> {
     let affected = conn.execute(
-        "UPDATE steps SET retry_strategy = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
-        params![strategy.map(|s| s.as_str()), step_id],
+        "UPDATE steps SET review_enabled = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+        params![enabled.map(|b| if b { 1 } else { 0 }), step_id],
     )?;
+    if affected == 0 {
+        anyhow::bail!("Step not found: {step_id}");
+    }
+    Ok(())
+}
+
+/// Overwrite a step's `short_id` with a caller-supplied value.
+///
+/// The V25 backfill and runtime `create_step` mint a fresh random
+/// `short_id`; the DAG-aware import path instead **preserves** the
+/// bundle's portable edge handles (docs/dag-redesign.md §13.3), so it
+/// creates the step (which mints a throwaway id) and then calls this to
+/// pin the bundle's `short_id`. Mirrors the V25 migration's raw
+/// `UPDATE steps SET short_id` (no `updated_at` bump — `short_id` is an
+/// identity handle, not a mutable user field). The
+/// `idx_steps_short_id (plan_id, short_id)` unique index still enforces
+/// plan-uniqueness; a violation surfaces as an `Err` here and (because
+/// imports are transactional) rolls the whole import back, so no partial
+/// plan is written.
+pub fn set_step_short_id(conn: &Connection, step_id: &str, short_id: &str) -> Result<()> {
+    let affected = conn
+        .execute(
+            "UPDATE steps SET short_id = ?1 WHERE id = ?2",
+            params![short_id, step_id],
+        )
+        .with_context(|| format!("Failed to set short_id '{short_id}' for step {step_id}"))?;
     if affected == 0 {
         anyhow::bail!("Step not found: {step_id}");
     }
@@ -1425,23 +2271,28 @@ pub fn set_step_retry_strategy(
 
 /// Reset a step's status to pending and zero out attempts.
 ///
-/// Also deletes the step's `execution_logs` rows — otherwise the zeroed
-/// attempt counter collides with the `UNIQUE(step_id, attempt)` constraint
-/// when the executor tries to create a fresh attempt=1 log on the next run
-/// (e.g. via `ralph resume` on an in-progress step).
-pub fn reset_step(conn: &Connection, step_id: &str) -> Result<()> {
-    conn.execute(
-        "DELETE FROM execution_logs WHERE step_id = ?1",
-        params![step_id],
-    )?;
-    let affected = conn.execute(
-        "UPDATE steps SET status = ?1, attempts = 0, skipped_reason = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
-        params![StepStatus::Pending.as_str(), step_id],
-    )?;
-    if affected == 0 {
-        anyhow::bail!("Step not found: {step_id}");
-    }
-    Ok(())
+/// Also deletes the step's `execution_logs` rows: `step reset` is a
+/// destructive restart that intentionally drops the old per-attempt history
+/// and prompt context before re-queueing the step from a clean slate.
+pub fn reset_step(conn: &Connection, step_id: &str) -> Result<Option<ParkedWorktreeState>> {
+    crate::db::with_tx(conn, |conn| {
+        conn.execute(
+            "DELETE FROM execution_logs WHERE step_id = ?1",
+            params![step_id],
+        )?;
+        let parked = get_step_parked_worktree(conn, step_id)?;
+        if parked.is_some() {
+            clear_step_parked_worktree(conn, step_id)?;
+        }
+        let affected = conn.execute(
+            "UPDATE steps SET status = ?1, attempts = 0, skipped_reason = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+            params![StepStatus::Pending.as_str(), step_id],
+        )?;
+        if affected == 0 {
+            anyhow::bail!("Step not found: {step_id}");
+        }
+        Ok(parked)
+    })
 }
 
 /// Flip every InProgress step for a plan to Aborted and return the affected rows.
@@ -1455,10 +2306,92 @@ pub fn reset_step(conn: &Connection, step_id: &str) -> Result<()> {
 /// snapshot is atomic with the flip: no TOCTOU window where a concurrent reader
 /// sees the Aborted row but the caller's return slice reflects the pre-update
 /// state.
+///
+/// **A step with an open interruption is NOT swept.** Such a step is a
+/// *deliberately parked* step, not a crashed-runner orphan: it raised a
+/// question/blocker (the §1 pause, the §10 review-loop escalation, or the
+/// review-error blocker `drain_finished_reviews` raises) and the scheduler
+/// already excludes it as derived-`Blocked` until a human resolves it.
+/// Aborting it here would discard its committed work and reduce it to a
+/// re-implement on the next run while *also* ignoring the human-needed
+/// interruption. Leaving it `InProgress` is correct: the scheduler keeps it
+/// gated, the plan reads derived `Interrupted`, and resolving the
+/// interruption lets the run pick it back up.
+///
+/// **A step with an open corrective request is NOT swept either.** After a
+/// human resolves the review-loop escalation blocker the escalated step is
+/// `InProgress` with NO open interruption (just resolved) but DOES carry an
+/// open `corrective_step_requests` row; the orchestrator converts it to
+/// `Complete` only when it drains that request. Since the run/resume sweep
+/// runs *before* the drain, aborting here would discard the step's committed
+/// work and strand the pending corrective request (this also hardens the
+/// pre-existing stranded-request-on-resume case for ordinary reviewer
+/// requests).
 pub fn sweep_stale_in_progress(conn: &Connection, plan_id: &str) -> Result<Vec<Step>> {
+    // Correlated subquery: true when `steps.id` has a committed execution-log
+    // row — the test-then-commit invariant's durable proof the implementation
+    // landed. Shared by the reclaim sweep (which keeps such a step InProgress
+    // for re-review) and the abort sweep (which excludes it from abort) so the
+    // two predicates that must mirror each other cannot drift.
+    const HAS_COMMITTED_ATTEMPT: &str = "EXISTS (\
+        SELECT 1 FROM execution_logs e \
+        WHERE e.step_id = steps.id AND e.commit_hash IS NOT NULL)";
+    // First, reclaim a review orphaned by a crash — WITHOUT aborting the step.
+    // A *committed* step left `InProgress` + `review_status = InFlight` was
+    // implementing-complete and mid-review when the runner died; its detached
+    // reviewer task is gone, but the work is on disk (a committed
+    // execution-log row proves it). Reset `review_status` InFlight → Pending
+    // but KEEP `InProgress`, so the scheduler re-spawns ONLY the review
+    // against the existing commit (`runner::respawn_pending_reviews`) instead
+    // of re-implementing the step. This must run before the abort sweep below,
+    // which then deliberately skips it.
+    conn.execute(
+        &format!(
+            "UPDATE steps SET review_status = ?4,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         WHERE plan_id = ?1 AND status = ?2 AND review_status = ?3
+           AND {HAS_COMMITTED_ATTEMPT}"
+        ),
+        params![
+            plan_id,
+            StepStatus::InProgress.as_str(),
+            crate::plan::ReviewStatus::InFlight.as_str(),
+            crate::plan::ReviewStatus::Pending.as_str(),
+        ],
+    )?;
+
+    // Abort sweep. Flip stale `InProgress` rows to `Aborted` (and defensively
+    // reset any residual `review_status = in_flight` → `pending` — there
+    // should be none after the reclaim above, but the impossible
+    // `Aborted` + `InFlight` pairing must never persist).
+    //
+    // Three classes of `InProgress` step are deliberately NOT swept:
+    //   - one with an open interruption (a deliberately parked / blocked step);
+    //   - one with an open corrective request (an escalated review-loop step
+    //     the orchestrator promotes to `Complete` only when it drains the
+    //     request);
+    //   - a **committed step awaiting review** (`review_status` pending/in_flight
+    //     with a committed execution-log row). Aborting it would discard the
+    //     committed work and re-implement it on the next run; instead it stays
+    //     `InProgress` (reclaimed to `pending` above) and is recovered by
+    //     re-running only the review.
     let sql = format!(
-        "UPDATE steps SET status = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        "UPDATE steps SET status = ?1,
+             review_status = CASE WHEN review_status = ?4 THEN ?5 ELSE review_status END,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
          WHERE plan_id = ?2 AND status = ?3
+           AND NOT EXISTS (
+               SELECT 1 FROM interruptions i
+               WHERE i.step_id = steps.id AND i.state = 'open'
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM corrective_step_requests c
+               WHERE c.reviewed_step_id = steps.id AND c.state = 'open'
+           )
+           AND NOT (
+               review_status IN (?4, ?5)
+               AND {HAS_COMMITTED_ATTEMPT}
+           )
          RETURNING {STEP_COLUMNS}",
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -1467,6 +2400,8 @@ pub fn sweep_stale_in_progress(conn: &Connection, plan_id: &str) -> Result<Vec<S
             StepStatus::Aborted.as_str(),
             plan_id,
             StepStatus::InProgress.as_str(),
+            crate::plan::ReviewStatus::InFlight.as_str(),
+            crate::plan::ReviewStatus::Pending.as_str(),
         ],
         Step::from_row,
     )?;
@@ -1477,6 +2412,28 @@ pub fn sweep_stale_in_progress(conn: &Connection, plan_id: &str) -> Result<Vec<S
     // Sort by sort_key so callers can report them in plan order.
     swept.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
     Ok(swept)
+}
+
+/// The commit SHA and iteration (attempt number) of the single committed
+/// attempt for `step_id`, if any.
+///
+/// Post-DAG-redesign there is **at most one commit per step** (test-then-commit),
+/// so the committed execution-log row is unique. This is the **durable** source
+/// of a step's reviewed commit: the orchestrator normally spawns a review from
+/// an in-memory `needs_review` hand-off, but on a crash/restart — or after a
+/// transient review error — that hand-off is gone. The scheduler recovers the
+/// review target from here so a committed-but-unreviewed step is re-reviewed
+/// against its existing commit rather than re-implemented from scratch.
+pub fn committed_review_target(conn: &Connection, step_id: &str) -> Result<Option<(String, i32)>> {
+    Ok(conn
+        .query_row(
+            "SELECT commit_hash, attempt FROM execution_logs \
+             WHERE step_id = ?1 AND commit_hash IS NOT NULL \
+             ORDER BY attempt DESC LIMIT 1",
+            params![step_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i32>(1)?)),
+        )
+        .optional()?)
 }
 
 /// Update a step's sort_key (used for reordering).
@@ -1521,9 +2478,16 @@ pub fn create_execution_log(
     prompt_text: Option<&str>,
     session_id: Option<&str>,
 ) -> Result<ExecutionLog> {
+    // V33: copy the step's `current_cycle_index` onto the new log row so
+    // each log records which retry-from-scratch cycle it belonged to.
+    // A subquery (rather than a Rust-side read+insert) keeps the cycle
+    // pointer and the row creation in a single SQL statement — no TOCTOU
+    // window if a concurrent `set_step_attempts(0)` bumps the cycle
+    // between two statements. Defaults to 0 when the step row is missing
+    // (the next INSERT will fail on the FK anyway, so this is benign).
     conn.execute(
-        "INSERT INTO execution_logs (step_id, attempt, prompt_text, session_id)
-         VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO execution_logs (step_id, attempt, prompt_text, session_id, cycle_index)
+         VALUES (?1, ?2, ?3, ?4, COALESCE((SELECT current_cycle_index FROM steps WHERE id = ?1), 0))",
         params![step_id, attempt, prompt_text, session_id],
     )
     .with_context(|| {
@@ -1539,9 +2503,8 @@ pub fn create_execution_log(
 /// Used by the executor's TUI-skip *cancel* path (step 18): the retry loop
 /// creates the `execution_logs` row (with the prompt) *before* spawning the
 /// harness, so a cancelled attempt must delete that row to honor the
-/// guarantee that a cancelled attempt leaves no `UNIQUE(step_id, attempt)`
-/// row behind and consumes no retry budget. Idempotent — deleting a missing
-/// id is a no-op.
+/// guarantee that a cancelled attempt leaves no stray audit row behind and
+/// consumes no retry budget. Idempotent — deleting a missing id is a no-op.
 pub fn delete_execution_log(conn: &Connection, log_id: i64) -> Result<()> {
     conn.execute("DELETE FROM execution_logs WHERE id = ?1", params![log_id])
         .with_context(|| format!("Failed to delete execution log {log_id}"))?;
@@ -1556,8 +2519,8 @@ pub fn delete_execution_log(conn: &Connection, log_id: i64) -> Result<()> {
 #[allow(dead_code)]
 pub fn get_latest_log_for_step(conn: &Connection, step_id: &str) -> Result<Option<ExecutionLog>> {
     let mut stmt = conn.prepare(
-        "SELECT id, step_id, attempt, started_at, duration_secs, prompt_text, diff, test_results, rolled_back, committed, commit_hash, harness_stdout, harness_stderr, cost_usd, input_tokens, output_tokens, session_id, termination_reason, test_status
-         FROM execution_logs WHERE step_id = ?1 ORDER BY attempt DESC LIMIT 1",
+        "SELECT id, step_id, attempt, started_at, duration_secs, prompt_text, diff, test_results, rolled_back, committed, commit_hash, harness_stdout, harness_stderr, cost_usd, input_tokens, output_tokens, session_id, termination_reason, test_status, cycle_index
+         FROM execution_logs WHERE step_id = ?1 ORDER BY id DESC LIMIT 1",
     )?;
 
     let mut rows = stmt.query_map(params![step_id], ExecutionLog::from_row)?;
@@ -1584,25 +2547,50 @@ pub fn get_latest_log_for_step(conn: &Connection, step_id: &str) -> Result<Optio
 /// values. At every *terminal* callsite in the executor, callers MUST pass
 /// `Some(...)` for `termination_reason`; `test_status` should be
 /// `Some(TestStatus::NotRun)` for rows that never reached the test phase.
-#[allow(clippy::too_many_arguments)]
+/// The outcome columns written by [`update_execution_log`] for one attempt:
+/// timing, the diff / test results, the rolled-back/committed flags + commit
+/// hash, the harness stdout+stderr, usage metrics, and the optional
+/// termination-reason / test-status (COALESCE-d, so `None` keeps the existing
+/// value). `#[derive(Default)]` keeps the many `None` fields off call sites.
+#[derive(Default)]
+pub struct ExecutionLogUpdate<'a> {
+    pub duration_secs: Option<f64>,
+    pub diff: Option<&'a str>,
+    pub test_results: &'a [String],
+    pub rolled_back: bool,
+    pub committed: bool,
+    pub commit_hash: Option<&'a str>,
+    pub harness_stdout: Option<&'a str>,
+    pub harness_stderr: Option<&'a str>,
+    pub cost_usd: Option<f64>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub session_id: Option<&'a str>,
+    pub termination_reason: Option<crate::plan::TerminationReason>,
+    pub test_status: Option<crate::plan::TestStatus>,
+}
+
 pub fn update_execution_log(
     conn: &Connection,
     log_id: i64,
-    duration_secs: Option<f64>,
-    diff: Option<&str>,
-    test_results: &[String],
-    rolled_back: bool,
-    committed: bool,
-    commit_hash: Option<&str>,
-    harness_stdout: Option<&str>,
-    harness_stderr: Option<&str>,
-    cost_usd: Option<f64>,
-    input_tokens: Option<i64>,
-    output_tokens: Option<i64>,
-    session_id: Option<&str>,
-    termination_reason: Option<crate::plan::TerminationReason>,
-    test_status: Option<crate::plan::TestStatus>,
+    update: ExecutionLogUpdate<'_>,
 ) -> Result<()> {
+    let ExecutionLogUpdate {
+        duration_secs,
+        diff,
+        test_results,
+        rolled_back,
+        committed,
+        commit_hash,
+        harness_stdout,
+        harness_stderr,
+        cost_usd,
+        input_tokens,
+        output_tokens,
+        session_id,
+        termination_reason,
+        test_status,
+    } = update;
     debug_assert!(
         !(rolled_back && committed),
         "execution log cannot be both rolled_back and committed",
@@ -1654,11 +2642,11 @@ pub fn update_execution_log(
     Ok(())
 }
 
-/// List execution logs for a step, ordered by attempt.
+/// List execution logs for a step, ordered chronologically by row creation.
 pub fn list_execution_logs_for_step(conn: &Connection, step_id: &str) -> Result<Vec<ExecutionLog>> {
     let mut stmt = conn.prepare(
-        "SELECT id, step_id, attempt, started_at, duration_secs, prompt_text, diff, test_results, rolled_back, committed, commit_hash, harness_stdout, harness_stderr, cost_usd, input_tokens, output_tokens, session_id, termination_reason, test_status
-         FROM execution_logs WHERE step_id = ?1 ORDER BY attempt ASC",
+        "SELECT id, step_id, attempt, started_at, duration_secs, prompt_text, diff, test_results, rolled_back, committed, commit_hash, harness_stdout, harness_stderr, cost_usd, input_tokens, output_tokens, session_id, termination_reason, test_status, cycle_index
+         FROM execution_logs WHERE step_id = ?1 ORDER BY id ASC",
     )?;
 
     let rows = stmt.query_map(params![step_id], ExecutionLog::from_row)?;
@@ -1690,7 +2678,7 @@ pub fn list_execution_logs_for_plan(
                 el.prompt_text, el.diff, el.test_results, el.rolled_back, el.committed,
                 el.commit_hash, el.harness_stdout, el.harness_stderr, el.cost_usd,
                 el.input_tokens, el.output_tokens, el.session_id,
-                el.termination_reason, el.test_status
+                el.termination_reason, el.test_status, el.cycle_index
          FROM execution_logs el
          JOIN steps s ON s.id = el.step_id
          WHERE s.plan_id = ?1
@@ -1723,6 +2711,7 @@ pub fn list_execution_logs_for_plan(
             })?),
             None => None,
         };
+        let cycle_index: i32 = row.get(20)?;
         let log = ExecutionLog {
             id: row.get(1)?,
             step_id: row.get(2)?,
@@ -1767,6 +2756,7 @@ pub fn list_execution_logs_for_plan(
             session_id: row.get(17)?,
             termination_reason,
             test_status,
+            cycle_index,
         };
         Ok((step_title, log))
     })?;
@@ -1781,7 +2771,7 @@ pub fn list_execution_logs_for_plan(
 /// Fetch an execution log by its primary key.
 pub(crate) fn get_execution_log_by_id(conn: &Connection, id: i64) -> Result<ExecutionLog> {
     conn.query_row(
-        "SELECT id, step_id, attempt, started_at, duration_secs, prompt_text, diff, test_results, rolled_back, committed, commit_hash, harness_stdout, harness_stderr, cost_usd, input_tokens, output_tokens, session_id, termination_reason, test_status
+        "SELECT id, step_id, attempt, started_at, duration_secs, prompt_text, diff, test_results, rolled_back, committed, commit_hash, harness_stdout, harness_stderr, cost_usd, input_tokens, output_tokens, session_id, termination_reason, test_status, cycle_index
          FROM execution_logs WHERE id = ?1",
         params![id],
         ExecutionLog::from_row,
@@ -1921,33 +2911,14 @@ pub fn list_dependent_plans(conn: &Connection, plan_id: &str) -> Result<Vec<Stri
 
 /// Check whether adding `plan_id -> new_dep_id` would create a cycle.
 ///
-/// Walks the transitive dependencies of `new_dep_id`; if `plan_id` appears in
-/// that set, the edge would close a cycle. A self-edge (`plan_id == new_dep_id`)
-/// is also reported as a cycle.
+/// Thin DB-backed wrapper around [`crate::dag_util::would_create_cycle_generic`]:
+/// the per-node dependency accessor delegates to [`list_plan_dependencies`].
+/// A self-edge (`plan_id == new_dep_id`) is reported as a cycle (handled by
+/// the generic).
 pub fn would_create_cycle(conn: &Connection, plan_id: &str, new_dep_id: &str) -> Result<bool> {
-    if plan_id == new_dep_id {
-        return Ok(true);
-    }
-
-    let mut stack: Vec<String> = vec![new_dep_id.to_string()];
-    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    while let Some(current) = stack.pop() {
-        if !visited.insert(current.clone()) {
-            continue;
-        }
-        if current == plan_id {
-            return Ok(true);
-        }
-        let deps = list_plan_dependencies(conn, &current)?;
-        for d in deps {
-            if !visited.contains(&d) {
-                stack.push(d);
-            }
-        }
-    }
-
-    Ok(false)
+    crate::dag_util::would_create_cycle_generic(plan_id, new_dep_id, |id| {
+        list_plan_dependencies(conn, id)
+    })
 }
 
 /// Topologically sort the given plan IDs so that dependencies come before
@@ -2020,6 +2991,390 @@ pub fn topo_sort_plans(conn: &Connection, plan_ids: &[String]) -> Result<Vec<Str
     }
 
     Ok(sorted)
+}
+
+// ---------------------------------------------------------------------------
+// Step dependency operations
+// ---------------------------------------------------------------------------
+
+/// Record that `step_id` depends on `depends_on_step_id`.
+///
+/// A direct structural clone of [`add_plan_dependency`] against the V25
+/// `step_dependencies` table (docs/dag-redesign.md §3.1). Bails with a
+/// user-friendly error if the two IDs are the same (mirroring the table's
+/// self-edge `CHECK`), or if adding the edge would create a cycle in the step
+/// dependency graph. Cycle detection runs before the insert via
+/// [`would_create_step_cycle`], so callers never need to invoke it themselves
+/// (docs/dag-redesign.md §6: DAG acyclicity validated on every edge mutation).
+///
+/// The CLI/scheduler callers land in later DAG-redesign steps (`ralph step
+/// dependency`, `--depends-on`, the topological scheduler); until then tests
+/// are the only consumers, so `#[allow(dead_code)]` marks the binary surface
+/// area, not the function itself.
+pub fn add_step_dependency(
+    conn: &Connection,
+    step_id: &str,
+    depends_on_step_id: &str,
+) -> Result<()> {
+    if step_id == depends_on_step_id {
+        anyhow::bail!("A step cannot depend on itself");
+    }
+
+    if would_create_step_cycle(conn, step_id, depends_on_step_id)? {
+        anyhow::bail!("Adding dependency {step_id} -> {depends_on_step_id} would create a cycle");
+    }
+
+    // Plan-local invariant: an edge must connect two steps in the same plan.
+    // The DB enforces this at the boundary via the V31
+    // `step_dependencies_same_plan_{insert,update}` triggers; this in-process
+    // check is deliberate defense-in-depth that runs first so the common path
+    // gets a precise `Step not found` vs. cross-plan error instead of the
+    // trigger's generic abort. If the invariant ever changes, update both this
+    // block and `migrate_v31` together.
+    let step_plan: Option<String> = conn
+        .query_row(
+            "SELECT plan_id FROM steps WHERE id = ?1",
+            params![step_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let dep_plan: Option<String> = conn
+        .query_row(
+            "SELECT plan_id FROM steps WHERE id = ?1",
+            params![depends_on_step_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match (step_plan, dep_plan) {
+        (Some(a), Some(b)) if a == b => {}
+        (Some(_), Some(_)) => {
+            anyhow::bail!("Step dependencies must stay within one plan");
+        }
+        (None, _) => anyhow::bail!("Step not found: {step_id}"),
+        (_, None) => anyhow::bail!("Step not found: {depends_on_step_id}"),
+    }
+
+    conn.execute(
+        "INSERT INTO step_dependencies (step_id, depends_on_step_id) VALUES (?1, ?2)",
+        params![step_id, depends_on_step_id],
+    )
+    .map_err(|e| {
+        if is_unique_violation(&e) {
+            anyhow::anyhow!("dependency already exists: {step_id} -> {depends_on_step_id}")
+        } else {
+            anyhow::Error::new(e).context(format!(
+                "Failed to add dependency {step_id} -> {depends_on_step_id}"
+            ))
+        }
+    })?;
+
+    Ok(())
+}
+
+/// Remove a specific step-dependency edge. No-op if the row does not exist.
+pub fn remove_step_dependency(
+    conn: &Connection,
+    step_id: &str,
+    depends_on_step_id: &str,
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM step_dependencies WHERE step_id = ?1 AND depends_on_step_id = ?2",
+        params![step_id, depends_on_step_id],
+    )
+    .with_context(|| format!("Failed to remove dependency {step_id} -> {depends_on_step_id}"))?;
+    Ok(())
+}
+
+/// List the step IDs that `step_id` directly depends on.
+pub fn list_step_dependencies(conn: &Connection, step_id: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT depends_on_step_id FROM step_dependencies WHERE step_id = ?1 ORDER BY depends_on_step_id ASC",
+    )?;
+    let rows = stmt.query_map(params![step_id], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// List the step IDs that directly depend on `step_id` (reverse edges).
+pub fn list_step_dependents(conn: &Connection, step_id: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT step_id FROM step_dependencies WHERE depends_on_step_id = ?1 ORDER BY step_id ASC",
+    )?;
+    let rows = stmt.query_map(params![step_id], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Check whether adding `step_id -> new_dep_id` would create a cycle.
+///
+/// Step-graph analogue of [`would_create_cycle`]: a thin DB-backed wrapper
+/// around [`crate::dag_util::would_create_cycle_generic`] whose per-node
+/// dependency accessor delegates to [`list_step_dependencies`]. A self-edge
+/// (`step_id == new_dep_id`) is reported as a cycle. Reused by import
+/// validation (docs/dag-redesign.md §13.3 — see
+/// `import::find_imported_cycle`, which is the in-memory analogue layered
+/// on the same generic DFS).
+pub fn would_create_step_cycle(conn: &Connection, step_id: &str, new_dep_id: &str) -> Result<bool> {
+    crate::dag_util::would_create_cycle_generic(step_id, new_dep_id, |id| {
+        list_step_dependencies(conn, id)
+    })
+}
+
+/// Load every step-dependency edge for `plan_id` as an adjacency map
+/// `step_id -> [depends_on_step_id, ...]`.
+///
+/// One query for the whole plan instead of N calls to
+/// [`list_step_dependencies`]; the topological scheduler
+/// (docs/dag-redesign.md §3.5) re-reads this every tick so a step added
+/// mid-run with `--depends-on` is picked up. Steps with no outgoing edges
+/// are simply absent from the map (callers treat a missing key as
+/// "no dependencies"). Edges are scoped to the plan via a join on
+/// `steps.plan_id`, so a returned `depends_on_step_id` always belongs to
+/// the same plan.
+pub fn list_step_dependency_edges(
+    conn: &Connection,
+    plan_id: &str,
+) -> Result<std::collections::HashMap<String, Vec<String>>> {
+    let mut stmt = conn.prepare(
+        "SELECT sd.step_id, sd.depends_on_step_id \
+         FROM step_dependencies sd \
+         JOIN steps s ON s.id = sd.step_id \
+         WHERE s.plan_id = ?1 \
+         ORDER BY sd.step_id ASC, sd.depends_on_step_id ASC",
+    )?;
+    let rows = stmt.query_map(params![plan_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut edges: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for row in rows {
+        let (step_id, dep_id) = row?;
+        edges.entry(step_id).or_default().push(dep_id);
+    }
+    Ok(edges)
+}
+
+// ---------------------------------------------------------------------------
+// Review pipeline: review_status, corrective steps, corrective-step request
+// bridge (docs/dag-redesign.md §3.3, §9-inv-3, §10)
+// ---------------------------------------------------------------------------
+
+/// Set a step's `review_status` (V27 `steps.review_status` TEXT column) and
+/// bump `updated_at`. NULL on disk means [`crate::plan::ReviewStatus::Pending`];
+/// this writes the explicit serialized variant so the
+/// Pending→InFlight→Passed/Failed transitions the review pipeline drives are
+/// durable and observable cross-process (mirrors [`update_step_status`]).
+pub fn update_step_review_status(
+    conn: &Connection,
+    step_id: &str,
+    status: crate::plan::ReviewStatus,
+) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE steps SET review_status = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+        params![status.as_str(), step_id],
+    )?;
+    if affected == 0 {
+        anyhow::bail!("Step not found: {step_id}");
+    }
+    Ok(())
+}
+
+/// Point a (reviewer-inserted) step at the step it corrects (§10): sets
+/// `steps.corrects_step_id`. Only the orchestrator calls this, as the SOLE
+/// DAG writer (§9-inv-3). `None` clears it (an ordinary, non-corrective
+/// step). Does not bump `updated_at` — `corrects_step_id` is immutable
+/// provenance set once at corrective-step creation, like `short_id`.
+pub fn set_step_corrects_step_id(
+    conn: &Connection,
+    step_id: &str,
+    corrects: Option<&str>,
+) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE steps SET corrects_step_id = ?1 WHERE id = ?2",
+        params![corrects, step_id],
+    )?;
+    if affected == 0 {
+        anyhow::bail!("Step not found: {step_id}");
+    }
+    Ok(())
+}
+
+/// One open corrective-step request — the durable face of the §9-inv-3
+/// "structured channel" by which a reviewer *requests* (never performs) a
+/// DAG mutation. Rows live in `corrective_step_requests` (V29).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorrectiveStepRequest {
+    pub id: String,
+    pub reviewed_step_id: String,
+    pub reviewed_iteration: i32,
+    pub commit_sha: String,
+    pub issues: i32,
+    pub verdict_body: Option<String>,
+    /// `true` when a human resolved a review-loop-escalation blocker, which
+    /// grants exactly ONE more review→correction cycle. `consume_corrective_request`
+    /// bypasses the recursion cap for a human-approved request (V35).
+    pub human_approved: bool,
+}
+
+/// Insert an OPEN corrective-step request (V29 bridge — docs/dag-redesign.md
+/// §9 invariant 3). This is the *only* DAG-related write a failed review
+/// performs: it records a *request*, keyed to the reviewed step + iteration +
+/// commit, that the orchestrator drains at a scheduler tick and acts on as
+/// the sole writer. Structural sibling of [`request_skip`] / V23 skip-bridge
+/// and [`insert_interruption`] / V26 interruption-bridge. Returns the
+/// generated request id.
+pub fn insert_corrective_step_request(
+    conn: &Connection,
+    reviewed_step_id: &str,
+    reviewed_iteration: i32,
+    commit_sha: &str,
+    issues: i32,
+    verdict_body: Option<&str>,
+    human_approved: bool,
+) -> Result<String> {
+    let id = Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO corrective_step_requests \
+            (id, reviewed_step_id, reviewed_iteration, commit_sha, issues, verdict_body, human_approved, state, requested_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'open', strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        params![
+            id,
+            reviewed_step_id,
+            reviewed_iteration,
+            commit_sha,
+            issues,
+            verdict_body,
+            human_approved
+        ],
+    )?;
+    Ok(id)
+}
+
+/// List every OPEN corrective-step request whose reviewed step belongs to
+/// `plan_id`, oldest-first (`requested_at ASC, id ASC` — stable). The
+/// orchestrator drains these at a scheduler tick. Ordering is deterministic
+/// so the scheduler tie-break stays reproducible (§3.5 item 4 / §11).
+pub fn list_open_corrective_step_requests_for_plan(
+    conn: &Connection,
+    plan_id: &str,
+) -> Result<Vec<CorrectiveStepRequest>> {
+    let mut stmt = conn.prepare(
+        "SELECT r.id, r.reviewed_step_id, r.reviewed_iteration, r.commit_sha, r.issues, r.verdict_body, r.human_approved \
+         FROM corrective_step_requests r \
+         JOIN steps s ON s.id = r.reviewed_step_id \
+         WHERE r.state = 'open' AND s.plan_id = ?1 \
+         ORDER BY r.requested_at ASC, r.id ASC",
+    )?;
+    let rows = stmt.query_map(params![plan_id], |row| {
+        Ok(CorrectiveStepRequest {
+            id: row.get(0)?,
+            reviewed_step_id: row.get(1)?,
+            reviewed_iteration: row.get(2)?,
+            commit_sha: row.get(3)?,
+            issues: row.get(4)?,
+            verdict_body: row.get(5)?,
+            human_approved: row.get::<_, i64>(6)? != 0,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Close (mark `consumed`) every OPEN corrective-step request against
+/// `step_id` without performing any DAG mutation. Used when the reviewed step
+/// is skipped: the correction is no longer actionable, so the row must leave
+/// the `open` state the orchestrator's drain query selects on. Returns the
+/// number of rows transitioned. Idempotent (the `state = 'open'` predicate
+/// makes a second call a no-op).
+pub fn close_open_corrective_step_requests_for_step(
+    conn: &Connection,
+    step_id: &str,
+) -> Result<usize> {
+    let affected = conn.execute(
+        "UPDATE corrective_step_requests SET state = 'consumed' \
+         WHERE reviewed_step_id = ?1 AND state = 'open'",
+        params![step_id],
+    )?;
+    Ok(affected)
+}
+
+/// Atomically mark a corrective-step request `consumed` **only when it is
+/// still `open`**, in one predicate-guarded transaction (the same
+/// read-and-clear discipline as [`take_skip_request_for_step`]). Returns
+/// `Ok(true)` when this call transitioned an open row (the caller owns the
+/// consumption and must perform the §10 mutation), `Ok(false)` when it was
+/// already consumed or gone — so the §9-inv-3 single-writer guarantee holds
+/// even if the drain is ever entered twice.
+pub fn consume_corrective_step_request(conn: &Connection, request_id: &str) -> Result<bool> {
+    // Hard delete (matches the V29 migration's documented intent): the
+    // durable audit trail is the corrective step + its `corrects_step_id`
+    // pointer, not the bridge row. A prior soft `state='consumed'` UPDATE
+    // never deleted anything, so the table grew by one row per failed
+    // review forever. The single-writer guard is unchanged — only the
+    // caller that removes the still-`open` row gets `true`.
+    let affected = conn.execute(
+        "DELETE FROM corrective_step_requests WHERE id = ?1 AND state = 'open'",
+        params![request_id],
+    )?;
+    Ok(affected > 0)
+}
+
+/// Length of the corrective chain ending at `step_id`, i.e. how many
+/// `corrects_step_id` hops it takes to walk back to a non-corrective step.
+///
+/// An ordinary step returns 0. A first corrective step A′ (`corrects A`,
+/// A ordinary) returns 1; A″ correcting A′ returns 2; and so on. The
+/// recursion-cap check (§10 item 4 / §14.5) compares the chain length the
+/// *next* correction would have against the per-plan
+/// `max_review_corrections`. Implemented as a single SQLite recursive CTE
+/// (one query for the whole chain instead of one SELECT per hop) — the
+/// per-hop loop was called from `consume_corrective_request` on every
+/// review-failure tick and turned the per-plan cap into N round-trips for
+/// a chain of length N. The CTE's `hops` accumulator is the chain length;
+/// `MAX(hops)` is the final answer.
+///
+/// The `WHERE hops < 1024` clause is a defense-in-depth bound: in normal
+/// operation a corrective chain points strictly backward at an existing
+/// step (never cyclic), but the bounded WHERE guarantees termination
+/// even on a corrupted `corrects_step_id` pointer (same role the
+/// pre-CTE `visited` HashSet played). 1024 is several orders of
+/// magnitude above any plausible `max_review_corrections` ceiling.
+///
+/// Returns `Ok(0)` for an ordinary step (no `corrects_step_id`) and for
+/// a non-existent `step_id` (the anchor returns no rows; the CTE yields
+/// the empty set; `MAX(...)` over the empty set is SQL NULL, which we
+/// coalesce to 0).
+pub fn corrective_chain_len(conn: &Connection, step_id: &str) -> Result<usize> {
+    // The anchor selects the start step's `corrects_step_id` (1 hop in if
+    // it is corrective, NULL otherwise — terminated immediately). Each
+    // recursive row walks one more `corrects_step_id` link. `hops <
+    // 1024` bounds the walk against any pathological pointer; the
+    // outer COALESCE turns the empty-set MAX (NULL) into 0 so an
+    // ordinary or non-existent step is reported as length 0.
+    let sql = "
+        WITH RECURSIVE chain(id, hops) AS (
+            SELECT s.corrects_step_id, 1
+              FROM steps s
+             WHERE s.id = ?1 AND s.corrects_step_id IS NOT NULL
+            UNION ALL
+            SELECT s.corrects_step_id, c.hops + 1
+              FROM chain c
+              JOIN steps s ON s.id = c.id
+             WHERE s.corrects_step_id IS NOT NULL AND c.hops < 1024
+        )
+        SELECT COALESCE(MAX(hops), 0) FROM chain
+    ";
+    let len: i64 = conn.query_row(sql, params![step_id], |r| r.get(0))?;
+    Ok(len.max(0) as usize)
 }
 
 // ---------------------------------------------------------------------------
@@ -2183,7 +3538,6 @@ pub fn list_all_hooks_for_plan(conn: &Connection, plan_id: &str) -> Result<Vec<S
 /// Production callers are `ralph cancel` and `ralph status`. Tests exercise it
 /// to verify phase writes, so the `#[allow(dead_code)]` marks the binary
 /// surface area, not the function itself.
-#[allow(dead_code)]
 pub fn get_live_run(conn: &Connection, project: &str) -> Result<Option<LiveRun>> {
     let query = format!("SELECT {LIVE_RUN_COLUMNS} FROM run_locks WHERE project = ?1");
     let mut stmt = conn.prepare(&query)?;
@@ -2223,6 +3577,56 @@ pub fn bind_live_run_to_plan(
             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
          WHERE project = ?4",
         params![plan_id, plan_slug, Phase::Idle.as_str(), project],
+    )?;
+
+    if affected == 0 {
+        anyhow::bail!("No run_locks row for project: {project}");
+    }
+    Ok(())
+}
+
+/// Clear every per-step field on the live-run lock row, returning the row
+/// to a "no live step" snapshot while keeping the plan binding intact.
+///
+/// **Why this exists.** `update_live_phase` uses COALESCE on `step_id`,
+/// `step_num`, `attempt`, `max_attempts`, and `execution_log_id`, so passing
+/// `None` for any of them *preserves* the prior value. Between two
+/// consecutive steps within the same plan there is a small window — from
+/// when `execute_step` returns to the scheduler to when the next step's
+/// first `write_phase` fires — during which `run_locks.step_id` still names
+/// the previous step. An orphaned subprocess from step A's harness calling
+/// `ralph question ask` during that window would bind the question to A
+/// (already `Complete`), not to B. `bind_live_run_to_plan` widens the same
+/// row to "no live step", but only on a **cross-plan** rebind; the
+/// within-plan case had no equivalent. This function fills that gap.
+///
+/// **What it clears.** Every per-step field on the lock row:
+/// `step_id`, `step_num`, `attempt`, `max_attempts`, `execution_log_id`,
+/// `current_command`, `child_pid`, `child_start_token`. The plan binding
+/// (`plan_id`, `plan_slug`), the process pid, and the run-start columns
+/// stay untouched.
+///
+/// Called by `runner::run_plan_inner` between consecutive `execute_step`
+/// invocations within a plan (and a defensive cross-process bridge — see
+/// the `Fix #4` comment at the call site).
+///
+/// Errors when no row exists for `project` — the run_locks row is created
+/// by [`crate::run_lock::acquire`] before the executor starts, so a missing
+/// row indicates a programming error (likely a test forgot to seed the row).
+pub fn clear_live_run_step(conn: &Connection, project: &str) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE run_locks SET
+            step_id = NULL,
+            step_num = NULL,
+            attempt = NULL,
+            max_attempts = NULL,
+            execution_log_id = NULL,
+            current_command = NULL,
+            child_pid = NULL,
+            child_start_token = NULL,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         WHERE project = ?1",
+        params![project],
     )?;
 
     if affected == 0 {
@@ -2278,19 +3682,36 @@ pub enum ChildUpdate<'a> {
 /// Errors when no row exists for `project` — the run_locks row is created by
 /// [`crate::run_lock::acquire`] before the executor starts, so a missing row
 /// indicates a programming error (likely a test forgot to seed the row).
-#[allow(clippy::too_many_arguments)]
+/// The COALESCE-able step bookkeeping written alongside a phase transition by
+/// [`update_live_phase`]: the step identity (`step_id` / `step_num`), the
+/// `attempt` / `max_attempts`, the `execution_log_id`, the (always-overwritten)
+/// `current_command`, and the explicit [`ChildUpdate`] for the child pid/token
+/// columns. `conn` / `project` / `phase` stay separate lead arguments.
+pub struct LivePhase<'a> {
+    pub step_id: Option<&'a str>,
+    pub step_num: Option<i32>,
+    pub attempt: Option<i32>,
+    pub max_attempts: Option<i32>,
+    pub execution_log_id: Option<i64>,
+    pub current_command: Option<&'a str>,
+    pub child: ChildUpdate<'a>,
+}
+
 pub fn update_live_phase(
     conn: &Connection,
     project: &str,
     phase: Phase,
-    step_id: Option<&str>,
-    step_num: Option<i32>,
-    attempt: Option<i32>,
-    max_attempts: Option<i32>,
-    execution_log_id: Option<i64>,
-    current_command: Option<&str>,
-    child: ChildUpdate<'_>,
+    live: LivePhase<'_>,
 ) -> Result<()> {
+    let LivePhase {
+        step_id,
+        step_num,
+        attempt,
+        max_attempts,
+        execution_log_id,
+        current_command,
+        child,
+    } = live;
     // Build the child-column fragment + bound params depending on the mode.
     // Keep uses COALESCE so Nones don't clobber; Set writes the values
     // directly; Clear overwrites both to NULL.
@@ -2365,6 +3786,153 @@ mod tests {
         db::open_memory().expect("open_memory")
     }
 
+    // -- short_id minting --
+
+    #[test]
+    fn test_mint_short_id_unique_length_charset() {
+        let conn = setup();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "mint",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+
+        // Mint a short_id per step, persisting each so the next mint's
+        // collision check (against steps.short_id) actually observes prior
+        // assignments — exactly the V25-migration usage pattern.
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..256 {
+            let (step, _) = create_step(
+                &conn,
+                &plan.id,
+                NewStep {
+                    title: &format!("Step {i}"),
+                    description: "d",
+                    agent: None,
+                    harness: None,
+                    acceptance_criteria: &[],
+                    max_retries: None,
+                    model: None,
+                    change_policy: None,
+                    tags: None,
+                },
+            )
+            .unwrap();
+            let sid = mint_short_id(&conn, &plan.id).expect("mint_short_id");
+            assert_eq!(sid.chars().count(), 8, "short_id must be 8 chars: {sid:?}");
+            assert!(
+                sid.bytes().all(|b| SHORT_ID_ALPHABET.contains(&b)),
+                "short_id must be base-62 ([0-9A-Za-z]): {sid:?}"
+            );
+            assert!(
+                !sid.bytes().all(|b| b.is_ascii_digit()),
+                "minted short_id must not be all digits: {sid:?}"
+            );
+            assert!(seen.insert(sid.clone()), "duplicate short_id minted: {sid}");
+            conn.execute(
+                "UPDATE steps SET short_id = ?1 WHERE id = ?2",
+                params![sid, step.id],
+            )
+            .unwrap();
+        }
+        assert_eq!(seen.len(), 256, "every minted short_id must be unique");
+    }
+
+    #[test]
+    fn test_create_step_assigns_unique_short_id() {
+        let conn = setup();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "sid",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+
+        let (s1, _) = create_step(
+            &conn,
+            &plan.id,
+            NewStep {
+                title: "Step one",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+        let (s2, _) = create_step(
+            &conn,
+            &plan.id,
+            NewStep {
+                title: "Step two",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            !s1.short_id.is_empty(),
+            "create_step must assign a non-empty short_id"
+        );
+        assert!(
+            !s2.short_id.is_empty(),
+            "create_step must assign a non-empty short_id"
+        );
+        assert_ne!(
+            s1.short_id, s2.short_id,
+            "two steps in one plan must get distinct short_ids"
+        );
+
+        // create_step_at goes through the same minting helper and must also
+        // produce a plan-unique short_id distinct from the appended steps.
+        let (s3, _) = create_step_at(
+            &conn,
+            &plan.id,
+            "z",
+            NewStep {
+                title: "Step three",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+        assert!(!s3.short_id.is_empty());
+        assert_ne!(s3.short_id, s1.short_id);
+        assert_ne!(s3.short_id, s2.short_id);
+    }
+
     // -- Plan tests --
 
     #[test]
@@ -2374,13 +3942,15 @@ mod tests {
 
         let plan = create_plan(
             &conn,
-            "my-plan",
-            "/tmp/proj",
-            "feat/branch",
-            "A test plan",
-            Some("claude"),
-            Some("opus"),
-            &tests,
+            NewPlan {
+                slug: "my-plan",
+                project: "/tmp/proj",
+                branch_name: "feat/branch",
+                description: "A test plan",
+                harness: Some("claude"),
+                agent: Some("opus"),
+                deterministic_tests: &tests,
+            },
         )
         .expect("create_plan");
 
@@ -2411,9 +3981,45 @@ mod tests {
     fn test_list_plans_filters_by_project() {
         let conn = setup();
 
-        create_plan(&conn, "p1", "/proj-a", "b1", "desc", None, None, &[]).unwrap();
-        create_plan(&conn, "p2", "/proj-b", "b2", "desc", None, None, &[]).unwrap();
-        create_plan(&conn, "p3", "/proj-a", "b3", "desc", None, None, &[]).unwrap();
+        create_plan(
+            &conn,
+            NewPlan {
+                slug: "p1",
+                project: "/proj-a",
+                branch_name: "b1",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        create_plan(
+            &conn,
+            NewPlan {
+                slug: "p2",
+                project: "/proj-b",
+                branch_name: "b2",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        create_plan(
+            &conn,
+            NewPlan {
+                slug: "p3",
+                project: "/proj-a",
+                branch_name: "b3",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         let proj_a = list_plans(&conn, "/proj-a", false).unwrap();
         assert_eq!(proj_a.len(), 2);
@@ -2430,20 +4036,56 @@ mod tests {
         // With no execution_logs rows, the order should be `created_at DESC`.
         let conn = setup();
 
-        let p1 = create_plan(&conn, "p1", "/proj", "b1", "d", None, None, &[]).unwrap();
+        let p1 = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p1",
+                project: "/proj",
+                branch_name: "b1",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         // Force distinct created_at stamps so ordering is deterministic.
         conn.execute(
             "UPDATE plans SET created_at = ?1 WHERE id = ?2",
             params!["2026-01-01T00:00:00.000Z", p1.id],
         )
         .unwrap();
-        let p2 = create_plan(&conn, "p2", "/proj", "b2", "d", None, None, &[]).unwrap();
+        let p2 = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p2",
+                project: "/proj",
+                branch_name: "b2",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         conn.execute(
             "UPDATE plans SET created_at = ?1 WHERE id = ?2",
             params!["2026-03-01T00:00:00.000Z", p2.id],
         )
         .unwrap();
-        let p3 = create_plan(&conn, "p3", "/proj", "b3", "d", None, None, &[]).unwrap();
+        let p3 = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p3",
+                project: "/proj",
+                branch_name: "b3",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         conn.execute(
             "UPDATE plans SET created_at = ?1 WHERE id = ?2",
             params!["2026-02-01T00:00:00.000Z", p3.id],
@@ -2462,14 +4104,38 @@ mod tests {
         let conn = setup();
 
         // p1 created earliest, but will get a recent log.
-        let p1 = create_plan(&conn, "p1", "/proj", "b1", "d", None, None, &[]).unwrap();
+        let p1 = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p1",
+                project: "/proj",
+                branch_name: "b1",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         conn.execute(
             "UPDATE plans SET created_at = ?1 WHERE id = ?2",
             params!["2026-01-01T00:00:00.000Z", p1.id],
         )
         .unwrap();
         // p2 created most recently, but never run.
-        let p2 = create_plan(&conn, "p2", "/proj", "b2", "d", None, None, &[]).unwrap();
+        let p2 = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p2",
+                project: "/proj",
+                branch_name: "b2",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         conn.execute(
             "UPDATE plans SET created_at = ?1 WHERE id = ?2",
             params!["2026-04-01T00:00:00.000Z", p2.id],
@@ -2480,15 +4146,17 @@ mod tests {
         let (step, _) = create_step(
             &conn,
             &p1.id,
-            "s",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "s",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let log = create_execution_log(&conn, &step.id, 1, None, None).unwrap();
@@ -2508,22 +4176,48 @@ mod tests {
         // When a plan has multiple logs, the MAX(started_at) wins.
         let conn = setup();
 
-        let p1 = create_plan(&conn, "p1", "/proj", "b1", "d", None, None, &[]).unwrap();
-        let p2 = create_plan(&conn, "p2", "/proj", "b2", "d", None, None, &[]).unwrap();
+        let p1 = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p1",
+                project: "/proj",
+                branch_name: "b1",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let p2 = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p2",
+                project: "/proj",
+                branch_name: "b2",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         // p1 has an old log + a fresh log → MAX is fresh.
         let (s1, _) = create_step(
             &conn,
             &p1.id,
-            "s1",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "s1",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let l_old = create_execution_log(&conn, &s1.id, 1, None, None).unwrap();
@@ -2543,15 +4237,17 @@ mod tests {
         let (s2, _) = create_step(
             &conn,
             &p2.id,
-            "s2",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "s2",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let l_p2 = create_execution_log(&conn, &s2.id, 1, None, None).unwrap();
@@ -2570,10 +4266,46 @@ mod tests {
     fn test_list_plans_sorted_by_recency_excludes_archived_and_other_projects() {
         let conn = setup();
 
-        let _own = create_plan(&conn, "own", "/proj", "b1", "d", None, None, &[]).unwrap();
-        let archived = create_plan(&conn, "archived", "/proj", "b2", "d", None, None, &[]).unwrap();
+        let _own = create_plan(
+            &conn,
+            NewPlan {
+                slug: "own",
+                project: "/proj",
+                branch_name: "b1",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let archived = create_plan(
+            &conn,
+            NewPlan {
+                slug: "archived",
+                project: "/proj",
+                branch_name: "b2",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         update_plan_status(&conn, &archived.id, PlanStatus::Archived).unwrap();
-        let _other = create_plan(&conn, "other", "/elsewhere", "b3", "d", None, None, &[]).unwrap();
+        let _other = create_plan(
+            &conn,
+            NewPlan {
+                slug: "other",
+                project: "/elsewhere",
+                branch_name: "b3",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         let plans = list_plans_sorted_by_recency(&conn, "/proj").unwrap();
         let slugs: Vec<&str> = plans.iter().map(|p| p.slug.as_str()).collect();
@@ -2584,10 +4316,58 @@ mod tests {
     fn test_list_archived_plans_sorted_by_recency_only_returns_archived() {
         let conn = setup();
 
-        let active = create_plan(&conn, "active", "/proj", "b1", "d", None, None, &[]).unwrap();
-        let arch_a = create_plan(&conn, "arch-a", "/proj", "b2", "d", None, None, &[]).unwrap();
-        let arch_b = create_plan(&conn, "arch-b", "/proj", "b3", "d", None, None, &[]).unwrap();
-        let other = create_plan(&conn, "other", "/elsewhere", "b4", "d", None, None, &[]).unwrap();
+        let active = create_plan(
+            &conn,
+            NewPlan {
+                slug: "active",
+                project: "/proj",
+                branch_name: "b1",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let arch_a = create_plan(
+            &conn,
+            NewPlan {
+                slug: "arch-a",
+                project: "/proj",
+                branch_name: "b2",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let arch_b = create_plan(
+            &conn,
+            NewPlan {
+                slug: "arch-b",
+                project: "/proj",
+                branch_name: "b3",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let other = create_plan(
+            &conn,
+            NewPlan {
+                slug: "other",
+                project: "/elsewhere",
+                branch_name: "b4",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         update_plan_status(&conn, &arch_a.id, PlanStatus::Archived).unwrap();
         update_plan_status(&conn, &arch_b.id, PlanStatus::Archived).unwrap();
         update_plan_status(&conn, &other.id, PlanStatus::Archived).unwrap();
@@ -2609,11 +4389,59 @@ mod tests {
 
         assert_eq!(count_archived_plans(&conn, "/proj").unwrap(), 0);
 
-        let p1 = create_plan(&conn, "p1", "/proj", "b1", "d", None, None, &[]).unwrap();
-        let p2 = create_plan(&conn, "p2", "/proj", "b2", "d", None, None, &[]).unwrap();
-        let p3 = create_plan(&conn, "p3", "/proj", "b3", "d", None, None, &[]).unwrap();
+        let p1 = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p1",
+                project: "/proj",
+                branch_name: "b1",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let p2 = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p2",
+                project: "/proj",
+                branch_name: "b2",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let p3 = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p3",
+                project: "/proj",
+                branch_name: "b3",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         // Different project — must not count.
-        let other = create_plan(&conn, "other", "/elsewhere", "b4", "d", None, None, &[]).unwrap();
+        let other = create_plan(
+            &conn,
+            NewPlan {
+                slug: "other",
+                project: "/elsewhere",
+                branch_name: "b4",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         // p1 still planning; only p2 and p3 archived.
         update_plan_status(&conn, &p2.id, PlanStatus::Archived).unwrap();
@@ -2630,14 +4458,110 @@ mod tests {
         let conn = setup();
 
         // Seed one plan per status, plus a same-status plan in another project.
-        let planning = create_plan(&conn, "p1", "/proj", "b1", "d", None, None, &[]).unwrap();
-        let ready = create_plan(&conn, "p2", "/proj", "b2", "d", None, None, &[]).unwrap();
-        let in_progress = create_plan(&conn, "p3", "/proj", "b3", "d", None, None, &[]).unwrap();
-        let failed = create_plan(&conn, "p4", "/proj", "b4", "d", None, None, &[]).unwrap();
-        let complete = create_plan(&conn, "p5", "/proj", "b5", "d", None, None, &[]).unwrap();
-        let archived = create_plan(&conn, "p6", "/proj", "b6", "d", None, None, &[]).unwrap();
-        let aborted = create_plan(&conn, "p7", "/proj", "b7", "d", None, None, &[]).unwrap();
-        let other = create_plan(&conn, "p8", "/other", "b8", "d", None, None, &[]).unwrap();
+        let planning = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p1",
+                project: "/proj",
+                branch_name: "b1",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let ready = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p2",
+                project: "/proj",
+                branch_name: "b2",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let in_progress = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p3",
+                project: "/proj",
+                branch_name: "b3",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let failed = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p4",
+                project: "/proj",
+                branch_name: "b4",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let complete = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p5",
+                project: "/proj",
+                branch_name: "b5",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let archived = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p6",
+                project: "/proj",
+                branch_name: "b6",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let aborted = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p7",
+                project: "/proj",
+                branch_name: "b7",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let other = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p8",
+                project: "/other",
+                branch_name: "b8",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         update_plan_status(&conn, &ready.id, PlanStatus::Ready).unwrap();
         update_plan_status(&conn, &in_progress.id, PlanStatus::InProgress).unwrap();
@@ -2684,7 +4608,19 @@ mod tests {
     #[test]
     fn test_update_plan_status() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         assert_eq!(plan.status, PlanStatus::Planning);
 
         update_plan_status(&conn, &plan.id, PlanStatus::InProgress).unwrap();
@@ -2695,26 +4631,101 @@ mod tests {
         assert!(found.updated_at >= plan.updated_at);
     }
 
+    /// STEP 44 / docs/dag-redesign.md §13.3: `any_review_enabled` drives
+    /// the doctor review-harness warning. It is true iff some plan OR step
+    /// has `review_enabled = 1`; an explicit `Some(false)` or NULL/inherit
+    /// must NOT count (only a truthy override means review is actually on).
     #[test]
-    fn test_set_plan_questions_enabled_flips_column() {
+    fn test_any_review_enabled_detects_plan_or_step_truthy_only() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-        assert!(plan.questions_enabled, "new plans default to on");
+        // Fresh DB: nothing enables review.
+        assert!(!any_review_enabled(&conn, false).unwrap());
 
-        set_plan_questions_enabled(&conn, &plan.id, false).unwrap();
-        let off = get_plan_by_slug(&conn, "s", "/p").unwrap().unwrap();
-        assert!(!off.questions_enabled);
-        assert!(off.updated_at >= plan.updated_at);
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "rv",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let (step, _) = create_step(
+            &conn,
+            &plan.id,
+            NewStep {
+                title: "s",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+        // Defaults (NULL/inherit) ⇒ still false.
+        assert!(!any_review_enabled(&conn, false).unwrap());
 
-        set_plan_questions_enabled(&conn, &plan.id, true).unwrap();
-        let on = get_plan_by_slug(&conn, "s", "/p").unwrap().unwrap();
-        assert!(on.questions_enabled);
+        // Explicit OFF on both ⇒ still false (not a truthy override).
+        set_plan_review_enabled(&conn, &plan.id, Some(false)).unwrap();
+        set_step_review_enabled(&conn, &step.id, Some(false)).unwrap();
+        assert!(!any_review_enabled(&conn, false).unwrap());
+
+        // Step ON ⇒ true.
+        set_step_review_enabled(&conn, &step.id, Some(true)).unwrap();
+        assert!(any_review_enabled(&conn, false).unwrap());
+
+        // Step back to inherit, plan ON ⇒ true (plan side of the OR).
+        set_step_review_enabled(&conn, &step.id, None).unwrap();
+        set_plan_review_enabled(&conn, &plan.id, Some(true)).unwrap();
+        assert!(any_review_enabled(&conn, false).unwrap());
+
+        // Everything back to inherit ⇒ false again.
+        set_plan_review_enabled(&conn, &plan.id, None).unwrap();
+        assert!(!any_review_enabled(&conn, false).unwrap());
+
+        // Global default ON means an inheriting plan counts even without an
+        // explicit DB truthy override.
+        assert!(any_review_enabled(&conn, true).unwrap());
+
+        // A per-step OFF override still suppresses review under a global ON
+        // default.
+        set_plan_review_enabled(&conn, &plan.id, Some(false)).unwrap();
+        set_step_review_enabled(&conn, &step.id, Some(false)).unwrap();
+        assert!(!any_review_enabled(&conn, true).unwrap());
+
+        // Plan inheriting (NULL) with every step explicitly OFF must NOT
+        // count, even under a global ON default — no review will ever run on
+        // such a plan, so doctor should stay quiet. This is the symmetry the
+        // function comment promises with `import::bundle_requests_review`.
+        set_plan_review_enabled(&conn, &plan.id, None).unwrap();
+        set_step_review_enabled(&conn, &step.id, Some(false)).unwrap();
+        assert!(!any_review_enabled(&conn, true).unwrap());
     }
 
     #[test]
     fn test_set_plan_pause_requested_round_trips() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         assert!(!plan.pause_requested, "default should be false");
         assert!(!get_plan_pause_requested(&conn, &plan.id).unwrap());
 
@@ -2733,7 +4744,19 @@ mod tests {
     #[test]
     fn test_take_plan_pause_requested_clears_flag_atomically() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         // Unset → take returns false, flag stays cleared.
         assert!(!take_plan_pause_requested(&conn, &plan.id).unwrap());
@@ -2763,7 +4786,19 @@ mod tests {
     #[test]
     fn test_request_skip_round_trips_and_take_clears_atomically() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         // No pending skip → take returns None, peek returns None.
         assert!(take_skip_request(&conn, &plan.id).unwrap().is_none());
@@ -2813,7 +4848,19 @@ mod tests {
     #[test]
     fn test_request_skip_overwrites_prior_and_unknown_token_defaults_stash() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         request_skip(
             &conn,
@@ -2850,7 +4897,19 @@ mod tests {
     #[test]
     fn test_clear_skip_request_is_idempotent_noop_when_empty() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         // No-op on an empty slot.
         clear_skip_request(&conn, &plan.id).unwrap();
         assert!(peek_skip_request(&conn, &plan.id).unwrap().is_none());
@@ -2866,7 +4925,19 @@ mod tests {
     #[test]
     fn test_take_skip_request_for_step_is_targeted_and_atomic() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         // Nothing pending → None for any step.
         assert!(
@@ -2946,7 +5017,19 @@ mod tests {
     #[test]
     fn test_set_plan_last_run_branch_round_trips() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         assert!(plan.last_run_branch.is_none());
 
         set_plan_last_run_branch(&conn, &plan.id, "feature/x").unwrap();
@@ -2973,9 +5056,45 @@ mod tests {
         // Three resumable plans on master; stamp last_run_started_at via
         // set_plan_last_run_branch in p1 → p2 → p3 order so DESC reflects
         // insertion order.
-        let p1 = create_plan(&conn, "p1", "/proj", "b1", "d", None, None, &[]).unwrap();
-        let p2 = create_plan(&conn, "p2", "/proj", "b2", "d", None, None, &[]).unwrap();
-        let p3 = create_plan(&conn, "p3", "/proj", "b3", "d", None, None, &[]).unwrap();
+        let p1 = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p1",
+                project: "/proj",
+                branch_name: "b1",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let p2 = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p2",
+                project: "/proj",
+                branch_name: "b2",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let p3 = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p3",
+                project: "/proj",
+                branch_name: "b3",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         update_plan_status(&conn, &p1.id, PlanStatus::Failed).unwrap();
         update_plan_status(&conn, &p2.id, PlanStatus::InProgress).unwrap();
         update_plan_status(&conn, &p3.id, PlanStatus::Aborted).unwrap();
@@ -3000,8 +5119,32 @@ mod tests {
     #[test]
     fn test_find_resumable_plans_orders_by_run_time_not_updated_at() {
         let conn = setup();
-        let stale = create_plan(&conn, "stale", "/proj", "b", "d", None, None, &[]).unwrap();
-        let fresh = create_plan(&conn, "fresh", "/proj", "b", "d", None, None, &[]).unwrap();
+        let stale = create_plan(
+            &conn,
+            NewPlan {
+                slug: "stale",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let fresh = create_plan(
+            &conn,
+            NewPlan {
+                slug: "fresh",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         update_plan_status(&conn, &stale.id, PlanStatus::Failed).unwrap();
         update_plan_status(&conn, &fresh.id, PlanStatus::Failed).unwrap();
 
@@ -3015,7 +5158,7 @@ mod tests {
         // first; under the new ordering anchored on
         // `last_run_started_at`, `fresh` still wins.
         std::thread::sleep(std::time::Duration::from_millis(5));
-        set_plan_questions_enabled(&conn, &stale.id, true).unwrap();
+        set_plan_pause_requested(&conn, &stale.id, true).unwrap();
 
         let candidates = find_resumable_plans_for_branch(&conn, "/proj", "master").unwrap();
         let slugs: Vec<&str> = candidates.iter().map(|p| p.slug.as_str()).collect();
@@ -3029,7 +5172,19 @@ mod tests {
     #[test]
     fn test_set_plan_last_run_branch_stamps_last_run_started_at() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/proj", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         assert!(plan.last_run_started_at.is_none());
 
         set_plan_last_run_branch(&conn, &plan.id, "master").unwrap();
@@ -3044,7 +5199,19 @@ mod tests {
     fn test_find_resumable_plan_returns_aborted_in_any_branch_context() {
         let conn = setup();
         // No matching branch row, but Aborted plan must still come back.
-        let plan = create_plan(&conn, "ab", "/proj", "any", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "ab",
+                project: "/proj",
+                branch_name: "any",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         update_plan_status(&conn, &plan.id, PlanStatus::Aborted).unwrap();
 
         let p = find_resumable_plan(&conn, "/proj").unwrap();
@@ -3056,10 +5223,46 @@ mod tests {
     fn test_find_resumable_plan_excludes_complete_and_planning() {
         let conn = setup();
         // Planning (default), complete, archived must not be returned.
-        let _planning = create_plan(&conn, "pl", "/proj", "b", "d", None, None, &[]).unwrap();
-        let cp = create_plan(&conn, "cp", "/proj", "b", "d", None, None, &[]).unwrap();
+        let _planning = create_plan(
+            &conn,
+            NewPlan {
+                slug: "pl",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let cp = create_plan(
+            &conn,
+            NewPlan {
+                slug: "cp",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         update_plan_status(&conn, &cp.id, PlanStatus::Complete).unwrap();
-        let ar = create_plan(&conn, "ar", "/proj", "b", "d", None, None, &[]).unwrap();
+        let ar = create_plan(
+            &conn,
+            NewPlan {
+                slug: "ar",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         update_plan_status(&conn, &ar.id, PlanStatus::Archived).unwrap();
 
         let p = find_resumable_plan(&conn, "/proj").unwrap();
@@ -3069,8 +5272,32 @@ mod tests {
     #[test]
     fn test_find_resumable_plan_orders_by_run_time_not_updated_at() {
         let conn = setup();
-        let stale = create_plan(&conn, "stale", "/proj", "b", "d", None, None, &[]).unwrap();
-        let fresh = create_plan(&conn, "fresh", "/proj", "b", "d", None, None, &[]).unwrap();
+        let stale = create_plan(
+            &conn,
+            NewPlan {
+                slug: "stale",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let fresh = create_plan(
+            &conn,
+            NewPlan {
+                slug: "fresh",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         update_plan_status(&conn, &stale.id, PlanStatus::Failed).unwrap();
         update_plan_status(&conn, &fresh.id, PlanStatus::Aborted).unwrap();
 
@@ -3079,7 +5306,7 @@ mod tests {
         set_plan_last_run_branch(&conn, &fresh.id, "main").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(5));
         // Bumping unrelated flag on the older plan must not change ranking.
-        set_plan_questions_enabled(&conn, &stale.id, true).unwrap();
+        set_plan_pause_requested(&conn, &stale.id, true).unwrap();
 
         let p = find_resumable_plan(&conn, "/proj").unwrap().unwrap();
         assert_eq!(p.slug, "fresh");
@@ -3096,16 +5323,64 @@ mod tests {
         ];
         for (i, status) in resumable_statuses.iter().enumerate() {
             let slug = format!("rp{i}");
-            let plan = create_plan(&conn, &slug, "/proj", "main", "d", None, None, &[]).unwrap();
+            let plan = create_plan(
+                &conn,
+                NewPlan {
+                    slug: &slug,
+                    project: "/proj",
+                    branch_name: "main",
+                    description: "d",
+                    harness: None,
+                    agent: None,
+                    deterministic_tests: &[],
+                },
+            )
+            .unwrap();
             update_plan_status(&conn, &plan.id, *status).unwrap();
             set_plan_last_run_branch(&conn, &plan.id, "main").unwrap();
         }
         // Non-resumable: planning (default), complete, archived.
-        let _planning = create_plan(&conn, "pl", "/proj", "main", "d", None, None, &[]).unwrap();
-        let cp = create_plan(&conn, "cp", "/proj", "main", "d", None, None, &[]).unwrap();
+        let _planning = create_plan(
+            &conn,
+            NewPlan {
+                slug: "pl",
+                project: "/proj",
+                branch_name: "main",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let cp = create_plan(
+            &conn,
+            NewPlan {
+                slug: "cp",
+                project: "/proj",
+                branch_name: "main",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         update_plan_status(&conn, &cp.id, PlanStatus::Complete).unwrap();
         set_plan_last_run_branch(&conn, &cp.id, "main").unwrap();
-        let ar = create_plan(&conn, "ar", "/proj", "main", "d", None, None, &[]).unwrap();
+        let ar = create_plan(
+            &conn,
+            NewPlan {
+                slug: "ar",
+                project: "/proj",
+                branch_name: "main",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         update_plan_status(&conn, &ar.id, PlanStatus::Archived).unwrap();
         set_plan_last_run_branch(&conn, &ar.id, "main").unwrap();
 
@@ -3122,11 +5397,34 @@ mod tests {
     #[test]
     fn test_find_resumable_plans_for_branch_scopes_to_project() {
         let conn = setup();
-        let here = create_plan(&conn, "here", "/proj", "main", "d", None, None, &[]).unwrap();
+        let here = create_plan(
+            &conn,
+            NewPlan {
+                slug: "here",
+                project: "/proj",
+                branch_name: "main",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         update_plan_status(&conn, &here.id, PlanStatus::Failed).unwrap();
         set_plan_last_run_branch(&conn, &here.id, "main").unwrap();
-        let elsewhere =
-            create_plan(&conn, "elsewhere", "/other", "main", "d", None, None, &[]).unwrap();
+        let elsewhere = create_plan(
+            &conn,
+            NewPlan {
+                slug: "elsewhere",
+                project: "/other",
+                branch_name: "main",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         update_plan_status(&conn, &elsewhere.id, PlanStatus::Failed).unwrap();
         set_plan_last_run_branch(&conn, &elsewhere.id, "main").unwrap();
 
@@ -3140,7 +5438,19 @@ mod tests {
         // A plan that has never run (last_run_branch IS NULL) should still
         // match when current_branch == branch_name.
         let conn = setup();
-        let plan = create_plan(&conn, "fresh", "/proj", "feat-x", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "fresh",
+                project: "/proj",
+                branch_name: "feat-x",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         update_plan_status(&conn, &plan.id, PlanStatus::Ready).unwrap();
         assert!(plan.last_run_branch.is_none());
 
@@ -3162,7 +5472,19 @@ mod tests {
         // that branch must NOT match A — A's last_run_branch='master' is
         // set, so the NULL+branch_name fallback is skipped.
         let conn = setup();
-        let a = create_plan(&conn, "deploy", "/proj", "deploy", "d", None, None, &[]).unwrap();
+        let a = create_plan(
+            &conn,
+            NewPlan {
+                slug: "deploy",
+                project: "/proj",
+                branch_name: "deploy",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         update_plan_status(&conn, &a.id, PlanStatus::Failed).unwrap();
         set_plan_last_run_branch(&conn, &a.id, "master").unwrap();
 
@@ -3185,109 +5507,90 @@ mod tests {
         assert_eq!(slugs, vec!["deploy"]);
     }
 
-    #[test]
-    fn test_list_answered_questions_for_step_returns_only_answered_in_order() {
-        let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-        let (step, _) = create_step(
-            &conn,
-            &plan.id,
-            "step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-
-        // Three rows: one already-answered, one unanswered (must be excluded),
-        // and one answered later. Use explicit asked_at timestamps to verify
-        // chronological ordering rather than insertion order.
-        conn.execute(
-            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, answer, asked_at, answered_at)
-             VALUES ('q1', ?1, 1, 'Q1?', '[]', 'A1.', '2026-05-01T10:00:00.000Z', '2026-05-01T11:00:00.000Z')",
-            params![&step.id],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, answer, asked_at)
-             VALUES ('q2', ?1, 1, 'Q2-pending?', '[]', NULL, '2026-05-01T10:30:00.000Z')",
-            params![&step.id],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, answer, asked_at, answered_at)
-             VALUES ('q3', ?1, 2, 'Q3?', '[]', 'A3.', '2026-05-01T12:00:00.000Z', '2026-05-01T13:00:00.000Z')",
-            params![&step.id],
-        )
-        .unwrap();
-
-        let answered = list_answered_questions_for_step(&conn, &step.id).unwrap();
-        assert_eq!(answered.len(), 2, "unanswered row must be excluded");
-        assert_eq!(answered[0].question, "Q1?");
-        assert_eq!(answered[0].answer, "A1.");
-        assert_eq!(answered[1].question, "Q3?");
-        assert_eq!(answered[1].answer, "A3.");
-    }
+    // `test_list_answered_questions_for_step_*` were removed in the §8/§4
+    // cutover (the unbounded prompt feed they covered is gone). The bounded
+    // replacement (`list_resolved_interruptions_for_step`) is exercised by
+    // `test_list_resolved_interruptions_for_step_is_bounded_and_newest_first`
+    // and the round-trip tests above.
 
     #[test]
     fn test_count_unanswered_questions_for_attempt_scopes_by_step_and_attempt() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
-        // Different combinations of (attempt, answer state) so we can verify
-        // the scoping. Only attempt=2 with answer=NULL should count.
-        conn.execute(
-            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, answer, asked_at, answered_at)
-             VALUES ('q1', ?1, 1, 'a1', '[]', 'done', '2026-05-01T10:00:00.000Z', '2026-05-01T11:00:00.000Z')",
-            params![&step.id],
-        ).unwrap();
-        conn.execute(
-            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, asked_at)
-             VALUES ('q2', ?1, 1, 'old open', '[]', '2026-05-01T10:00:00.000Z')",
-            params![&step.id],
+        // Different combinations of (attempt, open/resolved state) so we can
+        // verify the scoping. Only attempt=2 still-open should count. Native
+        // `interruptions` rows — no `step_questions`.
+        let q1 =
+            insert_interruption(&conn, &step.id, 1, InterruptionKind::Question, "a1", &[]).unwrap();
+        resolve_interruption(&conn, &q1, "done", None).unwrap();
+        insert_interruption(
+            &conn,
+            &step.id,
+            1,
+            InterruptionKind::Question,
+            "old open",
+            &[],
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, asked_at)
-             VALUES ('q3', ?1, 2, 'current open A', '[]', '2026-05-01T10:00:00.000Z')",
-            params![&step.id],
+        insert_interruption(
+            &conn,
+            &step.id,
+            2,
+            InterruptionKind::Question,
+            "current open A",
+            &[],
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, asked_at)
-             VALUES ('q4', ?1, 2, 'current open B', '[]', '2026-05-01T10:00:00.000Z')",
-            params![&step.id],
+        // A blocker on attempt 2 must also count (the bridge pauses on
+        // questions OR blockers — docs/dag-redesign.md §7).
+        insert_interruption(
+            &conn,
+            &step.id,
+            2,
+            InterruptionKind::Blocker,
+            "current open B",
+            &[],
         )
         .unwrap();
 
         assert_eq!(
             count_unanswered_questions_for_attempt(&conn, &step.id, 2).unwrap(),
             2,
-            "two unanswered rows for attempt=2",
+            "two open interruptions for attempt=2",
         );
         assert_eq!(
             count_unanswered_questions_for_attempt(&conn, &step.id, 1).unwrap(),
             1,
-            "one unanswered row for attempt=1 (the answered one is excluded)",
+            "one open interruption for attempt=1 (the resolved one is excluded)",
         );
         assert_eq!(
             count_unanswered_questions_for_attempt(&conn, &step.id, 99).unwrap(),
@@ -3297,67 +5600,115 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_effective_status_returns_question_when_unanswered_exists() {
+    fn test_plan_effective_status_returns_interrupted_when_open_interruption_exists() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         // Set the underlying lifecycle to in_progress so we can verify the
         // derived status overrides it.
         update_plan_status(&conn, &plan.id, PlanStatus::InProgress).unwrap();
 
-        conn.execute(
-            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, asked_at)
-             VALUES ('q1', ?1, 1, 'open?', '[]', '2026-05-01T10:00:00.000Z')",
-            params![&step.id],
-        )
-        .unwrap();
+        // An open *question* (native `interruptions` row) derives
+        // Interrupted.
+        let q1 = insert_interruption(&conn, &step.id, 1, InterruptionKind::Question, "open?", &[])
+            .unwrap();
 
         assert_eq!(
             plan_effective_status(&conn, &plan.id).unwrap(),
-            PlanStatus::Question,
-            "an unanswered row must shadow the underlying lifecycle"
+            PlanStatus::Interrupted,
+            "an open interruption must shadow the underlying lifecycle"
+        );
+
+        // Resolve it, then prove a *blocker* also derives Interrupted — the
+        // §3.4/§6 unification: question OR blocker interrupts the plan.
+        resolve_interruption(&conn, &q1, "answered", None).unwrap();
+        assert_eq!(
+            plan_effective_status(&conn, &plan.id).unwrap(),
+            PlanStatus::InProgress,
+            "resolving the only open interruption un-shadows the lifecycle"
+        );
+
+        insert_interruption(
+            &conn,
+            &step.id,
+            1,
+            InterruptionKind::Blocker,
+            "needs sudo",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            plan_effective_status(&conn, &plan.id).unwrap(),
+            PlanStatus::Interrupted,
+            "an open blocker (not just a question) must derive Interrupted"
         );
     }
 
     #[test]
     fn test_plan_effective_status_returns_underlying_when_no_open_questions() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         update_plan_status(&conn, &plan.id, PlanStatus::Complete).unwrap();
 
-        // Answered rows must not trigger the Question shadow.
-        conn.execute(
-            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, answer, asked_at, answered_at)
-             VALUES ('q1', ?1, 1, 'old?', '[]', 'yes', '2026-05-01T10:00:00.000Z', '2026-05-01T11:00:00.000Z')",
-            params![&step.id],
-        ).unwrap();
+        // Resolved interruptions must not trigger the Interrupted shadow.
+        let q1 = insert_interruption(&conn, &step.id, 1, InterruptionKind::Question, "old?", &[])
+            .unwrap();
+        resolve_interruption(&conn, &q1, "yes", None).unwrap();
 
         assert_eq!(
             plan_effective_status(&conn, &plan.id).unwrap(),
@@ -3366,51 +5717,35 @@ mod tests {
     }
 
     #[test]
-    fn test_list_answered_questions_for_step_empty_when_no_rows() {
-        let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-        let (step, _) = create_step(
-            &conn,
-            &plan.id,
-            "step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-
-        let answered = list_answered_questions_for_step(&conn, &step.id).unwrap();
-        assert!(answered.is_empty());
-    }
-
-    #[test]
-    fn test_set_plan_questions_enabled_missing_plan_errs() {
-        let conn = setup();
-        let err = set_plan_questions_enabled(&conn, "no-such-id", true).unwrap_err();
-        assert!(err.to_string().contains("Plan not found"));
-    }
-
-    #[test]
     fn test_delete_plan_cascades() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         create_execution_log(&conn, &step.id, 1, None, None).unwrap();
@@ -3437,48 +5772,66 @@ mod tests {
     #[test]
     fn test_create_step_generates_sort_keys() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         let (s1, _) = create_step(
             &conn,
             &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let (s2, _) = create_step(
             &conn,
             &plan.id,
-            "Second",
-            "d2",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Second",
+                description: "d2",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let (s3, _) = create_step(
             &conn,
             &plan.id,
-            "Third",
-            "d3",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Third",
+                description: "d3",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -3503,48 +5856,66 @@ mod tests {
     #[test]
     fn test_list_steps_ordered_by_sort_key() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         create_step(
             &conn,
             &plan.id,
-            "First",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "First",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         create_step(
             &conn,
             &plan.id,
-            "Second",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Second",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         create_step(
             &conn,
             &plan.id,
-            "Third",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Third",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -3563,21 +5934,35 @@ mod tests {
     #[test]
     fn test_step_acceptance_criteria_roundtrip() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         let criteria = vec!["tests pass".to_string(), "lint clean".to_string()];
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &criteria,
-            Some(3),
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &criteria,
+                max_retries: Some(3),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -3590,21 +5975,35 @@ mod tests {
     #[test]
     fn test_create_step_stores_tags() {
         let conn = setup();
-        let plan = create_plan(&conn, "tagged", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "tagged",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         let tags = vec!["FIX".to_string(), "REGRESSION".to_string()];
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "Fix bug",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            Some(&tags),
+            NewStep {
+                title: "Fix bug",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: Some(&tags),
+            },
         )
         .unwrap();
 
@@ -3623,7 +6022,19 @@ mod tests {
         // backfilled). Reading through Step::from_row must yield an empty
         // Vec without panicking.
         let conn = setup();
-        let plan = create_plan(&conn, "legacy", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "legacy",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         conn.execute(
             "INSERT INTO steps (id, plan_id, sort_key, title, description) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -3649,21 +6060,35 @@ mod tests {
     #[test]
     fn test_update_step_fields_ext_replaces_tags() {
         let conn = setup();
-        let plan = create_plan(&conn, "p", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         let initial = vec!["FIX".to_string()];
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "T",
-            "",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            Some(&initial),
+            NewStep {
+                title: "T",
+                description: "",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: Some(&initial),
+            },
         )
         .unwrap();
 
@@ -3672,15 +6097,10 @@ mod tests {
         update_step_fields_ext(
             &conn,
             &step.id,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(&replacement),
+            StepFieldUpdates {
+                tags_update: Some(&replacement),
+                ..Default::default()
+            },
         )
         .unwrap();
         let updated = get_step(&conn, &step.id).unwrap();
@@ -3690,15 +6110,10 @@ mod tests {
         update_step_fields_ext(
             &conn,
             &step.id,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(&[]),
+            StepFieldUpdates {
+                tags_update: Some(&[]),
+                ..Default::default()
+            },
         )
         .unwrap();
         let cleared = get_step(&conn, &step.id).unwrap();
@@ -3708,19 +6123,33 @@ mod tests {
     #[test]
     fn test_update_step_status() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -3736,19 +6165,33 @@ mod tests {
         // so setting multiple fields in one call leaves no window for a
         // partial write with inconsistent timestamps.
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -3759,15 +6202,17 @@ mod tests {
         update_step_fields_ext(
             &conn,
             &step.id,
-            Some("New Title"),
-            Some("New Desc"),
-            Some(Some("new-agent")),
-            Some(Some("new-harness")),
-            Some(&["criterion".to_string()]),
-            Some(Some(5)),
-            Some(Some("new-model")),
-            Some(ChangePolicy::Optional),
-            None,
+            StepFieldUpdates {
+                title: Some("New Title"),
+                description: Some("New Desc"),
+                agent_update: Some(Some("new-agent")),
+                harness_update: Some(Some("new-harness")),
+                criteria_update: Some(&["criterion".to_string()]),
+                retries_update: Some(Some(5)),
+                model_update: Some(Some("new-model")),
+                change_policy_update: Some(ChangePolicy::Optional),
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -3788,19 +6233,33 @@ mod tests {
         // When the step doesn't exist the transaction rolls back, leaving
         // other rows untouched.
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (other, _) = create_step(
             &conn,
             &plan.id,
-            "Other",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Other",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let other_before = get_step(&conn, &other.id).unwrap();
@@ -3808,15 +6267,12 @@ mod tests {
         let err = update_step_fields_ext(
             &conn,
             "nonexistent-id",
-            Some("New Title"),
-            Some("New Desc"),
-            Some(Some("agent")),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            StepFieldUpdates {
+                title: Some("New Title"),
+                description: Some("New Desc"),
+                agent_update: Some(Some("agent")),
+                ..Default::default()
+            },
         )
         .unwrap_err();
         assert!(err.to_string().contains("Step not found"));
@@ -3829,34 +6285,46 @@ mod tests {
     #[test]
     fn test_update_step_fields_ext_clears_nullable_fields() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            Some("agent"),
-            Some("harness"),
-            &[],
-            Some(3),
-            Some("model"),
-            None,
-            None,
+            NewStep {
+                title: "Step",
+                description: "desc",
+                agent: Some("agent"),
+                harness: Some("harness"),
+                acceptance_criteria: &[],
+                max_retries: Some(3),
+                model: Some("model"),
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
         update_step_fields_ext(
             &conn,
             &step.id,
-            None,
-            None,
-            Some(None),
-            Some(None),
-            None,
-            Some(None),
-            Some(None),
-            None,
-            None,
+            StepFieldUpdates {
+                agent_update: Some(None),
+                harness_update: Some(None),
+                retries_update: Some(None),
+                model_update: Some(None),
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -3870,27 +6338,38 @@ mod tests {
     #[test]
     fn test_update_step_fields_ext_noop_when_all_none() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let before = get_step(&conn, &step.id).unwrap();
 
-        update_step_fields_ext(
-            &conn, &step.id, None, None, None, None, None, None, None, None, None,
-        )
-        .unwrap();
+        update_step_fields_ext(&conn, &step.id, StepFieldUpdates::default()).unwrap();
 
         let after = get_step(&conn, &step.id).unwrap();
         assert_eq!(before.updated_at, after.updated_at);
@@ -3899,19 +6378,33 @@ mod tests {
     #[test]
     fn test_delete_step() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         create_execution_log(&conn, &step.id, 1, None, None).unwrap();
@@ -3930,19 +6423,33 @@ mod tests {
         // next run then tried to create attempt=1 again and tripped the
         // UNIQUE(step_id, attempt) constraint.
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         update_step_status(&conn, &step.id, StepStatus::InProgress).unwrap();
@@ -3962,34 +6469,50 @@ mod tests {
     #[test]
     fn test_get_next_pending_step() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         let (s1, _) = create_step(
             &conn,
             &plan.id,
-            "First",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "First",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let (s2, _) = create_step(
             &conn,
             &plan.id,
-            "Second",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Second",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -4015,19 +6538,33 @@ mod tests {
     #[test]
     fn test_create_and_get_execution_log() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -4046,19 +6583,33 @@ mod tests {
     #[test]
     fn test_get_latest_log_for_step() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -4073,19 +6624,33 @@ mod tests {
     #[test]
     fn test_update_execution_log() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let log = create_execution_log(&conn, &step.id, 1, None, None).unwrap();
@@ -4094,20 +6659,20 @@ mod tests {
         update_execution_log(
             &conn,
             log.id,
-            Some(45.5),
-            Some("+added line"),
-            &test_results,
-            false,
-            true,
-            Some("abc123"),
-            Some("stdout"),
-            Some("stderr"),
-            Some(0.05),
-            Some(1000),
-            Some(500),
-            Some("session-abc"),
-            None,
-            None,
+            ExecutionLogUpdate {
+                duration_secs: Some(45.5),
+                diff: Some("+added line"),
+                test_results: &test_results,
+                committed: true,
+                commit_hash: Some("abc123"),
+                harness_stdout: Some("stdout"),
+                harness_stderr: Some("stderr"),
+                cost_usd: Some(0.05),
+                input_tokens: Some(1000),
+                output_tokens: Some(500),
+                session_id: Some("session-abc"),
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -4132,19 +6697,33 @@ mod tests {
     fn test_update_execution_log_persists_termination_and_test_status() {
         use crate::plan::{TerminationReason, TestStatus};
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let log = create_execution_log(&conn, &step.id, 1, None, None).unwrap();
@@ -4152,20 +6731,14 @@ mod tests {
         update_execution_log(
             &conn,
             log.id,
-            Some(1.0),
-            None,
-            &[],
-            false,
-            true,
-            Some("abc"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(TerminationReason::Success),
-            Some(TestStatus::Passed),
+            ExecutionLogUpdate {
+                duration_secs: Some(1.0),
+                committed: true,
+                commit_hash: Some("abc"),
+                termination_reason: Some(TerminationReason::Success),
+                test_status: Some(TestStatus::Passed),
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -4184,19 +6757,33 @@ mod tests {
     fn test_update_execution_log_coalesces_termination_and_test_status() {
         use crate::plan::{TerminationReason, TestStatus};
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let log = create_execution_log(&conn, &step.id, 1, None, None).unwrap();
@@ -4205,20 +6792,13 @@ mod tests {
         update_execution_log(
             &conn,
             log.id,
-            Some(1.0),
-            None,
-            &[],
-            true,
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(TerminationReason::TestFailed),
-            Some(TestStatus::Failed),
+            ExecutionLogUpdate {
+                duration_secs: Some(1.0),
+                rolled_back: true,
+                termination_reason: Some(TerminationReason::TestFailed),
+                test_status: Some(TestStatus::Failed),
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -4226,20 +6806,11 @@ mod tests {
         update_execution_log(
             &conn,
             log.id,
-            Some(2.0),
-            None,
-            &[],
-            true,
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            ExecutionLogUpdate {
+                duration_secs: Some(2.0),
+                rolled_back: true,
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -4261,19 +6832,33 @@ mod tests {
     #[should_panic(expected = "execution log cannot be both rolled_back and committed")]
     fn test_update_execution_log_rolled_back_and_committed_panics() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let log = create_execution_log(&conn, &step.id, 1, None, None).unwrap();
@@ -4281,39 +6866,44 @@ mod tests {
         let _ = update_execution_log(
             &conn,
             log.id,
-            None,
-            None,
-            &[],
-            true,
-            true,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            ExecutionLogUpdate {
+                rolled_back: true,
+                committed: true,
+                ..Default::default()
+            },
         );
     }
 
     #[test]
     fn test_update_execution_log_preserves_session_id_when_none() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let log = create_execution_log(&conn, &step.id, 1, None, Some("initial-session")).unwrap();
@@ -4321,20 +6911,11 @@ mod tests {
         update_execution_log(
             &conn,
             log.id,
-            Some(10.0),
-            None,
-            &[],
-            false,
-            true,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            ExecutionLogUpdate {
+                duration_secs: Some(10.0),
+                committed: true,
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -4355,7 +6936,19 @@ mod tests {
             "cargo clippy -- -D warnings".to_string(),
         ];
 
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &tests).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &tests,
+            },
+        )
+        .unwrap();
         let found = get_plan_by_slug(&conn, "s", "/p").unwrap().unwrap();
         assert_eq!(found.deterministic_tests, tests);
         assert_eq!(found.id, plan.id);
@@ -4364,7 +6957,19 @@ mod tests {
     #[test]
     fn test_json_roundtrip_acceptance_criteria() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         let criteria = vec![
             "All tests pass".to_string(),
@@ -4372,7 +6977,19 @@ mod tests {
             "Code coverage > 80%".to_string(),
         ];
         let (step, _) = create_step(
-            &conn, &plan.id, "Step", "d", None, None, &criteria, None, None, None, None,
+            &conn,
+            &plan.id,
+            NewStep {
+                title: "Step",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &criteria,
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -4383,21 +7000,35 @@ mod tests {
     #[test]
     fn test_json_roundtrip_empty_arrays() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         assert!(plan.deterministic_tests.is_empty());
 
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "Step",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Step",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         assert!(step.acceptance_criteria.is_empty());
@@ -4410,9 +7041,20 @@ mod tests {
         (1..=n)
             .map(|i| {
                 let slug = format!("p{i}");
-                create_plan(conn, &slug, "/proj", "branch", "desc", None, None, &[])
-                    .expect("create_plan")
-                    .id
+                create_plan(
+                    conn,
+                    NewPlan {
+                        slug: &slug,
+                        project: "/proj",
+                        branch_name: "branch",
+                        description: "desc",
+                        harness: None,
+                        agent: None,
+                        deterministic_tests: &[],
+                    },
+                )
+                .expect("create_plan")
+                .id
             })
             .collect()
     }
@@ -4532,6 +7174,372 @@ mod tests {
         assert!(!would_create_cycle(&conn, &ids[0], &ids[2]).unwrap());
     }
 
+    // -- Step dependency tests --
+
+    /// Create one plan plus `n` steps named s1..sn in it; return the step IDs.
+    fn make_steps(conn: &Connection, n: usize) -> Vec<String> {
+        let plan = create_plan(
+            conn,
+            NewPlan {
+                slug: "sp",
+                project: "/proj",
+                branch_name: "branch",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .expect("create_plan");
+        (1..=n)
+            .map(|i| {
+                create_step(
+                    conn,
+                    &plan.id,
+                    NewStep {
+                        title: &format!("s{i}"),
+                        description: "d",
+                        agent: None,
+                        harness: None,
+                        acceptance_criteria: &[],
+                        max_retries: None,
+                        model: None,
+                        change_policy: None,
+                        tags: None,
+                    },
+                )
+                .expect("create_step")
+                .0
+                .id
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_add_step_dependency_happy_path() {
+        let conn = setup();
+        let ids = make_steps(&conn, 2);
+
+        add_step_dependency(&conn, &ids[0], &ids[1]).expect("add dep");
+
+        let deps = list_step_dependencies(&conn, &ids[0]).unwrap();
+        assert_eq!(deps, vec![ids[1].clone()]);
+    }
+
+    #[test]
+    fn test_add_step_dependency_rejects_self_reference() {
+        let conn = setup();
+        let ids = make_steps(&conn, 1);
+
+        let err = add_step_dependency(&conn, &ids[0], &ids[0]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cannot depend on itself"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_add_step_dependency_rejects_cross_plan_edge() {
+        let conn = setup();
+        let plan_a = create_plan(
+            &conn,
+            NewPlan {
+                slug: "spa",
+                project: "/proj",
+                branch_name: "branch",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .expect("create_plan a");
+        let plan_b = create_plan(
+            &conn,
+            NewPlan {
+                slug: "spb",
+                project: "/proj",
+                branch_name: "branch",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .expect("create_plan b");
+        let (a, _) = create_step(
+            &conn,
+            &plan_a.id,
+            NewStep {
+                title: "a",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+        let (b, _) = create_step(
+            &conn,
+            &plan_b.id,
+            NewStep {
+                title: "b",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+
+        let err = add_step_dependency(&conn, &a.id, &b.id).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("within one plan"),
+            "unexpected cross-plan error: {msg}"
+        );
+        assert!(
+            list_step_dependencies(&conn, &a.id).unwrap().is_empty(),
+            "cross-plan edge must not be persisted"
+        );
+    }
+
+    #[test]
+    fn test_remove_step_dependency() {
+        let conn = setup();
+        let ids = make_steps(&conn, 2);
+
+        add_step_dependency(&conn, &ids[0], &ids[1]).unwrap();
+        assert_eq!(list_step_dependencies(&conn, &ids[0]).unwrap().len(), 1);
+
+        remove_step_dependency(&conn, &ids[0], &ids[1]).unwrap();
+        assert!(list_step_dependencies(&conn, &ids[0]).unwrap().is_empty());
+
+        // Removing a non-existent edge is a no-op.
+        remove_step_dependency(&conn, &ids[0], &ids[1]).unwrap();
+    }
+
+    #[test]
+    fn test_list_step_dependencies_and_dependents() {
+        let conn = setup();
+        let ids = make_steps(&conn, 3);
+
+        // s1 depends on s2 and s3.
+        add_step_dependency(&conn, &ids[0], &ids[1]).unwrap();
+        add_step_dependency(&conn, &ids[0], &ids[2]).unwrap();
+
+        let mut deps = list_step_dependencies(&conn, &ids[0]).unwrap();
+        deps.sort();
+        let mut expected = vec![ids[1].clone(), ids[2].clone()];
+        expected.sort();
+        assert_eq!(deps, expected);
+
+        // s2 and s3 should both see s1 as a dependent.
+        let dependents_s2 = list_step_dependents(&conn, &ids[1]).unwrap();
+        assert_eq!(dependents_s2, vec![ids[0].clone()]);
+
+        let dependents_s3 = list_step_dependents(&conn, &ids[2]).unwrap();
+        assert_eq!(dependents_s3, vec![ids[0].clone()]);
+
+        // s1 has no dependents.
+        assert!(list_step_dependents(&conn, &ids[0]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_step_dependency_cascades_on_step_delete() {
+        let conn = setup();
+        let ids = make_steps(&conn, 2);
+
+        add_step_dependency(&conn, &ids[0], &ids[1]).unwrap();
+        assert_eq!(list_step_dependencies(&conn, &ids[0]).unwrap().len(), 1);
+
+        // V25's ON DELETE CASCADE drops dependent edges with the step.
+        delete_step(&conn, &ids[1]).unwrap();
+        assert!(list_step_dependencies(&conn, &ids[0]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_delete_mid_dag_step_reparents_dependents() {
+        // Chain A <- B <- C (ids[1] depends on ids[0]; ids[2] depends on
+        // ids[1]). Deleting the middle step B must re-parent C onto A, not
+        // orphan C into a new root.
+        let conn = setup();
+        let ids = make_steps(&conn, 3); // A=ids[0], B=ids[1], C=ids[2]
+        add_step_dependency(&conn, &ids[1], &ids[0]).unwrap(); // B depends on A
+        add_step_dependency(&conn, &ids[2], &ids[1]).unwrap(); // C depends on B
+
+        delete_step(&conn, &ids[1]).unwrap(); // remove B
+
+        // C must now depend on A (B's parent), preserving the ordering —
+        // NOT be left edgeless (a silent new root).
+        let c_deps = list_step_dependencies(&conn, &ids[2]).unwrap();
+        assert_eq!(
+            c_deps,
+            vec![ids[0].clone()],
+            "C must inherit B's parent A on delete, not become an orphan root"
+        );
+        // B is gone and A has no dangling dependents on the removed B.
+        assert!(get_step_by_id(&conn, &ids[1]).unwrap().is_none());
+        assert_eq!(
+            list_step_dependents(&conn, &ids[0]).unwrap(),
+            vec![ids[2].clone()],
+            "A's sole dependent is now C (re-parented)"
+        );
+    }
+
+    #[test]
+    fn test_delete_mid_dag_step_reparents_without_duplicate_when_diamond() {
+        // Diamond: B->A, C->A, C->B. Deleting B must not error on the
+        // already-present C->A edge (INSERT OR IGNORE) and must leave C
+        // depending only on A.
+        let conn = setup();
+        let ids = make_steps(&conn, 3); // A=ids[0], B=ids[1], C=ids[2]
+        add_step_dependency(&conn, &ids[1], &ids[0]).unwrap(); // B depends on A
+        add_step_dependency(&conn, &ids[2], &ids[0]).unwrap(); // C depends on A
+        add_step_dependency(&conn, &ids[2], &ids[1]).unwrap(); // C depends on B
+
+        delete_step(&conn, &ids[1]).unwrap(); // remove B
+
+        let c_deps = list_step_dependencies(&conn, &ids[2]).unwrap();
+        assert_eq!(
+            c_deps,
+            vec![ids[0].clone()],
+            "C keeps its single A edge; the re-parent is idempotent"
+        );
+    }
+
+    /// Create a plan with `n` steps; return `(plan_id, step_ids)`.
+    fn make_plan_with_steps(conn: &Connection, slug: &str, n: usize) -> (String, Vec<String>) {
+        let plan = create_plan(
+            conn,
+            NewPlan {
+                slug,
+                project: "/proj",
+                branch_name: "branch",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .expect("create_plan");
+        let ids = (1..=n)
+            .map(|i| {
+                create_step(
+                    conn,
+                    &plan.id,
+                    NewStep {
+                        title: &format!("s{i}"),
+                        description: "d",
+                        agent: None,
+                        harness: None,
+                        acceptance_criteria: &[],
+                        max_retries: None,
+                        model: None,
+                        change_policy: None,
+                        tags: None,
+                    },
+                )
+                .expect("create_step")
+                .0
+                .id
+            })
+            .collect();
+        (plan.id, ids)
+    }
+
+    #[test]
+    fn test_list_step_dependency_edges() {
+        let conn = setup();
+        let (plan_id, ids) = make_plan_with_steps(&conn, "edges", 4);
+
+        // Diamond: s1 -> s2, s1 -> s3, s2 -> s4, s3 -> s4.
+        add_step_dependency(&conn, &ids[0], &ids[1]).unwrap();
+        add_step_dependency(&conn, &ids[0], &ids[2]).unwrap();
+        add_step_dependency(&conn, &ids[1], &ids[3]).unwrap();
+        add_step_dependency(&conn, &ids[2], &ids[3]).unwrap();
+
+        let edges = list_step_dependency_edges(&conn, &plan_id).unwrap();
+
+        let mut s1 = edges.get(&ids[0]).cloned().unwrap_or_default();
+        s1.sort();
+        let mut expected_s1 = vec![ids[1].clone(), ids[2].clone()];
+        expected_s1.sort();
+        assert_eq!(s1, expected_s1);
+        assert_eq!(edges.get(&ids[1]).cloned().unwrap(), vec![ids[3].clone()]);
+        assert_eq!(edges.get(&ids[2]).cloned().unwrap(), vec![ids[3].clone()]);
+        // The sink has no outgoing edges → absent from the map.
+        assert!(!edges.contains_key(&ids[3]));
+
+        // Edges are plan-scoped: a second plan's edges don't leak in.
+        let (_other_plan, other_ids) = make_plan_with_steps(&conn, "other", 2);
+        add_step_dependency(&conn, &other_ids[0], &other_ids[1]).unwrap();
+        let edges = list_step_dependency_edges(&conn, &plan_id).unwrap();
+        assert!(!edges.contains_key(&other_ids[0]));
+    }
+
+    #[test]
+    fn test_would_create_step_cycle_direct() {
+        let conn = setup();
+        let ids = make_steps(&conn, 2);
+
+        // Self-edge is always a cycle.
+        assert!(would_create_step_cycle(&conn, &ids[0], &ids[0]).unwrap());
+
+        // A -> B. Adding B -> A closes a direct cycle.
+        add_step_dependency(&conn, &ids[0], &ids[1]).unwrap();
+        assert!(would_create_step_cycle(&conn, &ids[1], &ids[0]).unwrap());
+    }
+
+    #[test]
+    fn test_would_create_step_cycle_transitive() {
+        let conn = setup();
+        let ids = make_steps(&conn, 3);
+
+        // A -> B -> C. Adding C -> A would create a 3-node cycle.
+        add_step_dependency(&conn, &ids[0], &ids[1]).unwrap();
+        add_step_dependency(&conn, &ids[1], &ids[2]).unwrap();
+
+        assert!(would_create_step_cycle(&conn, &ids[2], &ids[0]).unwrap());
+    }
+
+    #[test]
+    fn test_would_create_step_cycle_no_cycle() {
+        let conn = setup();
+        let ids = make_steps(&conn, 3);
+
+        // A -> B. Adding A -> C does not create a cycle.
+        add_step_dependency(&conn, &ids[0], &ids[1]).unwrap();
+
+        assert!(!would_create_step_cycle(&conn, &ids[0], &ids[2]).unwrap());
+    }
+
+    #[test]
+    fn test_add_step_dependency_rejects_cycle() {
+        let conn = setup();
+        let ids = make_steps(&conn, 3);
+
+        // A -> B -> C, then attempt C -> A: rejected before the insert.
+        add_step_dependency(&conn, &ids[0], &ids[1]).unwrap();
+        add_step_dependency(&conn, &ids[1], &ids[2]).unwrap();
+
+        let err = add_step_dependency(&conn, &ids[2], &ids[0]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("cycle"), "unexpected error: {msg}");
+
+        // The rejected edge was not persisted.
+        assert!(list_step_dependencies(&conn, &ids[2]).unwrap().is_empty());
+    }
+
     #[test]
     fn test_topo_sort_linear_chain() {
         let conn = setup();
@@ -4609,19 +7617,33 @@ mod tests {
     #[test]
     fn test_attach_hook_to_step_rejects_duplicate() {
         let conn = setup();
-        let plan = create_plan(&conn, "p", "/proj", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "t",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "t",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -4641,7 +7663,19 @@ mod tests {
     #[test]
     fn test_attach_hook_to_plan_rejects_duplicate() {
         let conn = setup();
-        let plan = create_plan(&conn, "p", "/proj", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         attach_hook_to_plan(&conn, &plan.id, "post-step", "h1").unwrap();
 
@@ -4658,33 +7692,49 @@ mod tests {
     #[test]
     fn test_attach_hook_allows_distinct_combinations() {
         let conn = setup();
-        let plan = create_plan(&conn, "p", "/proj", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (s1, _) = create_step(
             &conn,
             &plan.id,
-            "t1",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "t1",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let (s2, _) = create_step(
             &conn,
             &plan.id,
-            "t2",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "t2",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -4707,21 +7757,35 @@ mod tests {
     #[test]
     fn test_create_step_persists_change_policy_required_by_default() {
         let conn = setup();
-        let plan = create_plan(&conn, "p", "/proj", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         // None argument → Required default.
         let (s_default, _) = create_step(
             &conn,
             &plan.id,
-            "def",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "def",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         assert_eq!(s_default.change_policy, ChangePolicy::Required);
@@ -4733,20 +7797,34 @@ mod tests {
     #[test]
     fn test_create_step_persists_change_policy_optional() {
         let conn = setup();
-        let plan = create_plan(&conn, "p", "/proj", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         let (s_opt, _) = create_step(
             &conn,
             &plan.id,
-            "review",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            Some(ChangePolicy::Optional),
-            None,
+            NewStep {
+                title: "review",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: Some(ChangePolicy::Optional),
+                tags: None,
+            },
         )
         .unwrap();
         assert_eq!(s_opt.change_policy, ChangePolicy::Optional);
@@ -4763,24 +7841,311 @@ mod tests {
     #[test]
     fn test_create_step_at_persists_change_policy() {
         let conn = setup();
-        let plan = create_plan(&conn, "p", "/proj", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         let (s, _) = create_step_at(
             &conn,
             &plan.id,
             "m5",
-            "mid",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            Some(ChangePolicy::Optional),
-            None,
+            NewStep {
+                title: "mid",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: Some(ChangePolicy::Optional),
+                tags: None,
+            },
         )
         .unwrap();
         assert_eq!(s.change_policy, ChangePolicy::Optional);
+    }
+
+    /// A crash *during a concurrent review* (docs/dag-redesign.md §3.5
+    /// item 3) leaves a step `InProgress` + `review_status = InFlight`. The
+    /// stale-sweep must reset BOTH so the impossible `Aborted` + `InFlight`
+    /// combination can never persist; other review verdicts are durable and
+    /// must be left untouched.
+    #[test]
+    fn test_sweep_stale_in_progress_resets_in_flight_review_status() {
+        let conn = setup();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "sweep",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+
+        // Step A: InProgress + InFlight but with NO committed execution-log
+        // row. In real runs InFlight always implies a commit, but a row
+        // without one is treated as a stale implementation (not awaiting
+        // review): the sweep aborts it and resets InFlight -> Pending. The
+        // committed-and-awaiting-review case is covered by
+        // `test_sweep_keeps_committed_review_pending_step`.
+        let (a, _) = create_step(
+            &conn,
+            &plan.id,
+            NewStep {
+                title: "A",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+        update_step_status(&conn, &a.id, StepStatus::InProgress).unwrap();
+        update_step_review_status(&conn, &a.id, crate::plan::ReviewStatus::InFlight).unwrap();
+
+        // Step B: crashed mid-implement, review never started (InProgress +
+        // Pending). Sweep flips status; review_status stays Pending.
+        let (b, _) = create_step(
+            &conn,
+            &plan.id,
+            NewStep {
+                title: "B",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+        update_step_status(&conn, &b.id, StepStatus::InProgress).unwrap();
+
+        // Step C: a *completed, durably-passed* review on a still-Complete
+        // step — NOT swept (status != InProgress) and verdict untouched.
+        let (c, _) = create_step(
+            &conn,
+            &plan.id,
+            NewStep {
+                title: "C",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+        update_step_status(&conn, &c.id, StepStatus::Complete).unwrap();
+        update_step_review_status(&conn, &c.id, crate::plan::ReviewStatus::Passed).unwrap();
+
+        let swept = sweep_stale_in_progress(&conn, &plan.id).unwrap();
+        assert_eq!(swept.len(), 2, "only A and B were InProgress");
+
+        let a2 = get_step(&conn, &a.id).unwrap();
+        assert_eq!(a2.status, StepStatus::Aborted);
+        assert_eq!(
+            a2.review_status,
+            Some(crate::plan::ReviewStatus::Pending),
+            "InFlight on a swept step MUST reset to Pending — no \
+             Aborted+InFlight (the bug)"
+        );
+
+        let b2 = get_step(&conn, &b.id).unwrap();
+        assert_eq!(b2.status, StepStatus::Aborted);
+        assert_eq!(
+            b2.review_status, None,
+            "a never-set (on-disk NULL ⇒ semantically Pending) review_status \
+             on a swept step is left as NULL — the CASE only rewrites the \
+             literal 'in_flight'"
+        );
+
+        let c2 = get_step(&conn, &c.id).unwrap();
+        assert_eq!(c2.status, StepStatus::Complete, "C was not InProgress");
+        assert_eq!(
+            c2.review_status,
+            Some(crate::plan::ReviewStatus::Passed),
+            "a durable Passed verdict must NOT be clobbered by the sweep"
+        );
+
+        // The RETURNING snapshot reflects the post-update review_status.
+        let swept_a = swept.iter().find(|s| s.id == a.id).unwrap();
+        assert_eq!(
+            swept_a.review_status,
+            Some(crate::plan::ReviewStatus::Pending),
+            "the returned row snapshot must show the reset review_status"
+        );
+    }
+
+    /// Blocker #2 (durable committed-review-pending recovery): a step that
+    /// committed its work and was mid-review when the runner crashed
+    /// (`InProgress` + `review_status = InFlight` + a committed execution-log
+    /// row) must NOT be aborted+re-implemented by the sweep. Instead it stays
+    /// `InProgress` and its orphaned `InFlight` resets to `Pending`, so the
+    /// scheduler re-runs ONLY the review against the existing commit.
+    #[test]
+    fn test_sweep_keeps_committed_review_pending_step() {
+        let conn = setup();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "sweep2",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+
+        let (a, _) = create_step(
+            &conn,
+            &plan.id,
+            NewStep {
+                title: "A",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+        update_step_status(&conn, &a.id, StepStatus::InProgress).unwrap();
+        update_step_review_status(&conn, &a.id, crate::plan::ReviewStatus::InFlight).unwrap();
+        // Durable proof the implementation is committed: an execution-log row
+        // carrying a commit hash (the single committed attempt).
+        let log = create_execution_log(&conn, &a.id, 1, None, None).unwrap();
+        conn.execute(
+            "UPDATE execution_logs SET commit_hash = 'deadbeefcafe' WHERE id = ?1",
+            params![log.id],
+        )
+        .unwrap();
+
+        let swept = sweep_stale_in_progress(&conn, &plan.id).unwrap();
+        assert!(
+            swept.is_empty(),
+            "a committed-but-unreviewed step must NOT be swept to Aborted, got {swept:?}"
+        );
+
+        let a2 = get_step(&conn, &a.id).unwrap();
+        assert_eq!(
+            a2.status,
+            StepStatus::InProgress,
+            "the step must stay InProgress (recoverable by re-review), not Aborted"
+        );
+        assert_eq!(
+            a2.review_status,
+            Some(crate::plan::ReviewStatus::Pending),
+            "the orphaned InFlight reviewer must reset to Pending so the scheduler re-spawns it"
+        );
+
+        // The durable review target is recoverable for the re-spawn.
+        let target = committed_review_target(&conn, &a.id).unwrap();
+        assert_eq!(target, Some(("deadbeefcafe".to_string(), 1)));
+    }
+
+    /// An InProgress step carrying an OPEN corrective request must NOT be
+    /// swept. After a human resolves a review-loop escalation blocker the
+    /// step is InProgress with NO open interruption but an open corrective
+    /// request; the orchestrator converts it to Complete only when it drains
+    /// that request, and run/resume sweeps BEFORE the drain — so aborting it
+    /// here would strand the pending correction.
+    #[test]
+    fn test_sweep_skips_step_with_open_corrective_request() {
+        let conn = setup();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "sweep-corr",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+
+        // A: InProgress + an OPEN corrective request → must be preserved.
+        let (a, _) = create_step(
+            &conn,
+            &plan.id,
+            NewStep {
+                title: "A",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+        update_step_status(&conn, &a.id, StepStatus::InProgress).unwrap();
+        insert_corrective_step_request(&conn, &a.id, 1, "", 0, None, true).unwrap();
+
+        // B: InProgress, no request → swept as the orphan it is.
+        let (b, _) = create_step(
+            &conn,
+            &plan.id,
+            NewStep {
+                title: "B",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+        update_step_status(&conn, &b.id, StepStatus::InProgress).unwrap();
+
+        let swept = sweep_stale_in_progress(&conn, &plan.id).unwrap();
+        assert_eq!(swept.len(), 1, "only B (no corrective request) is swept");
+        assert_eq!(swept[0].id, b.id);
+
+        assert_eq!(
+            get_step(&conn, &a.id).unwrap().status,
+            StepStatus::InProgress,
+            "a step with an open corrective request must survive the sweep"
+        );
+        assert_eq!(get_step(&conn, &b.id).unwrap().status, StepStatus::Aborted);
     }
 
     #[test]
@@ -4821,15 +8186,17 @@ mod tests {
             &conn,
             "/proj-lp1",
             Phase::Harness,
-            Some("step-uuid"),
-            Some(2),
-            Some(1),
-            Some(3),
-            Some(42),
-            Some("claude-code"),
-            ChildUpdate::Set {
-                pid: 99_999,
-                start_token: Some("token-abc"),
+            LivePhase {
+                step_id: Some("step-uuid"),
+                step_num: Some(2),
+                attempt: Some(1),
+                max_attempts: Some(3),
+                execution_log_id: Some(42),
+                current_command: Some("claude-code"),
+                child: ChildUpdate::Set {
+                    pid: 99_999,
+                    start_token: Some("token-abc"),
+                },
             },
         )
         .unwrap();
@@ -4860,15 +8227,17 @@ mod tests {
             &conn,
             "/proj-lp2",
             Phase::Harness,
-            Some("step-1"),
-            Some(1),
-            Some(1),
-            Some(3),
-            Some(7),
-            None,
-            ChildUpdate::Set {
-                pid: 12345,
-                start_token: Some("tok-initial"),
+            LivePhase {
+                step_id: Some("step-1"),
+                step_num: Some(1),
+                attempt: Some(1),
+                max_attempts: Some(3),
+                execution_log_id: Some(7),
+                current_command: None,
+                child: ChildUpdate::Set {
+                    pid: 12345,
+                    start_token: Some("tok-initial"),
+                },
             },
         )
         .unwrap();
@@ -4879,13 +8248,15 @@ mod tests {
             &conn,
             "/proj-lp2",
             Phase::Tests,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            ChildUpdate::Keep,
+            LivePhase {
+                step_id: None,
+                step_num: None,
+                attempt: None,
+                max_attempts: None,
+                execution_log_id: None,
+                current_command: None,
+                child: ChildUpdate::Keep,
+            },
         )
         .unwrap();
 
@@ -4915,15 +8286,17 @@ mod tests {
             &conn,
             "/proj-keep",
             Phase::Harness,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            ChildUpdate::Set {
-                pid: 42,
-                start_token: Some("tok"),
+            LivePhase {
+                step_id: None,
+                step_num: None,
+                attempt: None,
+                max_attempts: None,
+                execution_log_id: None,
+                current_command: None,
+                child: ChildUpdate::Set {
+                    pid: 42,
+                    start_token: Some("tok"),
+                },
             },
         )
         .unwrap();
@@ -4932,13 +8305,15 @@ mod tests {
             &conn,
             "/proj-keep",
             Phase::PreTestHook,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            ChildUpdate::Keep,
+            LivePhase {
+                step_id: None,
+                step_num: None,
+                attempt: None,
+                max_attempts: None,
+                execution_log_id: None,
+                current_command: None,
+                child: ChildUpdate::Keep,
+            },
         )
         .unwrap();
 
@@ -4959,15 +8334,17 @@ mod tests {
             &conn,
             "/proj-clear",
             Phase::Harness,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            ChildUpdate::Set {
-                pid: 7777,
-                start_token: Some("tok-set"),
+            LivePhase {
+                step_id: None,
+                step_num: None,
+                attempt: None,
+                max_attempts: None,
+                execution_log_id: None,
+                current_command: None,
+                child: ChildUpdate::Set {
+                    pid: 7777,
+                    start_token: Some("tok-set"),
+                },
             },
         )
         .unwrap();
@@ -4980,13 +8357,15 @@ mod tests {
             &conn,
             "/proj-clear",
             Phase::Tests,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            ChildUpdate::Clear,
+            LivePhase {
+                step_id: None,
+                step_num: None,
+                attempt: None,
+                max_attempts: None,
+                execution_log_id: None,
+                current_command: None,
+                child: ChildUpdate::Clear,
+            },
         )
         .unwrap();
 
@@ -5008,13 +8387,15 @@ mod tests {
             &conn,
             "/proj-lp3",
             Phase::Tests,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some("cargo test"),
-            ChildUpdate::Keep,
+            LivePhase {
+                step_id: None,
+                step_num: None,
+                attempt: None,
+                max_attempts: None,
+                execution_log_id: None,
+                current_command: Some("cargo test"),
+                child: ChildUpdate::Keep,
+            },
         )
         .unwrap();
         let before = get_live_run(&conn, "/proj-lp3").unwrap().unwrap();
@@ -5026,13 +8407,15 @@ mod tests {
             &conn,
             "/proj-lp3",
             Phase::PostTestHook,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            ChildUpdate::Keep,
+            LivePhase {
+                step_id: None,
+                step_num: None,
+                attempt: None,
+                max_attempts: None,
+                execution_log_id: None,
+                current_command: None,
+                child: ChildUpdate::Keep,
+            },
         )
         .unwrap();
         let after = get_live_run(&conn, "/proj-lp3").unwrap().unwrap();
@@ -5050,13 +8433,15 @@ mod tests {
             &conn,
             "/proj-missing",
             Phase::Harness,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            ChildUpdate::Keep,
+            LivePhase {
+                step_id: None,
+                step_num: None,
+                attempt: None,
+                max_attempts: None,
+                execution_log_id: None,
+                current_command: None,
+                child: ChildUpdate::Keep,
+            },
         )
         .unwrap_err();
         assert!(
@@ -5116,25 +8501,169 @@ mod tests {
         assert!(live.updated_at.is_some());
     }
 
+    /// Fix #4: `clear_live_run_step` widens the row to "no live step" while
+    /// preserving the plan binding. Seed every per-step field, call clear,
+    /// and assert every per-step field is NULL while plan_id/plan_slug/pid
+    /// stay intact.
+    #[test]
+    fn test_clear_live_run_step_nulls_step_fields_keeps_plan() {
+        let conn = setup();
+        conn.execute(
+            "INSERT INTO run_locks (project, pid, plan_id, plan_slug, step_id, step_num,
+                                    attempt, max_attempts, phase, current_command,
+                                    execution_log_id, child_pid, child_start_token)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                "/proj-clear",
+                1i64,
+                "plan-A",
+                "plan-A-slug",
+                "step-A",
+                3i32,
+                1i32,
+                3i32,
+                Phase::Harness.as_str(),
+                "claude-code",
+                42i64,
+                12345i64,
+                "tok-A",
+            ],
+        )
+        .unwrap();
+
+        clear_live_run_step(&conn, "/proj-clear").unwrap();
+
+        let live = get_live_run(&conn, "/proj-clear").unwrap().unwrap();
+        // Plan binding preserved.
+        assert_eq!(live.plan_id.as_deref(), Some("plan-A"));
+        assert_eq!(live.plan_slug.as_deref(), Some("plan-A-slug"));
+        assert_eq!(live.pid, 1);
+        // Every per-step field is NULL.
+        assert_eq!(live.step_id, None);
+        assert_eq!(live.step_num, None);
+        assert_eq!(live.attempt, None);
+        assert_eq!(live.max_attempts, None);
+        assert_eq!(live.execution_log_id, None);
+        assert_eq!(live.current_command, None);
+        assert_eq!(live.child_pid, None);
+        assert_eq!(live.child_start_token, None);
+    }
+
+    /// Simulate the orchestrator loop's A → clear → B transition: write
+    /// step A's per-step fields, clear (mirrors the new
+    /// `runner::run_plan_inner` call after `execute_step` returns), then
+    /// write step B's fields. Asserts step_id transitions A → NULL → B
+    /// (NOT A → B, which is what COALESCE produced before the fix).
+    #[test]
+    fn test_clear_live_run_step_models_orchestrator_a_to_b_transition() {
+        let conn = setup();
+        seed_run_lock(&conn, "/proj-a-to-b");
+
+        // Step A bound to the live-run row.
+        update_live_phase(
+            &conn,
+            "/proj-a-to-b",
+            Phase::Harness,
+            LivePhase {
+                step_id: Some("step-A"),
+                step_num: Some(1),
+                attempt: Some(1),
+                max_attempts: Some(3),
+                execution_log_id: Some(10),
+                current_command: Some("claude-A"),
+                child: ChildUpdate::Set {
+                    pid: 100,
+                    start_token: Some("tok-A"),
+                },
+            },
+        )
+        .unwrap();
+        let live_a = get_live_run(&conn, "/proj-a-to-b").unwrap().unwrap();
+        assert_eq!(live_a.step_id.as_deref(), Some("step-A"));
+
+        // Orchestrator: A returned to the scheduler — clear the per-step
+        // window before picking B (the "no live step" snapshot).
+        clear_live_run_step(&conn, "/proj-a-to-b").unwrap();
+        let live_gap = get_live_run(&conn, "/proj-a-to-b").unwrap().unwrap();
+        assert_eq!(
+            live_gap.step_id, None,
+            "step_id must transition through NULL between consecutive steps \
+             so an orphaned subprocess can't bind a question to the wrong step",
+        );
+
+        // Step B's first phase write.
+        update_live_phase(
+            &conn,
+            "/proj-a-to-b",
+            Phase::Harness,
+            LivePhase {
+                step_id: Some("step-B"),
+                step_num: Some(2),
+                attempt: Some(1),
+                max_attempts: Some(3),
+                execution_log_id: Some(11),
+                current_command: Some("claude-B"),
+                child: ChildUpdate::Set {
+                    pid: 200,
+                    start_token: Some("tok-B"),
+                },
+            },
+        )
+        .unwrap();
+        let live_b = get_live_run(&conn, "/proj-a-to-b").unwrap().unwrap();
+        assert_eq!(live_b.step_id.as_deref(), Some("step-B"));
+        assert_eq!(live_b.step_num, Some(2));
+        assert_eq!(live_b.execution_log_id, Some(11));
+        // Sanity: the *previous* step's child pid is gone (cleared in the gap).
+        assert_eq!(live_b.child_pid, Some(200));
+    }
+
+    /// `clear_live_run_step` on a project with no row errors with the same
+    /// shape as `update_live_phase` / `bind_live_run_to_plan`. Defensive: a
+    /// test forgetting to seed should fail loudly, not silently no-op.
+    #[test]
+    fn test_clear_live_run_step_missing_row_errors() {
+        let conn = setup();
+        let err = clear_live_run_step(&conn, "/proj-missing").unwrap_err();
+        assert!(
+            err.to_string().contains("No run_locks row"),
+            "missing-row error must mention the gap; got: {err}",
+        );
+    }
+
     // -- finalize_execution_log_as_interrupted_if_exists tests --
 
     #[test]
     fn test_finalize_execution_log_as_interrupted_sets_fields() {
         use crate::plan::{TerminationReason, TestStatus};
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let log = create_execution_log(&conn, &step.id, 1, None, None).unwrap();
@@ -5143,20 +8672,14 @@ mod tests {
         update_execution_log(
             &conn,
             log.id,
-            Some(3.0),
-            Some("+some diff"),
-            &["unit: pass".to_string()],
-            false,
-            false,
-            None,
-            Some("hello stdout"),
-            Some("warn stderr"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            ExecutionLogUpdate {
+                duration_secs: Some(3.0),
+                diff: Some("+some diff"),
+                test_results: &["unit: pass".to_string()],
+                harness_stdout: Some("hello stdout"),
+                harness_stderr: Some("warn stderr"),
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -5180,19 +8703,33 @@ mod tests {
     fn test_finalize_execution_log_as_interrupted_preserves_existing_terminal() {
         use crate::plan::{TerminationReason, TestStatus};
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let log = create_execution_log(&conn, &step.id, 1, None, None).unwrap();
@@ -5201,20 +8738,14 @@ mod tests {
         update_execution_log(
             &conn,
             log.id,
-            Some(1.0),
-            None,
-            &[],
-            false,
-            true,
-            Some("abc"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(TerminationReason::Success),
-            Some(TestStatus::Passed),
+            ExecutionLogUpdate {
+                duration_secs: Some(1.0),
+                committed: true,
+                commit_hash: Some("abc"),
+                termination_reason: Some(TerminationReason::Success),
+                test_status: Some(TestStatus::Passed),
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -5298,13 +8829,15 @@ mod tests {
         let conn = setup();
         let plan = create_plan(
             &conn,
-            "tests-rt",
-            "/proj",
-            "b",
-            "d",
-            None,
-            None,
-            &["cargo build".to_string()],
+            NewPlan {
+                slug: "tests-rt",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &["cargo build".to_string()],
+            },
         )
         .unwrap();
 
@@ -5492,5 +9025,756 @@ mod tests {
             canonical,
             "STEP_COLUMNS drifted from the physical steps table layout"
         );
+    }
+
+    // -- interruption CRUD (native `interruptions` table, V26) --
+
+    /// Create a plan + one step and return the step id.
+    fn step_for_interruptions(conn: &Connection) -> String {
+        let plan = create_plan(
+            conn,
+            NewPlan {
+                slug: "intr",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let (step, _) = create_step(
+            conn,
+            &plan.id,
+            NewStep {
+                title: "Step A",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+        step.id
+    }
+
+    #[test]
+    fn test_step_parked_worktree_round_trips_and_clears() {
+        let conn = setup();
+        let step_id = step_for_interruptions(&conn);
+
+        let staged = vec!["a.txt".to_string(), "b.txt".to_string()];
+        set_step_parked_worktree(&conn, &step_id, "deadbeef", &staged).unwrap();
+
+        let parked = get_step_parked_worktree(&conn, &step_id)
+            .unwrap()
+            .expect("parked row should exist");
+        assert_eq!(parked.stash_sha, "deadbeef");
+        assert_eq!(parked.staged_files, staged);
+
+        clear_step_parked_worktree(&conn, &step_id).unwrap();
+        assert!(get_step_parked_worktree(&conn, &step_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_reset_step_clears_parked_worktree() {
+        let conn = setup();
+        let step_id = step_for_interruptions(&conn);
+
+        set_step_parked_worktree(&conn, &step_id, "deadbeef", &[]).unwrap();
+        let parked = reset_step(&conn, &step_id)
+            .unwrap()
+            .expect("reset should return the parked stash pointer");
+
+        assert_eq!(parked.stash_sha, "deadbeef");
+        assert!(get_step_parked_worktree(&conn, &step_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_mark_step_skipped_clears_parked_worktree() {
+        let conn = setup();
+        let step_id = step_for_interruptions(&conn);
+
+        set_step_parked_worktree(&conn, &step_id, "deadbeef", &[]).unwrap();
+        let parked = mark_step_skipped(&conn, &step_id, Some("no longer needed"))
+            .unwrap()
+            .expect("skip should return the parked stash pointer");
+
+        assert_eq!(parked.stash_sha, "deadbeef");
+        assert!(get_step_parked_worktree(&conn, &step_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_mark_step_skipped_closes_open_corrective_request() {
+        let conn = setup();
+        let step_id = step_for_interruptions(&conn);
+
+        let req_id =
+            insert_corrective_step_request(&conn, &step_id, 1, "abc1234", 2, Some("issues"), false)
+                .unwrap();
+        let open: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM corrective_step_requests WHERE id = ?1 AND state = 'open'",
+                params![req_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(open, 1, "request should start open");
+
+        mark_step_skipped(&conn, &step_id, Some("abandoned")).unwrap();
+
+        let still_open: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM corrective_step_requests WHERE id = ?1 AND state = 'open'",
+                params![req_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(still_open, 0, "skip must close the open corrective request");
+    }
+
+    /// Force a specific `resolved_at` (and `asked_at`) on a row so ordering
+    /// assertions don't race the `strftime('now')` clock when many rows are
+    /// resolved within the same millisecond.
+    fn stamp_resolved_at(conn: &Connection, id: &str, ts: &str) {
+        conn.execute(
+            "UPDATE interruptions SET resolved_at = ?1, asked_at = ?1 WHERE id = ?2",
+            params![ts, id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_insert_interruption_round_trips_options_state() {
+        let conn = setup();
+        let step_id = step_for_interruptions(&conn);
+
+        let opts = vec![
+            InterruptionOption {
+                text: "Use OAuth".to_string(),
+                priority: 1,
+            },
+            InterruptionOption {
+                text: "Use SAML".to_string(),
+                priority: 2,
+            },
+        ];
+        let id = insert_interruption(
+            &conn,
+            &step_id,
+            3,
+            InterruptionKind::Question,
+            "Which auth?",
+            &opts,
+        )
+        .unwrap();
+
+        let all = list_interruptions_for_step(&conn, &step_id).unwrap();
+        assert_eq!(all.len(), 1);
+        let i = &all[0];
+        assert_eq!(i.id, id);
+        assert_eq!(i.step_id, step_id);
+        assert_eq!(i.attempt, 3);
+        assert_eq!(i.kind, InterruptionKind::Question);
+        assert_eq!(i.body, "Which auth?");
+        assert_eq!(i.options, opts, "options must round-trip verbatim");
+        assert_eq!(i.state, InterruptionState::Open);
+        assert_eq!(i.resolution, None);
+        assert_eq!(i.comment, None);
+        assert_eq!(i.resolved_at, None);
+
+        // A fresh interruption is open ⇒ visible in the open lists, absent
+        // from the bounded resolved list.
+        assert_eq!(
+            list_open_interruptions(&conn, "/proj", None).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            list_open_interruptions_for_plan(
+                &conn,
+                &conn
+                    .query_row(
+                        "SELECT plan_id FROM steps WHERE id = ?1",
+                        params![step_id],
+                        |r| r.get::<_, String>(0)
+                    )
+                    .unwrap()
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        assert!(
+            list_resolved_interruptions_for_step(&conn, &step_id, 5)
+                .unwrap()
+                .is_empty(),
+            "open interruptions must not appear in the resolved list"
+        );
+    }
+
+    /// Phase B: an auto-raised retry-exhausted blocker carries two ranked
+    /// options. Verify the round-trip persists the ranking — the existing
+    /// `test_insert_interruption_round_trips_options_state` only covers the
+    /// Question kind, leaving the relaxed "blockers may carry options"
+    /// contract uncovered before Phase B.
+    #[test]
+    fn test_insert_interruption_blocker_with_options_round_trips() {
+        let conn = setup();
+        let step_id = step_for_interruptions(&conn);
+
+        let opts = vec![
+            InterruptionOption {
+                text: "Retry step with parked changes".to_string(),
+                priority: 1,
+            },
+            InterruptionOption {
+                text: "Mark step Failed".to_string(),
+                priority: 2,
+            },
+        ];
+        let id = insert_interruption(
+            &conn,
+            &step_id,
+            2,
+            InterruptionKind::Blocker,
+            "Step failed after 3 attempts.\n\nLast attempt test output:\n<snip>",
+            &opts,
+        )
+        .unwrap();
+
+        let all = list_interruptions_for_step(&conn, &step_id).unwrap();
+        assert_eq!(all.len(), 1);
+        let i = &all[0];
+        assert_eq!(i.id, id);
+        assert_eq!(i.attempt, 2);
+        assert_eq!(i.kind, InterruptionKind::Blocker);
+        assert_eq!(i.state, InterruptionState::Open);
+        assert_eq!(
+            i.options, opts,
+            "options must round-trip verbatim on a Blocker"
+        );
+        assert!(i.body.contains("Step failed after"));
+    }
+
+    #[test]
+    fn test_get_interruption_round_trips() {
+        // Phase C: `get_interruption` (the targeted single-row read) must
+        // return the same row shape `list_interruptions_for_step` produces.
+        // Covers: open question with ranked options, missing-id precise
+        // error, and post-resolve state/resolution round-trip.
+        let conn = setup();
+        let step_id = step_for_interruptions(&conn);
+
+        let opts = vec![
+            InterruptionOption {
+                text: "Retry step with parked changes".to_string(),
+                priority: 1,
+            },
+            InterruptionOption {
+                text: "Mark step Failed".to_string(),
+                priority: 2,
+            },
+        ];
+        let id = insert_interruption(
+            &conn,
+            &step_id,
+            2,
+            InterruptionKind::Blocker,
+            "exhausted budget",
+            &opts,
+        )
+        .unwrap();
+
+        let got = get_interruption(&conn, &id).unwrap();
+        assert_eq!(got.id, id);
+        assert_eq!(got.step_id, step_id);
+        assert_eq!(got.attempt, 2);
+        assert_eq!(got.kind, InterruptionKind::Blocker);
+        assert_eq!(got.body, "exhausted budget");
+        assert_eq!(got.options, opts);
+        assert_eq!(got.state, InterruptionState::Open);
+        assert!(got.resolved_at.is_none());
+
+        // Resolving flips state + resolution; the targeted read must reflect it.
+        resolve_interruption(&conn, &id, "Retry step with parked changes", Some("hint")).unwrap();
+        let after = get_interruption(&conn, &id).unwrap();
+        assert_eq!(after.state, InterruptionState::Resolved);
+        assert_eq!(
+            after.resolution.as_deref(),
+            Some("Retry step with parked changes")
+        );
+        assert_eq!(after.comment.as_deref(), Some("hint"));
+        assert!(after.resolved_at.is_some());
+
+        // Unknown id is a precise error (caller surfaces it to the human).
+        let err = get_interruption(&conn, "no-such-id").unwrap_err();
+        assert!(
+            err.to_string().contains("interruption not found"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_set_step_attempts_persists_value_and_errors_on_missing() {
+        // Phase C: the public `set_step_attempts` in storage (Phase C's
+        // resolution helper uses it; the executor keeps its private
+        // hot-loop one). Round-trip the value through a SELECT (rather than
+        // touching the executor) and verify the missing-step path errors.
+        let conn = setup();
+        let step_id = step_for_interruptions(&conn);
+
+        set_step_attempts(&conn, &step_id, 3).unwrap();
+        let n: i32 = conn
+            .query_row(
+                "SELECT attempts FROM steps WHERE id = ?1",
+                params![step_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 3);
+
+        set_step_attempts(&conn, &step_id, 0).unwrap();
+        let n: i32 = conn
+            .query_row(
+                "SELECT attempts FROM steps WHERE id = ?1",
+                params![step_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0);
+
+        let err = set_step_attempts(&conn, "no-such-step", 1).unwrap_err();
+        assert!(err.to_string().contains("Step not found"), "got: {err}");
+    }
+
+    #[test]
+    fn test_set_step_attempts_zero_after_nonzero_bumps_cycle_index() {
+        // V33: a 0 → bump transition only fires when the prior value was
+        // >0. Setting 0 from 0 must NOT bump (idempotent re-zero); setting
+        // 0 from 3 MUST bump; setting any non-zero value must NOT bump.
+        let conn = setup();
+        let step_id = step_for_interruptions(&conn);
+
+        let read_cycle = |sid: &str| -> i32 {
+            conn.query_row(
+                "SELECT current_cycle_index FROM steps WHERE id = ?1",
+                params![sid],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(read_cycle(&step_id), 0, "fresh step starts at cycle 0");
+
+        // 0 → 0 is a no-op (no prior attempts to "reset away" from).
+        set_step_attempts(&conn, &step_id, 0).unwrap();
+        assert_eq!(read_cycle(&step_id), 0, "0 from 0 must not bump cycle");
+
+        // Bump attempts up, then any further non-zero set must not change
+        // the cycle.
+        set_step_attempts(&conn, &step_id, 3).unwrap();
+        assert_eq!(read_cycle(&step_id), 0, "non-zero set never bumps cycle");
+        set_step_attempts(&conn, &step_id, 5).unwrap();
+        assert_eq!(read_cycle(&step_id), 0);
+
+        // Now the actual reset path: 5 → 0 bumps to cycle 1.
+        set_step_attempts(&conn, &step_id, 0).unwrap();
+        assert_eq!(
+            read_cycle(&step_id),
+            1,
+            "0 after >0 must bump the cycle pointer",
+        );
+
+        // A second cycle: bump again, then reset, expect cycle 2.
+        set_step_attempts(&conn, &step_id, 2).unwrap();
+        set_step_attempts(&conn, &step_id, 0).unwrap();
+        assert_eq!(read_cycle(&step_id), 2);
+    }
+
+    #[test]
+    fn test_create_execution_log_copies_current_cycle_index() {
+        // V33: the new log row carries whatever cycle the step is at.
+        let conn = setup();
+        let step_id = step_for_interruptions(&conn);
+
+        let l1 = create_execution_log(&conn, &step_id, 1, None, None).unwrap();
+        assert_eq!(l1.cycle_index, 0, "first log lands in cycle 0");
+
+        // Drive the auto-blocker "retry with parked changes" path: bump then reset.
+        set_step_attempts(&conn, &step_id, 2).unwrap();
+        set_step_attempts(&conn, &step_id, 0).unwrap();
+
+        let l2 = create_execution_log(&conn, &step_id, 1, None, None).unwrap();
+        assert_eq!(l2.cycle_index, 1, "post-reset log lands in cycle 1");
+
+        // Older log unchanged.
+        let logs = list_execution_logs_for_step(&conn, &step_id).unwrap();
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0].cycle_index, 0);
+        assert_eq!(logs[1].cycle_index, 1);
+    }
+
+    #[test]
+    fn test_resolve_interruption_round_trips_resolution_comment_state() {
+        let conn = setup();
+        let step_id = step_for_interruptions(&conn);
+
+        // Blocker: no options.
+        let id = insert_interruption(
+            &conn,
+            &step_id,
+            1,
+            InterruptionKind::Blocker,
+            "Needs sudo to install deps",
+            &[],
+        )
+        .unwrap();
+
+        resolve_interruption(&conn, &id, "Installed by operator", Some("ran apt-get")).unwrap();
+
+        let resolved = list_resolved_interruptions_for_step(&conn, &step_id, 5).unwrap();
+        assert_eq!(resolved.len(), 1);
+        let r = &resolved[0];
+        assert_eq!(r.kind, InterruptionKind::Blocker);
+        assert!(r.options.is_empty());
+        assert_eq!(r.state, InterruptionState::Resolved);
+        assert_eq!(r.resolution.as_deref(), Some("Installed by operator"));
+        assert_eq!(r.comment.as_deref(), Some("ran apt-get"));
+        assert!(r.resolved_at.is_some(), "resolved_at must be stamped");
+
+        // A resolved interruption no longer counts as open.
+        assert!(
+            list_open_interruptions(&conn, "/proj", None)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Double-resolve is a precise error (row exists but not open).
+        let err = resolve_interruption(&conn, &id, "again", None).unwrap_err();
+        assert!(err.to_string().contains("already resolved"), "got: {err}");
+
+        // Unknown id is a distinct precise error.
+        let err = resolve_interruption(&conn, "no-such-id", "x", None).unwrap_err();
+        assert!(err.to_string().contains("not found"), "got: {err}");
+    }
+
+    #[test]
+    fn test_list_resolved_interruptions_for_step_is_bounded_and_newest_first() {
+        let conn = setup();
+        let step_id = step_for_interruptions(&conn);
+
+        const LIMIT: usize = DEFAULT_RESOLVED_INTERRUPTION_LIMIT; // 5
+        let total = LIMIT + 3; // insert N+3, expect only N back
+
+        // Insert + resolve N+3 interruptions with strictly increasing
+        // `resolved_at` so "newest first" is deterministic regardless of how
+        // fast the inserts run.
+        let mut ids = Vec::new();
+        for i in 0..total {
+            let id = insert_interruption(
+                &conn,
+                &step_id,
+                i as i32,
+                InterruptionKind::Question,
+                &format!("Q{i}"),
+                &[],
+            )
+            .unwrap();
+            resolve_interruption(&conn, &id, &format!("A{i}"), None).unwrap();
+            // 2026-01-01T00:00:0{i}.000Z — monotonically increasing.
+            stamp_resolved_at(&conn, &id, &format!("2026-01-01T00:00:{:02}.000Z", i));
+            ids.push(id);
+        }
+
+        // Also insert one *open* interruption — it must never appear here.
+        insert_interruption(
+            &conn,
+            &step_id,
+            99,
+            InterruptionKind::Blocker,
+            "still open",
+            &[],
+        )
+        .unwrap();
+
+        let got = list_resolved_interruptions_for_step(&conn, &step_id, LIMIT).unwrap();
+
+        // (1) Bounded to exactly LIMIT despite N+3 resolved rows present.
+        assert_eq!(
+            got.len(),
+            LIMIT,
+            "resolved-interruption query MUST LIMIT to {LIMIT} (had {total} resolved)"
+        );
+
+        // (2) Newest-first: the last `LIMIT` inserted ids, reversed.
+        let expected_newest_first: Vec<&String> = ids.iter().rev().take(LIMIT).collect();
+        let got_ids: Vec<&String> = got.iter().map(|i| &i.id).collect();
+        assert_eq!(
+            got_ids, expected_newest_first,
+            "must return the most-recent {LIMIT}, newest first"
+        );
+        assert!(
+            got.iter().all(|i| i.state == InterruptionState::Resolved),
+            "open interruptions must be excluded"
+        );
+
+        // (3) limit == 0 returns nothing (cheap short-circuit, no query).
+        assert!(
+            list_resolved_interruptions_for_step(&conn, &step_id, 0)
+                .unwrap()
+                .is_empty()
+        );
+
+        // (4) A limit larger than the row count returns all resolved rows
+        // (and still excludes the open one).
+        let all_resolved =
+            list_resolved_interruptions_for_step(&conn, &step_id, total + 100).unwrap();
+        assert_eq!(all_resolved.len(), total);
+    }
+
+    /// `list_inbox_rows` enforces `resolved_limit` **SQL-side** via a
+    /// `LIMIT ?` on the resolved branch — even with 100 resolved rows in
+    /// the project, asking for the top 5 returns exactly 5 (and the
+    /// inbox always carries all open rows ahead of them).
+    #[test]
+    fn test_list_inbox_rows_enforces_sql_side_resolved_limit() {
+        let conn = setup();
+        let step_id = step_for_interruptions(&conn);
+
+        // 100 resolved interruptions, with monotonically increasing
+        // `resolved_at` so "newest first" is deterministic.
+        const TOTAL_RESOLVED: usize = 100;
+        const RESOLVED_LIMIT: usize = 5;
+        let mut ids = Vec::new();
+        for i in 0..TOTAL_RESOLVED {
+            let id = insert_interruption(
+                &conn,
+                &step_id,
+                i as i32,
+                InterruptionKind::Question,
+                &format!("Q{i}"),
+                &[],
+            )
+            .unwrap();
+            resolve_interruption(&conn, &id, &format!("A{i}"), None).unwrap();
+            // 2026-01-01T00:0M:SS — monotonic.
+            stamp_resolved_at(
+                &conn,
+                &id,
+                &format!("2026-01-01T00:{:02}:{:02}.000Z", i / 60, i % 60),
+            );
+            ids.push(id);
+        }
+
+        // Also insert two *open* interruptions — these must all come
+        // through (the SQL-side limit only bounds the resolved tail).
+        // Stamp explicit, monotonically-spaced `asked_at` so the
+        // ordering assertion below doesn't race the per-row
+        // `strftime('now')` clock when multiple tests run in parallel
+        // and the millisecond resolution collides.
+        let open1 = insert_interruption(
+            &conn,
+            &step_id,
+            200,
+            InterruptionKind::Question,
+            "open Q1",
+            &[],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE interruptions SET asked_at = ?1 WHERE id = ?2",
+            params!["2026-02-01T00:00:01.000Z", open1],
+        )
+        .unwrap();
+        let open2 = insert_interruption(
+            &conn,
+            &step_id,
+            201,
+            InterruptionKind::Blocker,
+            "open B1",
+            &[],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE interruptions SET asked_at = ?1 WHERE id = ?2",
+            params!["2026-02-01T00:00:02.000Z", open2],
+        )
+        .unwrap();
+
+        let rows = list_inbox_rows(&conn, "/proj", RESOLVED_LIMIT).unwrap();
+        let open_count = rows
+            .iter()
+            .filter(|r| r.interruption.state == crate::plan::InterruptionState::Open)
+            .count();
+        let resolved_count = rows.len() - open_count;
+        assert_eq!(open_count, 2, "all open rows must be returned");
+        assert_eq!(
+            resolved_count, RESOLVED_LIMIT,
+            "resolved tail must be SQL-side capped to {RESOLVED_LIMIT}, not {TOTAL_RESOLVED}",
+        );
+        // Open rows precede resolved rows in the output (the §12.3 inbox
+        // UX).
+        for (i, r) in rows.iter().enumerate() {
+            if i < open_count {
+                assert_eq!(r.interruption.state, crate::plan::InterruptionState::Open);
+            } else {
+                assert_eq!(
+                    r.interruption.state,
+                    crate::plan::InterruptionState::Resolved
+                );
+            }
+        }
+        // The two open ids land in the open block in `asked_at ASC`
+        // order, oldest first — open1 was stamped earlier than open2.
+        let open_ids: Vec<&String> = rows[..open_count]
+            .iter()
+            .map(|r| &r.interruption.id)
+            .collect();
+        assert_eq!(open_ids, vec![&open1, &open2]);
+
+        // The resolved tail is the LAST `RESOLVED_LIMIT` inserted ids,
+        // newest first.
+        let expected_resolved: Vec<&String> = ids.iter().rev().take(RESOLVED_LIMIT).collect();
+        let got_resolved: Vec<&String> = rows[open_count..]
+            .iter()
+            .map(|r| &r.interruption.id)
+            .collect();
+        assert_eq!(got_resolved, expected_resolved);
+
+        // `resolved_limit = 0` returns no resolved rows but still every
+        // open one.
+        let rows_no_tail = list_inbox_rows(&conn, "/proj", 0).unwrap();
+        assert_eq!(rows_no_tail.len(), 2);
+        assert!(
+            rows_no_tail
+                .iter()
+                .all(|r| r.interruption.state == crate::plan::InterruptionState::Open)
+        );
+    }
+
+    /// `corrective_chain_len` walks every `corrects_step_id` hop with a
+    /// single SQLite recursive CTE — one query for the whole chain, no
+    /// per-hop round-trip. Verified across a range of depths.
+    #[test]
+    fn test_corrective_chain_len_recursive_cte_handles_long_chains() {
+        let conn = setup();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "chain",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+
+        // Build a chain of 10 corrective steps: s0 (ordinary) <- s1
+        // (corrects s0) <- s2 (corrects s1) <- … <- s10 (corrects s9).
+        let mut ids = Vec::new();
+        for i in 0..=10 {
+            let (step, _) = create_step(
+                &conn,
+                &plan.id,
+                NewStep {
+                    title: &format!("S{i}"),
+                    description: "d",
+                    agent: None,
+                    harness: None,
+                    acceptance_criteria: &[],
+                    max_retries: None,
+                    model: None,
+                    change_policy: None,
+                    tags: None,
+                },
+            )
+            .unwrap();
+            ids.push(step.id);
+        }
+        for i in 1..=10 {
+            // s_i corrects s_{i-1}.
+            set_step_corrects_step_id(&conn, &ids[i], Some(&ids[i - 1])).unwrap();
+        }
+
+        // Ordinary step (no corrects link).
+        assert_eq!(corrective_chain_len(&conn, &ids[0]).unwrap(), 0);
+        // 1-hop chain.
+        assert_eq!(corrective_chain_len(&conn, &ids[1]).unwrap(), 1);
+        // Mid-chain.
+        assert_eq!(corrective_chain_len(&conn, &ids[5]).unwrap(), 5);
+        // Full chain of 10.
+        assert_eq!(corrective_chain_len(&conn, &ids[10]).unwrap(), 10);
+
+        // A non-existent step returns 0 (the COALESCE-NULL path).
+        assert_eq!(
+            corrective_chain_len(&conn, "does-not-exist").unwrap(),
+            0,
+            "non-existent step must return 0 via COALESCE(MAX(NULL), 0)",
+        );
+    }
+
+    #[test]
+    fn test_list_interruptions_for_step_scopes_to_step() {
+        let conn = setup();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "scope",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let (s1, _) = create_step(
+            &conn,
+            &plan.id,
+            NewStep {
+                title: "S1",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+        let (s2, _) = create_step(
+            &conn,
+            &plan.id,
+            NewStep {
+                title: "S2",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+
+        insert_interruption(&conn, &s1.id, 1, InterruptionKind::Question, "q1", &[]).unwrap();
+        insert_interruption(&conn, &s2.id, 1, InterruptionKind::Question, "q2", &[]).unwrap();
+
+        let for_s1 = list_interruptions_for_step(&conn, &s1.id).unwrap();
+        assert_eq!(for_s1.len(), 1);
+        assert_eq!(for_s1[0].body, "q1");
     }
 }

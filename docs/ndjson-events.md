@@ -40,9 +40,29 @@ The events fall into two groups:
 | `plan_grew`        | lifecycle | After each runner-loop iteration when new steps appeared   |
 | `prompt_prepared`  | lifecycle | Once per attempt, immediately before harness spawn         |
 | `attempt_cancelled`| lifecycle | When the TUI skip dialog's Esc/cancel undoes an in-flight attempt |
+| `paused_by_user`   | lifecycle | When the runner exits cleanly on an operator pause request |
+| `review_started`   | lifecycle | When a read-only reviewer is spawned against a committed iteration |
+| `review_finished`  | lifecycle | When a reviewer returns a pass/fail verdict                 |
+| `corrective_step_requested`  | lifecycle | When a failed review requests a corrective step (the reviewer-side half of the structured channel) |
+| `corrective_step_inserted`   | lifecycle | When the orchestrator has inserted `A′` and re-parented `A`'s dependents |
+| `review_loop_escalated`      | lifecycle | When the review→correction chain hits the per-plan cap and a blocker is raised |
+| `interruption_raised`        | lifecycle | When ANY interruption (question / blocker) is inserted — harness, executor auto-blocker, TUI, or CLI |
+| `interruption_resolved`      | lifecycle | When ANY interruption is resolved — CLI, TUI, or programmatic |
 | `harness_chunk`    | streaming | Per newline of harness stdout/stderr during the harness phase |
 | `test_chunk`       | streaming | Per newline of test stdout/stderr during the tests phase   |
 | `phase_changed`    | streaming | On every `run_locks.phase` transition                      |
+
+> **Interruptions now emit NDJSON events** (Phase E reversal of the pre-existing
+> "no event for interruptions" stance). Every insert produces an
+> `interruption_raised` and every resolve produces an
+> `interruption_resolved`, regardless of who triggered it — a harness
+> calling `ralph question ask` / `ralph block`, the executor's
+> retry-exhausted auto-blocker, the TUI inbox, or the `ralph interruption
+> resolve` CLI. The `auto_raised: bool` flag on `interruption_raised`
+> discriminates the executor's retry-exhausted auto-blocker (true) from
+> every other path (false). Consumers that want to subscribe to *just* the
+> auto-blocker (because the human-visible inbox surfaces the rest) can gate
+> on `auto_raised == true`.
 
 ---
 
@@ -115,7 +135,7 @@ Payload:
 | `step_title`    | `string`  | Step title at finish.                                  |
 | `step_num`      | `integer` | 1-based position at finish.                            |
 | `step_total`    | `integer` | Total step count at finish.                            |
-| `outcome`       | `string`  | One of `success`, `failed`, `skipped`, `aborted`.      |
+| `outcome`       | `string`  | One of `success`, `failed`, `skipped`, `aborted`, `timeout`, `paused_for_question`. See note below on `paused_for_question`. |
 | `attempts`      | `integer` | Number of harness invocations this step consumed.      |
 | `duration_secs` | `number`  | Wall-clock seconds from `step_started` to finish.      |
 
@@ -136,6 +156,31 @@ Consumer expectations: a `step_finished` is guaranteed to follow each
 `step_started`, including when the runner is killed mid-flight (the
 runner emits `outcome: aborted`). Stuck-state recovery is via
 `stale_steps_swept` on the next run.
+
+> **`outcome: paused_for_question` is now a two-way street.** It was
+> originally the "harness raised an interruption mid-attempt"
+> termination — `ralph question ask` / `ralph block` wrote an `open`
+> row, the harness exited cleanly, the executor parked the branch
+> `Blocked` with no retry-budget consumed. The shipped post-redesign
+> executor *also* emits this outcome when a step **exhausts its retry
+> budget** on `TestFailed` or `CommitFailed` (the retry-exhaustion
+> auto-blocker — `docs/dag-redesign.md` §3.4-bis): the executor inserts
+> a `kind=Blocker` interruption with two ranked options ("Retry step
+> with parked changes" / "Mark step Failed") and parks the step at
+> `status=Pending` with `attempts == max_attempts`, the dirty tree
+> preserved on disk (parked, not rolled back — retrying restores the
+> parked WIP). `StepOutcome::PausedForQuestion` is reused — no new
+> outcome variant — so a downstream consumer cannot distinguish the two
+> cases from the event stream alone. To tell them apart, poll
+> `interruptions` for the step and inspect the most recent open row:
+> `kind=blocker` with two options whose `text` matches
+> `executor::RETRY_EXHAUSTED_OPTION_RETRY` /
+> `RETRY_EXHAUSTED_OPTION_FAIL` is the auto-blocker; anything else
+> (typically `kind=question` or a freeform `kind=blocker` body) is a
+> harness-raised pause. Both cases ALSO emit `interruption_raised` (see
+> below); the auto-blocker is discriminated by `auto_raised: true`. The
+> NDJSON-quiet rule that previously applied to interruptions has been
+> reversed in Phase E.
 
 ### `plan_complete`
 
@@ -201,7 +246,12 @@ Payload:
 
 `plan_status` matches the `PlanStatus` enum:
 `planning`, `ready`, `in_progress`, `complete`, `failed`, `aborted`,
-`archived`, `question`.
+`archived`, `interrupted`. (`interrupted` is the post-DAG-redesign
+rename of the old `question` variant — it is a *derived* status,
+reported whenever any step in the plan has an open interruption, never
+stored. `question` is still accepted on the parse side for one release
+as a legacy alias, but `summary`/`plan_complete` always *emit*
+`interrupted`.)
 
 Consumer expectations: this is the **last** event in a clean run.
 Treat any subsequent line on stdout as out-of-band noise.
@@ -292,7 +342,7 @@ emitting it the runner has:
   re-enter the retry loop at the **same** `attempt` number.
 
 Net effect: the cancelled attempt consumes **no** retry budget and
-leaves **no** `UNIQUE(step_id, attempt)` row behind. Another
+leaves **no** `execution_logs` row behind. Another
 `prompt_prepared` / `phase_changed` for the same `step_id` at the same
 `attempt` number follows.
 
@@ -321,6 +371,274 @@ Decrement any "attempts used" counter you derived from
 It is only emitted on the TUI-spawned runner stream — CLI `ralph skip
 --changes …` never produces it (those choices always finalize the
 step).
+
+### `paused_by_user`
+
+Emitted when the runner exits cleanly because the operator requested a
+pause (`plans.pause_requested`, set by the TUI `[P]` keybinding or
+`ralph pause`). Distinct from `plan_complete` / `summary` so a consumer
+can tell a deliberate pause from completion (the TUI surfaces a
+"Paused. Use `ralph resume` to continue." toast on this event).
+
+Payload:
+
+| Field       | Type     | Notes                          |
+|-------------|----------|--------------------------------|
+| `plan_slug` | `string` | Plan slug that was paused.     |
+
+```json
+{ "event": "paused_by_user", "plan_slug": "dag-redesign" }
+```
+
+Consumer expectations: terminal for the run, like `summary` — the
+runner exits after emitting it. The plan is resumable with
+`ralph resume`.
+
+### `review_started`
+
+Emitted the moment a read-only reviewer subprocess is spawned against a
+committed iteration (docs/dag-redesign.md §3.2 / §9-inv-2). The review
+runs **concurrently** with the next unrelated implementation and is
+read-only w.r.t. the working tree (it operates against the fixed
+`commit_sha` in a throwaway isolated git worktree, never the live
+tree).
+
+Payload:
+
+| Field        | Type      | Notes                                              |
+|--------------|-----------|----------------------------------------------------|
+| `step_id`    | `string`  | UUID of the step whose iteration is being reviewed.|
+| `step_num`   | `integer` | 1-based position at emit time.                     |
+| `commit_sha` | `string`  | Full SHA of the reviewed iteration commit.         |
+| `iteration`  | `integer` | 1-based iteration number (`<short_id>.<n>`).       |
+
+```json
+{
+  "event": "review_started",
+  "step_id": "9b8c4…",
+  "step_num": 7,
+  "commit_sha": "1a2b3c4d…",
+  "iteration": 2
+}
+```
+
+Consumer expectations: pair with `review_finished` by `step_id` +
+`commit_sha`. There is no `StepStatus::AwaitingReview` — a review-gated
+step stays `InProgress`; gating is structural (dependents wait for the
+step to become `Complete`).
+
+### `review_finished`
+
+Emitted when a reviewer returns a verdict. `passed: true` ⇒ `REVIEW
+PASS` (the step is promoted toward `Complete`, `review_status =
+Passed`); `passed: false` ⇒ `REVIEW FAIL` (a `corrective_step_requested`
+follows). The `Ralph-Review` value is recorded as a git **note** on
+`refs/notes/ralph-review` for the reviewed commit (`passed` / `failed`)
+— **not** by amending the commit, so history and the working tree are
+untouched under concurrency.
+
+Payload:
+
+| Field        | Type      | Notes                                              |
+|--------------|-----------|----------------------------------------------------|
+| `step_id`    | `string`  | UUID matching the prior `review_started`.          |
+| `step_num`   | `integer` | 1-based position at emit time.                     |
+| `commit_sha` | `string`  | Full SHA of the reviewed iteration commit.         |
+| `iteration`  | `integer` | 1-based iteration number.                          |
+| `passed`     | `boolean` | `true` = pass; `false` = fail (correction follows).|
+
+```json
+{
+  "event": "review_finished",
+  "step_id": "9b8c4…",
+  "step_num": 7,
+  "commit_sha": "1a2b3c4d…",
+  "iteration": 2,
+  "passed": false
+}
+```
+
+### `corrective_step_requested`
+
+The **reviewer-side half** of the single-DAG-writer structured channel
+(docs/dag-redesign.md §9-inv-3). A failed review never mutates the DAG
+itself; it *requests* a corrective step by emitting this event **and**
+writing a `corrective_step_requests` bridge row. The orchestrator — the
+sole DAG writer — consumes the bridge row at a later scheduler tick and
+performs the §10 insert + re-parent (announced separately by
+`corrective_step_inserted`). Always preceded by a
+`review_finished` with `passed: false` for the same step/commit.
+
+Payload:
+
+| Field               | Type      | Notes                                              |
+|---------------------|-----------|----------------------------------------------------|
+| `reviewed_step_id`  | `string`  | UUID of the step `A` whose review failed.          |
+| `reviewed_step_num` | `integer` | 1-based position at emit time.                     |
+| `commit_sha`        | `string`  | SHA of the reviewed iteration commit.              |
+| `iteration`         | `integer` | 1-based iteration number that failed review.       |
+| `issues`            | `integer` | Issue count parsed from the reviewer's verdict.    |
+
+```json
+{
+  "event": "corrective_step_requested",
+  "reviewed_step_id": "9b8c4…",
+  "reviewed_step_num": 7,
+  "commit_sha": "1a2b3c4d…",
+  "iteration": 2,
+  "issues": 3
+}
+```
+
+Consumer expectations: this is a *request*, not the mutation. Wait for
+`corrective_step_inserted` (or `review_loop_escalated`) before assuming
+the DAG changed.
+
+### `corrective_step_inserted`
+
+Emitted when the orchestrator (sole writer) has inserted corrective step
+`A′` (`corrects_step_id = A`, `A′ depends_on A`) and re-parented every
+former dependent of `A` onto `A′` (docs/dag-redesign.md §10). `A` itself
+transitions to `Complete` with `review_status = Failed` — its commit
+stays in linear history; the fix lives in `A′` and dependents are gated
+by the new structural edge.
+
+Payload:
+
+| Field                 | Type     | Notes                                              |
+|-----------------------|----------|----------------------------------------------------|
+| `corrective_step_id`  | `string` | UUID of the newly inserted corrective step `A′`.   |
+| `corrective_short_id` | `string` | 8-char `short_id` of `A′` (the user-facing handle).|
+| `corrects_step_id`    | `string` | UUID of the reviewed step `A` that `A′` corrects.  |
+
+```json
+{
+  "event": "corrective_step_inserted",
+  "corrective_step_id": "c0ffee…",
+  "corrective_short_id": "a1b2c3d4",
+  "corrects_step_id": "9b8c4…"
+}
+```
+
+Consumer expectations: refresh any cached step-list / DAG view — the
+edge set changed (the new step plus re-parented edges).
+
+### `review_loop_escalated`
+
+Emitted when the review→correction→review chain hits the per-plan
+`max_review_corrections` cap (docs/dag-redesign.md §10 item 4 / §14.5).
+Instead of spawning another correction, the orchestrator raises a
+`kind=blocker` interruption ("review loop — needs human") on the
+offending step and stops the chain. That blocker ALSO emits a generic
+`interruption_raised` event (see below); this event is the
+escalation-specific announcement carrying the chain/cap context.
+
+Payload:
+
+| Field       | Type      | Notes                                                   |
+|-------------|-----------|---------------------------------------------------------|
+| `step_id`   | `string`  | UUID of the step whose correction chain was capped.     |
+| `step_num`  | `integer` | 1-based position at emit time.                          |
+| `chain_len` | `integer` | Number of corrections already applied to this chain.    |
+| `cap`       | `integer` | The per-plan `max_review_corrections` value that was hit.|
+
+```json
+{
+  "event": "review_loop_escalated",
+  "step_id": "9b8c4…",
+  "step_num": 7,
+  "chain_len": 3,
+  "cap": 3
+}
+```
+
+Consumer expectations: the step is now `Complete`/`review_status =
+Failed` with an **open blocker** keeping its dependents gated until a
+human resolves it (`ralph interruption resolve`). No further corrective
+steps will be spawned for this chain.
+
+### `interruption_raised`
+
+Emitted on every new interruption row written, no matter who triggered
+it:
+
+- a harness calling `ralph question ask` / `ralph block` from inside a
+  running step (`auto_raised: false`);
+- the executor's retry-exhausted auto-blocker, when a step exhausts its
+  retry budget on a productively-retryable failure mode (TestFailed /
+  CommitFailed) — see also the `outcome: paused_for_question` note on
+  `step_finished` (`auto_raised: true`);
+- TUI / CLI-injected interruptions (`auto_raised: false`).
+
+Best-effort: emitted post-commit so a transaction that rolled back never
+produces a phantom "raised" event. Failure to resolve the plan slug from
+the step id (e.g., a step row that has since been deleted out from under
+the orchestrator) silently swallows the emit rather than failing the
+underlying write.
+
+Payload:
+
+| Field             | Type               | Notes                                                       |
+|-------------------|--------------------|-------------------------------------------------------------|
+| `interruption_id` | `string`           | UUID of the inserted interruption row.                      |
+| `step_id`         | `string`           | UUID of the step the interruption is attached to.           |
+| `plan_slug`       | `string`           | Plan slug, resolved via the step→plan FK.                   |
+| `kind`            | `string`           | `question` or `blocker`.                                    |
+| `auto_raised`     | `boolean`          | `true` only for the executor's retry-exhausted auto-blocker.|
+| `attempt`         | `integer`          | 1-based attempt number this row was bound to.               |
+| `raised_at`       | `string` (RFC3339) | UTC instant the event was emitted.                          |
+
+```json
+{
+  "event": "interruption_raised",
+  "interruption_id": "c0ffee…",
+  "step_id": "9b8c4…",
+  "plan_slug": "dag-redesign",
+  "kind": "blocker",
+  "auto_raised": true,
+  "attempt": 3,
+  "raised_at": "2026-05-25T10:00:00Z"
+}
+```
+
+Consumer expectations: pair with `interruption_resolved` by
+`interruption_id`. A `false`-armed event still requires DB poll for the
+full body / options payload — the event is a notification, not the
+content.
+
+### `interruption_resolved`
+
+Emitted on every resolve, regardless of resolver (CLI
+`ralph interruption resolve`, TUI inbox, or programmatic). Pairs with the
+earlier `interruption_raised` by `interruption_id`.
+
+Payload:
+
+| Field             | Type               | Notes                                              |
+|-------------------|--------------------|----------------------------------------------------|
+| `interruption_id` | `string`           | UUID matching the prior `interruption_raised`.    |
+| `step_id`         | `string`           | UUID of the step the interruption was attached to. |
+| `plan_slug`       | `string`           | Plan slug.                                         |
+| `resolution`      | `string`           | The resolution text (option text or freeform answer). May be empty for a comment-only resolution. |
+| `comment`         | `string?`          | Optional human-side comment captured at resolve.   |
+| `resolved_at`     | `string` (RFC3339) | UTC instant the event was emitted.                 |
+
+```json
+{
+  "event": "interruption_resolved",
+  "interruption_id": "c0ffee…",
+  "step_id": "9b8c4…",
+  "plan_slug": "dag-redesign",
+  "resolution": "Retry step with parked changes",
+  "comment": "tweaked the failing assertion in test::foo",
+  "resolved_at": "2026-05-25T10:05:00Z"
+}
+```
+
+Consumer expectations: resolving an open interruption un-shadows the
+step's derived `Blocked` overlay at the next scheduler tick — expect the
+step's `step_started` / `prompt_prepared` to follow once the scheduler
+re-picks it.
 
 ---
 
