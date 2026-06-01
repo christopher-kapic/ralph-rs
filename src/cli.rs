@@ -1137,6 +1137,19 @@ fn parse_step_dependency_tail(
         anyhow::bail!("Missing required `--depends-on <step>`");
     }
 
+    // Dependencies are always step selectors (a 1-based number or an 8-char
+    // short id). A non-selector token can only be a misplaced plan slug — e.g.
+    // a second plan in `... <plan> --depends-on 1 other-plan`, or a slug typed
+    // after `--depends-on` when one was already split off. Reject it here with
+    // a clear message rather than letting a bogus dependency fail downstream at
+    // step resolution.
+    if let Some(bad) = depends_on.iter().find(|t| !looks_like_step_selector(t)) {
+        anyhow::bail!(
+            "`{bad}` is not a valid step selector (expected a 1-based number or an 8-char \
+             short id); if it is a plan slug, put it before `--depends-on`"
+        );
+    }
+
     Ok((step, plan, depends_on))
 }
 
@@ -1904,6 +1917,37 @@ mod tests {
             assert_eq!(step, "3");
             assert_eq!(plan.as_deref(), Some("my-plan"));
             assert_eq!(depends_on, vec!["1".to_string(), "2".to_string()]);
+        } else {
+            panic!("Expected Step Dependency Add");
+        }
+    }
+
+    #[test]
+    fn test_parse_step_dependency_add_rejects_misplaced_second_plan() {
+        // The plan is already set as the leading positional, so a trailing
+        // non-selector token after `--depends-on` (a second plan slug) must
+        // error clearly instead of being swallowed as a bogus dependency.
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "dependency",
+            "add",
+            "3",
+            "my-plan",
+            "--depends-on",
+            "1",
+            "other-plan",
+        ])
+        .unwrap();
+
+        if let Command::Step(StepCommand::Dependency(StepDependencyCommand::Add(args))) =
+            cli.command.unwrap()
+        {
+            let err = args.into_parts().unwrap_err().to_string();
+            assert!(
+                err.contains("`other-plan` is not a valid step selector"),
+                "got: {err}"
+            );
         } else {
             panic!("Expected Step Dependency Add");
         }
