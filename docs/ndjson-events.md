@@ -529,9 +529,9 @@ Emitted when the review→correction→review chain hits the per-plan
 `max_review_corrections` cap (docs/dag-redesign.md §10 item 4 / §14.5).
 Instead of spawning another correction, the orchestrator raises a
 `kind=blocker` interruption ("review loop — needs human") on the
-offending step and stops the chain. This is the only place an
-interruption is announced on the event stream (interruptions otherwise
-have no NDJSON variant — see the note in the quick reference).
+offending step and stops the chain. That blocker ALSO emits a generic
+`interruption_raised` event (see below); this event is the
+escalation-specific announcement carrying the chain/cap context.
 
 Payload:
 
