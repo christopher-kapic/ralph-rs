@@ -1,6 +1,6 @@
 // CLI argument parsing (clap)
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use clap_complete::Shell;
 use std::path::PathBuf;
 
@@ -1031,37 +1031,10 @@ pub enum StepDependencyCommand {
     /// Selectors accept a 1-based step number or an 8-char short id, scoped
     /// to the same plan (the same disambiguation as every other step
     /// command). Cycles and self-edges are rejected.
-    Add {
-        /// Step number (1-based) or 8-char short id to add dependencies to.
-        step: String,
-
-        /// Plan slug. Defaults to the active plan.
-        plan: Option<String>,
-
-        /// A step (number or short id) this step depends on. **Repeat the
-        /// flag once per parent** (`--depends-on a --depends-on b`);
-        /// space-separated multi-value (`--depends-on a b`) is *not*
-        /// supported because it would silently swallow the trailing `<plan>`
-        /// positional (the same footgun `ralph step add --depends-on` avoids).
-        #[arg(long = "depends-on", required = true)]
-        depends_on: Vec<String>,
-    },
+    Add(StepDependencyMutationArgs),
 
     /// Remove one or more dependency edges from a step.
-    Remove {
-        /// Step number (1-based) or 8-char short id to remove dependencies from.
-        step: String,
-
-        /// Plan slug. Defaults to the active plan.
-        plan: Option<String>,
-
-        /// A dependency step (number or short id) to remove. **Repeat the
-        /// flag once per edge** (`--depends-on a --depends-on b`);
-        /// space-separated multi-value is *not* supported because it would
-        /// silently swallow the trailing `<plan>` positional.
-        #[arg(long = "depends-on", required = true)]
-        depends_on: Vec<String>,
-    },
+    Remove(StepDependencyMutationArgs),
 
     /// List a step's direct dependencies and dependents.
     List {
@@ -1071,6 +1044,104 @@ pub enum StepDependencyCommand {
         /// Plan slug. Defaults to the active plan.
         plan: Option<String>,
     },
+}
+
+/// Raw argv carrier for `step dependency add/remove`.
+///
+/// We parse this tail manually instead of relying on clap's greedy
+/// `num_args = 1..` handling so we can support both of these forms:
+///
+/// - `ralph step dependency add <step> <plan> --depends-on a b`
+/// - `ralph step dependency add <step> --depends-on a b <plan>`
+///
+/// ...without silently swallowing a trailing `<plan>` positional into the
+/// dependency list when it is a normal slug like `my-plan`.
+#[derive(Debug, Args)]
+#[command(trailing_var_arg = true)]
+pub struct StepDependencyMutationArgs {
+    /// Step number (1-based) or 8-char short id.
+    pub step: String,
+
+    /// Optional plan slug plus one or more `--depends-on` groups. Supported
+    /// forms:
+    ///
+    /// - `<plan> --depends-on a b`
+    /// - `--depends-on a --depends-on b <plan>`
+    ///
+    /// If the trailing token after `--depends-on` *looks like* a step
+    /// selector (a number or 8-char short id), it is treated as another
+    /// dependency; put the plan before `--depends-on` to avoid that
+    /// ambiguity.
+    #[arg(value_name = "PLAN|--depends-on", allow_hyphen_values = true)]
+    raw_tail: Vec<String>,
+}
+
+impl StepDependencyMutationArgs {
+    pub fn into_parts(self) -> anyhow::Result<(String, Option<String>, Vec<String>)> {
+        parse_step_dependency_tail(self.step, self.raw_tail)
+    }
+}
+
+fn parse_step_dependency_tail(
+    step: String,
+    raw_tail: Vec<String>,
+) -> anyhow::Result<(String, Option<String>, Vec<String>)> {
+    let mut plan = None;
+    let mut depends_on = Vec::new();
+    let mut i = 0usize;
+
+    while i < raw_tail.len() {
+        let tok = &raw_tail[i];
+        if tok == "--depends-on" {
+            i += 1;
+            if i >= raw_tail.len() || raw_tail[i].starts_with("--") {
+                anyhow::bail!("`--depends-on` requires at least one step selector");
+            }
+
+            let start = i;
+            while i < raw_tail.len() && !raw_tail[i].starts_with("--") {
+                i += 1;
+            }
+            let group = &raw_tail[start..i];
+            if plan.is_none()
+                && group.len() >= 2
+                && !looks_like_step_selector(group.last().expect("group is non-empty"))
+            {
+                depends_on.extend(group[..group.len() - 1].iter().cloned());
+                plan = Some(group[group.len() - 1].clone());
+            } else {
+                depends_on.extend(group.iter().cloned());
+            }
+            continue;
+        }
+
+        if tok.starts_with("--") {
+            anyhow::bail!(
+                "Unexpected flag `{tok}`; expected `--depends-on <step>` or an optional plan slug"
+            );
+        }
+
+        if plan.is_none() && depends_on.is_empty() {
+            plan = Some(tok.clone());
+            i += 1;
+            continue;
+        }
+
+        anyhow::bail!(
+            "Unexpected positional argument `{tok}`; put the plan slug before `--depends-on`, \
+             or repeat `--depends-on` once per dependency"
+        );
+    }
+
+    if depends_on.is_empty() {
+        anyhow::bail!("Missing required `--depends-on <step>`");
+    }
+
+    Ok((step, plan, depends_on))
+}
+
+fn looks_like_step_selector(tok: &str) -> bool {
+    tok.parse::<usize>().ok().is_some_and(|n| n >= 1) || crate::storage::is_short_id_shaped(tok)
 }
 
 // ---------------------------------------------------------------------------
@@ -1757,8 +1828,7 @@ mod tests {
         // same `<step> [plan]`-then-`--depends-on` shape, so a greedy
         // `num_args = 1..` would let `--depends-on 1 2 my-plan` swallow
         // `my-plan` as a third dependency and operate on the wrong (active)
-        // plan. The trailing `<plan>` positional must be preserved;
-        // --depends-on takes exactly one value per occurrence.
+        // plan. The trailing `<plan>` positional must be preserved.
         let cli = Cli::try_parse_from([
             "ralph-rs",
             "step",
@@ -1771,12 +1841,10 @@ mod tests {
         ])
         .unwrap();
 
-        if let Command::Step(StepCommand::Dependency(StepDependencyCommand::Add {
-            step,
-            plan,
-            depends_on,
-        })) = cli.command.unwrap()
+        if let Command::Step(StepCommand::Dependency(StepDependencyCommand::Add(args))) =
+            cli.command.unwrap()
         {
+            let (step, plan, depends_on) = args.into_parts().unwrap();
             assert_eq!(step, "3");
             assert_eq!(plan.as_deref(), Some("my-plan"));
             assert_eq!(depends_on, vec!["1".to_string()]);
@@ -1802,15 +1870,66 @@ mod tests {
         ])
         .unwrap();
 
-        if let Command::Step(StepCommand::Dependency(StepDependencyCommand::Add {
-            step,
-            plan,
-            depends_on,
-        })) = cli.command.unwrap()
+        if let Command::Step(StepCommand::Dependency(StepDependencyCommand::Add(args))) =
+            cli.command.unwrap()
         {
+            let (step, plan, depends_on) = args.into_parts().unwrap();
             assert_eq!(step, "abc12345");
             assert_eq!(plan.as_deref(), Some("my-feature"));
             assert_eq!(depends_on, vec!["1".to_string(), "def67890".to_string()]);
+        } else {
+            panic!("Expected Step Dependency Add");
+        }
+    }
+
+    #[test]
+    fn test_parse_step_dependency_add_multi_value_with_plan_before_flag() {
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "dependency",
+            "add",
+            "3",
+            "my-plan",
+            "--depends-on",
+            "1",
+            "2",
+        ])
+        .unwrap();
+
+        if let Command::Step(StepCommand::Dependency(StepDependencyCommand::Add(args))) =
+            cli.command.unwrap()
+        {
+            let (step, plan, depends_on) = args.into_parts().unwrap();
+            assert_eq!(step, "3");
+            assert_eq!(plan.as_deref(), Some("my-plan"));
+            assert_eq!(depends_on, vec!["1".to_string(), "2".to_string()]);
+        } else {
+            panic!("Expected Step Dependency Add");
+        }
+    }
+
+    #[test]
+    fn test_parse_step_dependency_add_multi_value_without_plan_still_works() {
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "dependency",
+            "add",
+            "3",
+            "--depends-on",
+            "1",
+            "2",
+        ])
+        .unwrap();
+
+        if let Command::Step(StepCommand::Dependency(StepDependencyCommand::Add(args))) =
+            cli.command.unwrap()
+        {
+            let (step, plan, depends_on) = args.into_parts().unwrap();
+            assert_eq!(step, "3");
+            assert_eq!(plan, None);
+            assert_eq!(depends_on, vec!["1".to_string(), "2".to_string()]);
         } else {
             panic!("Expected Step Dependency Add");
         }
@@ -2054,12 +2173,10 @@ mod tests {
         ])
         .unwrap();
 
-        if let Command::Step(StepCommand::Dependency(StepDependencyCommand::Add {
-            step,
-            plan,
-            depends_on,
-        })) = cli.command.unwrap()
+        if let Command::Step(StepCommand::Dependency(StepDependencyCommand::Add(args))) =
+            cli.command.unwrap()
         {
+            let (step, plan, depends_on) = args.into_parts().unwrap();
             assert_eq!(step, "3");
             assert_eq!(plan, Some("my-plan".to_string()));
             assert_eq!(depends_on, vec!["1".to_string()]);
@@ -2070,9 +2187,18 @@ mod tests {
 
     #[test]
     fn test_parse_step_dependency_add_requires_depends_on() {
-        // Missing --depends-on should error because of num_args = 1..
-        let result = Cli::try_parse_from(["ralph-rs", "step", "dependency", "add", "3"]);
-        assert!(result.is_err());
+        let cli = Cli::try_parse_from(["ralph-rs", "step", "dependency", "add", "3"]).unwrap();
+        if let Command::Step(StepCommand::Dependency(StepDependencyCommand::Add(args))) =
+            cli.command.unwrap()
+        {
+            let err = args.into_parts().unwrap_err().to_string();
+            assert!(
+                err.contains("Missing required `--depends-on <step>`"),
+                "got: {err}"
+            );
+        } else {
+            panic!("Expected Step Dependency Add");
+        }
     }
 
     #[test]
@@ -2090,14 +2216,39 @@ mod tests {
         ])
         .unwrap();
 
-        if let Command::Step(StepCommand::Dependency(StepDependencyCommand::Remove {
-            step,
-            plan,
-            depends_on,
-        })) = cli.command.unwrap()
+        if let Command::Step(StepCommand::Dependency(StepDependencyCommand::Remove(args))) =
+            cli.command.unwrap()
         {
+            let (step, plan, depends_on) = args.into_parts().unwrap();
             assert_eq!(step, "abc12345");
             assert_eq!(plan, None);
+            assert_eq!(depends_on, vec!["1".to_string(), "2".to_string()]);
+        } else {
+            panic!("Expected Step Dependency Remove");
+        }
+    }
+
+    #[test]
+    fn test_parse_step_dependency_remove_multi_value_with_plan_before_flag() {
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "dependency",
+            "remove",
+            "abc12345",
+            "my-plan",
+            "--depends-on",
+            "1",
+            "2",
+        ])
+        .unwrap();
+
+        if let Command::Step(StepCommand::Dependency(StepDependencyCommand::Remove(args))) =
+            cli.command.unwrap()
+        {
+            let (step, plan, depends_on) = args.into_parts().unwrap();
+            assert_eq!(step, "abc12345");
+            assert_eq!(plan, Some("my-plan".to_string()));
             assert_eq!(depends_on, vec!["1".to_string(), "2".to_string()]);
         } else {
             panic!("Expected Step Dependency Remove");

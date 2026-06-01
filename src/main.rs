@@ -444,11 +444,8 @@ fn main() -> Result<()> {
                 )
             }
             StepCommand::Dependency(dep_cmd) => match dep_cmd {
-                StepDependencyCommand::Add {
-                    step,
-                    plan,
-                    depends_on,
-                } => {
+                StepDependencyCommand::Add(args) => {
+                    let (step, plan, depends_on) = args.into_parts()?;
                     let p = resolve_plan(&conn, plan, &project, false)?;
                     commands::step_dependency_add(
                         &conn,
@@ -459,11 +456,8 @@ fn main() -> Result<()> {
                         &out,
                     )
                 }
-                StepDependencyCommand::Remove {
-                    step,
-                    plan,
-                    depends_on,
-                } => {
+                StepDependencyCommand::Remove(args) => {
+                    let (step, plan, depends_on) = args.into_parts()?;
                     let p = resolve_plan(&conn, plan, &project, false)?;
                     commands::step_dependency_remove(
                         &conn,
