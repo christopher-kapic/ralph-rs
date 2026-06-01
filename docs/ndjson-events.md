@@ -165,10 +165,11 @@ runner emits `outcome: aborted`). Stuck-state recovery is via
 > executor *also* emits this outcome when a step **exhausts its retry
 > budget** on `TestFailed` or `CommitFailed` (the retry-exhaustion
 > auto-blocker — `docs/dag-redesign.md` §3.4-bis): the executor inserts
-> a `kind=Blocker` interruption with two ranked options ("Retry the
-> step from scratch" / "Mark step Failed") and parks the step at
+> a `kind=Blocker` interruption with two ranked options ("Retry step
+> with parked changes" / "Mark step Failed") and parks the step at
 > `status=Pending` with `attempts == max_attempts`, the dirty tree
-> rolled back. `StepOutcome::PausedForQuestion` is reused — no new
+> preserved on disk (parked, not rolled back — retrying restores the
+> parked WIP). `StepOutcome::PausedForQuestion` is reused — no new
 > outcome variant — so a downstream consumer cannot distinguish the two
 > cases from the event stream alone. To tell them apart, poll
 > `interruptions` for the step and inspect the most recent open row:

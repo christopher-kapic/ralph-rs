@@ -1535,6 +1535,40 @@ async fn run_all_plans_inner(
                 );
                 return Ok(results);
             }
+            PlanStatus::Interrupted => {
+                // The plan is blocked on an open interruption (a question or
+                // blocker) on one branch, but it made committed progress. Its
+                // branch tip is NOT a clean completion, so we still fence its
+                // transitive dependents (their branches would root on an
+                // incomplete tip) — but, unlike a plain stalled plan, this is
+                // resolvable: `ralph interruption resolve` + `ralph resume`.
+                // The message reflects that so the operator knows the next
+                // step. Keep iterating so independent plans still run.
+                incomplete_slugs.push(plan.slug.clone());
+                let newly_blocked = transitive_dependents(plan_id, &dependents_of);
+                if newly_blocked.is_empty() {
+                    eprintln!(
+                        "Plan '{}' is blocked on an open interruption; resolve it \
+                         (ralph interruption resolve) and resume. Continuing with \
+                         independent plans.",
+                        plan.slug
+                    );
+                } else {
+                    let blocked_slugs: Vec<String> = newly_blocked
+                        .iter()
+                        .filter_map(|id| plan_by_id.get(id).map(|p| p.slug.clone()))
+                        .collect();
+                    eprintln!(
+                        "Plan '{}' is blocked on an open interruption; resolve it \
+                         (ralph interruption resolve) and resume. Skipping {} \
+                         dependent plan(s) meanwhile: {}",
+                        plan.slug,
+                        blocked_slugs.len(),
+                        blocked_slugs.join(", ")
+                    );
+                    blocked.extend(newly_blocked);
+                }
+            }
             _ => {
                 // InProgress — plan stopped cleanly but incomplete. Block
                 // its transitive dependents (their branches would root on an

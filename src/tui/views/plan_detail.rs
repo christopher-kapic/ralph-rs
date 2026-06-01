@@ -554,10 +554,7 @@ impl PlanDetailApp {
     /// Returns `Some(step_id)` if the selected step is in a skippable status,
     /// or `None` if skipping is not allowed (e.g. step is already complete).
     pub fn request_skip(&self) -> Option<String> {
-        if self.steps.is_empty() {
-            return None;
-        }
-        let step = &self.steps[self.selected_index];
+        let step = self.selected_step()?;
         match step.status {
             StepStatus::Pending
             | StepStatus::InProgress
@@ -641,8 +638,8 @@ impl PlanDetailApp {
     pub fn delete_targets(&self) -> Vec<String> {
         if !self.selection.is_empty() {
             self.selection.as_slice().to_vec()
-        } else if !self.steps.is_empty() {
-            vec![self.steps[self.selected_index].id.clone()]
+        } else if let Some(step) = self.selected_step() {
+            vec![step.id.clone()]
         } else {
             Vec::new()
         }
@@ -653,11 +650,7 @@ impl PlanDetailApp {
     /// Step ID to reset, or `None` when the step list is empty. Cursor-only
     /// (selection is ignored — reset is a single-step operation).
     pub fn reset_target(&self) -> Option<String> {
-        if self.steps.is_empty() {
-            None
-        } else {
-            Some(self.steps[self.selected_index].id.clone())
-        }
+        self.selected_step().map(|s| s.id.clone())
     }
 
     // -- Move (Shift-J / Shift-K) -----------------------------------------
@@ -826,6 +819,24 @@ impl PlanDetailApp {
         {
             self.selected_index = idx;
         }
+    }
+
+    /// Resolve the step the cursor-target helpers (skip/reset/delete) should
+    /// act on, going through the outline — the source of truth for what the
+    /// user actually sees — first. On a focused / re-rooted DAG,
+    /// [`Self::realign_selection_to_outline`] can fail to resolve the outline's
+    /// selected id back into `self.steps`, leaving `selected_index` stale; so
+    /// we resolve `outline.selected_step_id()` against `self.steps` here and
+    /// only fall back to the `selected_index` path when the outline yields
+    /// nothing (e.g. an empty outline). Mirrors the Enter/open path, which was
+    /// already hardened to resolve through the outline.
+    fn selected_step(&self) -> Option<&Step> {
+        if let Some(id) = self.outline.selected_step_id()
+            && let Some(s) = self.steps.iter().find(|s| s.id == id)
+        {
+            return Some(s);
+        }
+        self.steps.get(self.selected_index)
     }
 
     /// True while the outline is re-rooted on a focus step (§12.2). Drives
@@ -1363,8 +1374,10 @@ mod tests {
         let steps = make_steps(3);
         let mut app = PlanDetailApp::new(plan, steps, &Config::default());
 
-        // Select the in_progress step
-        app.selected_index = 1;
+        // Select the in_progress step via the outline cursor (the source of
+        // truth the cursor-target helpers resolve through).
+        app.outline.set_cursor(1);
+        app.realign_selection_to_outline();
         let result = app.request_skip();
         assert!(result.is_some());
         assert_eq!(result.unwrap(), "s1"); // step index 1 = id "s1"
@@ -1376,8 +1389,9 @@ mod tests {
         let steps = make_steps(3);
         let mut app = PlanDetailApp::new(plan, steps, &Config::default());
 
-        // Select the complete step
-        app.selected_index = 0;
+        // Select the complete step via the outline cursor.
+        app.outline.set_cursor(0);
+        app.realign_selection_to_outline();
         let result = app.request_skip();
         assert!(result.is_none()); // Can't skip a completed step
     }
@@ -1667,7 +1681,8 @@ mod tests {
         let plan = make_plan();
         let steps = make_steps(3);
         let mut app = PlanDetailApp::new(plan, steps, &Config::default());
-        app.selected_index = 2;
+        app.outline.set_cursor(2);
+        app.realign_selection_to_outline();
         assert_eq!(app.delete_targets(), vec!["s2".to_string()]);
     }
 
@@ -1703,9 +1718,11 @@ mod tests {
         let plan = make_plan();
         let steps = make_steps(3);
         let mut app = PlanDetailApp::new(plan, steps, &Config::default());
-        app.selected_index = 0;
+        app.outline.set_cursor(0);
+        app.realign_selection_to_outline();
         assert_eq!(app.reset_target(), Some("s0".to_string()));
-        app.selected_index = 2;
+        app.outline.set_cursor(2);
+        app.realign_selection_to_outline();
         assert_eq!(app.reset_target(), Some("s2".to_string()));
     }
 

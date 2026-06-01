@@ -667,6 +667,7 @@ fn main() -> Result<()> {
                     None,
                     Some(&text),
                     None,
+                    true, // `question answer` alias: only resolve questions, not blockers
                     &out,
                 )
             }
@@ -762,6 +763,7 @@ fn main() -> Result<()> {
                 option,
                 answer.as_deref(),
                 comment.as_deref(),
+                false, // `interruption resolve` works on both questions and blockers
                 &out,
             ),
         },

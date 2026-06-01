@@ -470,10 +470,20 @@ impl OutlineState {
     }
 
     /// The step id under the cursor, if any.
+    ///
+    /// Clamps `self.cursor` to the current visible-row range so this matches
+    /// what the renderer highlights (`plan_detail_ui::draw_step_list` clamps
+    /// identically). Without the clamp a transiently-stale cursor (e.g. the
+    /// outline shrank via a focus pop before the next `sync`) would draw a
+    /// highlight on the clamped last row while keyboard/mouse selection
+    /// resolved to a different row or `None` — a one-frame divergence.
     pub fn selected_step_id(&self) -> Option<String> {
-        self.visible_rows()
-            .get(self.cursor)
-            .map(|r| r.step_id.clone())
+        let rows = self.visible_rows();
+        if rows.is_empty() {
+            return None;
+        }
+        let idx = self.cursor.min(rows.len() - 1);
+        rows.get(idx).map(|r| r.step_id.clone())
     }
 
     /// Move the cursor down one row (wraps), no-op on an empty outline.

@@ -531,6 +531,7 @@ pub fn cmd_interruption_resolve(
     option: Option<usize>,
     answer: Option<&str>,
     comment: Option<&str>,
+    require_question: bool,
     out: &OutputContext,
 ) -> Result<()> {
     let opens = storage::list_open_interruptions_enriched(conn, project, plan_slug)?;
@@ -541,6 +542,20 @@ pub fn cmd_interruption_resolve(
              index from `ralph interruption list`)."
         ),
     };
+
+    // The legacy `ralph question answer <selector> <text>` alias
+    // (`require_question = true`) must only ever resolve a question. The
+    // unified open-interruptions list now contains blockers too, so a 1-based
+    // index can land on a blocker (e.g. the retry-exhausted auto-blocker),
+    // where the freeform `--answer` path would silently mutate run state
+    // (treated as retry-with-hint). Refuse it before any side effect and point
+    // the user at the kind-agnostic `ralph interruption resolve`.
+    if require_question && q.kind == InterruptionKind::Blocker {
+        bail!(
+            "interruption {selector} is a blocker, not a question; use \
+             `ralph interruption resolve` instead"
+        );
+    }
 
     // Determine the resolution text. `--option K` selects the K-th proposed
     // option by priority order; `--answer` is freeform. clap already makes
@@ -745,6 +760,7 @@ mod tests {
             Some(2),
             None,
             Some("go with file db"),
+            false,
             &quiet_out(),
         )
         .unwrap();
@@ -763,6 +779,7 @@ mod tests {
             None,
             Some("granted"),
             None,
+            false,
             &quiet_out(),
         )
         .unwrap();
@@ -796,6 +813,7 @@ mod tests {
             Some(5),
             None,
             None,
+            false,
             &quiet_out(),
         )
         .unwrap_err();
@@ -819,10 +837,72 @@ mod tests {
             None,
             Some("x"),
             None,
+            false,
             &quiet_out(),
         )
         .unwrap_err();
         assert!(err.to_string().contains("No open interruption matched"));
+    }
+
+    /// Bug fix: the legacy `ralph question answer` alias (require_question =
+    /// true) must refuse to resolve a blocker. The unified open-interruptions
+    /// list contains both kinds, so a 1-based index can land on a blocker; the
+    /// freeform answer path would otherwise silently mutate run state. The
+    /// guard must fire BEFORE any side effect (the blocker stays open) and the
+    /// kind-agnostic `ralph interruption resolve` path (require_question =
+    /// false) must keep resolving the same blocker.
+    #[test]
+    fn question_answer_alias_rejects_blocker_but_interruption_resolve_allows_it() {
+        let conn = db::open_memory().unwrap();
+        let project = "/proj-q-answer-alias";
+        let (_plan_id, step_id) = seed_plan_and_step(&conn, "p", project);
+        let bid = storage::insert_interruption(
+            &conn,
+            &step_id,
+            1,
+            InterruptionKind::Blocker,
+            "needs sudo",
+            &[],
+        )
+        .unwrap();
+
+        // Alias path (require_question = true): rejected, nothing written.
+        let err = cmd_interruption_resolve(
+            &conn,
+            project,
+            None,
+            &bid,
+            None,
+            Some("granted"),
+            None,
+            true,
+            &quiet_out(),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("is a blocker, not a question")
+                && msg.contains("ralph interruption resolve"),
+            "guard must name the kind and point at the right command: {msg}",
+        );
+        let still = storage::list_open_interruptions_enriched(&conn, project, None).unwrap();
+        assert_eq!(still.len(), 1, "blocker still open after rejection");
+
+        // Kind-agnostic resolve path (require_question = false): resolves it.
+        cmd_interruption_resolve(
+            &conn,
+            project,
+            None,
+            &bid,
+            None,
+            Some("granted"),
+            None,
+            false,
+            &quiet_out(),
+        )
+        .unwrap();
+        let after = storage::list_open_interruptions_enriched(&conn, project, None).unwrap();
+        assert!(after.is_empty(), "blocker resolved via interruption resolve");
     }
 
     // -- Phase C: apply_retry_exhausted_resolution -------------------------
@@ -1089,6 +1169,7 @@ mod tests {
             Some(1), // priority 1 = Retry
             None,
             None,
+            false,
             &quiet_out(),
         )
         .unwrap();
@@ -1117,7 +1198,7 @@ mod tests {
         storage::update_step_status(&conn, &step_id, StepStatus::Pending).unwrap();
         let id = seed_auto_blocker(&conn, &step_id);
 
-        cmd_interruption_resolve(&conn, project, None, &id, Some(1), None, None, &quiet_out())
+        cmd_interruption_resolve(&conn, project, None, &id, Some(1), None, None, false, &quiet_out())
             .unwrap();
 
         // Retry-with-parked-changes preserved the old audit rows. A fresh logical
@@ -1181,7 +1262,7 @@ mod tests {
             quiet: true,
             color: false,
         };
-        cmd_interruption_resolve(&conn, project, None, &qid, Some(2), None, None, &json_out)
+        cmd_interruption_resolve(&conn, project, None, &qid, Some(2), None, None, false, &json_out)
             .unwrap();
 
         let after = storage::list_open_interruptions_enriched(&conn, project, None).unwrap();
@@ -1205,6 +1286,7 @@ mod tests {
             None,
             Some(RETRY_EXHAUSTED_OPTION_FAIL), // freeform that matches the Fail option text
             None,
+            false,
             &quiet_out(),
         )
         .unwrap();
@@ -1347,6 +1429,7 @@ mod tests {
             None,
             None,
             Some("just a note, not a decision"),
+            false,
             &quiet_out(),
         )
         .unwrap_err();
@@ -1406,6 +1489,7 @@ mod tests {
             None,
             None,
             Some("looked into it"),
+            false,
             &quiet_out(),
         )
         .unwrap_err();
@@ -1449,6 +1533,7 @@ mod tests {
             None,
             None,
             Some("Postgres please, found prior art"),
+            false,
             &quiet_out(),
         )
         .unwrap();
@@ -1600,6 +1685,7 @@ mod tests {
             None,
             Some(&padded),
             None,
+            false,
             &quiet_out(),
         )
         .unwrap();
@@ -1628,6 +1714,7 @@ mod tests {
             None,
             Some("  skip and mark failed  "),
             None,
+            false,
             &quiet_out(),
         )
         .unwrap();
@@ -1657,6 +1744,7 @@ mod tests {
             Some(1), // priority 1 = MARK_FAILED
             None,
             None,
+            false,
             &quiet_out(),
         )
         .unwrap();
@@ -1695,6 +1783,7 @@ mod tests {
             Some(2), // priority 2 = MARK_PENDING
             None,
             None,
+            false,
             &quiet_out(),
         )
         .unwrap();
@@ -1731,6 +1820,7 @@ mod tests {
             None,
             Some("the disk was full"),
             None,
+            false,
             &quiet_out(),
         )
         .unwrap();
@@ -1826,6 +1916,7 @@ mod tests {
             None,
             Some("approved, take one more pass"),
             None,
+            false,
             &quiet_out(),
         )
         .unwrap();
@@ -1870,6 +1961,7 @@ mod tests {
             None,
             Some("granted"),
             None,
+            false,
             &quiet_out(),
         )
         .unwrap();

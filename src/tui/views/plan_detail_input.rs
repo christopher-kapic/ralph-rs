@@ -467,7 +467,10 @@ mod tests {
     #[test]
     fn test_d_returns_delete_with_cursor_target() {
         let mut app = make_app(3);
-        app.selected_index = 2;
+        // Drive the outline cursor (the source of truth the cursor-target
+        // helpers resolve through), mirroring the real input path.
+        app.outline.set_cursor(2);
+        app.realign_selection_to_outline();
         let action = handle_key(&mut app, key(KeyCode::Char('d')));
         assert_eq!(action, InputAction::Delete(vec!["s2".to_string()]));
     }
@@ -496,7 +499,8 @@ mod tests {
     #[test]
     fn test_r_returns_reset_for_cursor_step() {
         let mut app = make_app(3);
-        app.selected_index = 1;
+        app.outline.set_cursor(1);
+        app.realign_selection_to_outline();
         let action = handle_key(&mut app, key(KeyCode::Char('r')));
         assert_eq!(action, InputAction::Reset("s1".to_string()));
     }
