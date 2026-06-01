@@ -99,7 +99,11 @@ pub fn parse_review_verdict(stdout: &str) -> ReviewVerdict {
             // pass-with-caveats line must fall through to the fail-safe rather
             // than silently passing un-reviewed work. A non-matching line just
             // keeps the bottom-up scan going.
-            if !rest.chars().next().is_some_and(|c| c.is_ascii_alphanumeric()) {
+            if !rest
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric())
+            {
                 return ReviewVerdict::Pass;
             }
         }
