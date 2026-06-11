@@ -165,14 +165,20 @@ pub enum Command {
         #[arg(long)]
         harness: Option<String>,
 
-        /// Reclaim a held run lock even if the previous runner still appears alive (use only if you know the other process is gone).
-        #[arg(long)]
+        /// Deprecated no-op compatibility flag. Skip no longer acquires or
+        /// steals the run lock; in-flight skips use the DB bridge.
+        #[arg(long, hide = true)]
         force: bool,
 
         /// Print the full per-attempt prompt to stderr instead of the
         /// truncated 512-char preview.
         #[arg(long, short = 'v')]
         verbose: bool,
+
+        /// Do not enable terminal mouse capture in TUI mode. This leaves
+        /// native terminal selection/copy behavior available.
+        #[arg(long = "no-mouse")]
+        no_mouse: bool,
     },
 
     /// Resume a plan from the last failed or in-progress step.
@@ -180,9 +186,14 @@ pub enum Command {
         /// Plan slug to resume. Defaults to the active plan.
         plan: Option<String>,
 
-        /// Reclaim a held run lock even if the previous runner still appears alive (use only if you know the other process is gone).
+        /// Reclaim a stale run lock before resuming (use only if the previous runner is gone).
         #[arg(long)]
         force: bool,
+
+        /// Do not enable terminal mouse capture in TUI mode. This leaves
+        /// native terminal selection/copy behavior available.
+        #[arg(long = "no-mouse")]
+        no_mouse: bool,
     },
 
     /// Request a graceful pause: the active runner finishes the current step,
@@ -225,9 +236,9 @@ pub enum Command {
         /// Plan slug. Defaults to the active plan.
         plan: Option<String>,
 
-        /// Step number to skip (1-based). Defaults to current step.
+        /// Step number or 8-character short id to skip. Defaults to current step.
         #[arg(long)]
-        step: Option<usize>,
+        step: Option<String>,
 
         /// Reason for skipping.
         #[arg(long)]
@@ -239,8 +250,8 @@ pub enum Command {
         #[arg(long, value_enum, default_value_t = ChangeHandling::Stash)]
         changes: ChangeHandling,
 
-        /// Reclaim a held run lock even if the previous runner still appears alive (use only if you know the other process is gone).
-        #[arg(long)]
+        /// Deprecated compatibility flag; skip no longer owns run-lock reclaim.
+        #[arg(long, hide = true)]
         force: bool,
     },
 
@@ -288,9 +299,9 @@ pub enum Command {
         /// Plan slug. Defaults to the active plan.
         plan: Option<String>,
 
-        /// Step number (1-based) to show logs for.
+        /// Step number or 8-character short id to show logs for.
         #[arg(long)]
-        step: Option<usize>,
+        step: Option<String>,
 
         /// Maximum number of log entries to show.
         #[arg(long, short)]
@@ -1211,11 +1222,11 @@ pub enum QuestionCommand {
     /// Legacy alias for `ralph interruption resolve --answer`.
     ///
     /// Kept for one release as the V26 compatibility bridge documented in
-    /// `docs/dag-redesign.md`. Accepts the same 1-based list index legacy
-    /// `question answer` used, but also works with a direct interruption id.
+    /// `docs/dag-redesign.md`. Mutating answers require a direct interruption
+    /// id; numeric list indexes are display-only because lists can change.
     Answer {
-        /// Interruption id (a uuid) OR its 1-based index in
-        /// `ralph question list` / `ralph interruption list`.
+        /// Interruption id (a uuid). Use `ralph interruption show <index>` to
+        /// inspect/copy an id from a numbered list.
         id: String,
 
         /// Freeform answer/resolution text.
@@ -1260,8 +1271,8 @@ pub enum InterruptionCommand {
     /// current project.
     ///
     /// Numbered 1..N, ordered `asked_at` ASC then `id` so an index is
-    /// stable as new interruptions arrive. The number OR the interruption
-    /// id is accepted by `interruption show` / `interruption resolve`.
+    /// stable as new interruptions arrive. The number is accepted by
+    /// `interruption show`; mutating `interruption resolve` requires the id.
     List {
         /// Filter to interruptions on a specific plan slug.
         plan: Option<String>,
@@ -1271,19 +1282,16 @@ pub enum InterruptionCommand {
     /// priority), and resolution state.
     ///
     /// Accepts an optional leading [PLAN] positional (consistent with
-    /// `interruption list`, `status`, `log`, `run`, etc.). When PLAN is
-    /// supplied the selector <id|index> is resolved only against that
-    /// plan's open interruptions (so "1" is the first open item *on that
-    /// plan*).
+    /// `interruption list`, `status`, `log`, `run`, etc.). PLAN is accepted
+    /// for command-shape consistency, but mutating resolution still requires
+    /// the stable interruption id rather than a numeric list index.
     #[command(allow_missing_positional = true)]
     Show {
-        /// Optional plan slug. When supplied, <id|index> resolution + index
-        /// numbering are scoped to this plan only.
+        /// Optional plan slug.
         plan: Option<String>,
 
-        /// Interruption id (a uuid) OR its 1-based index in
-        /// `ralph interruption list` (or the plan-scoped list when PLAN
-        /// is given).
+        /// Interruption id (a uuid). Numeric list indexes are accepted by
+        /// `interruption show`, not by mutating resolve.
         id: String,
     },
 
@@ -1503,6 +1511,10 @@ pub enum HooksCommand {
         /// Overwrite existing hooks on name collision.
         #[arg(long)]
         force: bool,
+
+        /// Trust and install the shell commands in this hook bundle.
+        #[arg(long)]
+        trust: bool,
     },
 }
 
@@ -2108,6 +2120,26 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_run_no_mouse() {
+        let cli = Cli::try_parse_from(["ralph-rs", "run", "--no-mouse"]).unwrap();
+        if let Command::Run { no_mouse, .. } = cli.command.unwrap() {
+            assert!(no_mouse);
+        } else {
+            panic!("Expected Run");
+        }
+    }
+
+    #[test]
+    fn test_parse_resume_no_mouse() {
+        let cli = Cli::try_parse_from(["ralph-rs", "resume", "--no-mouse"]).unwrap();
+        if let Command::Resume { no_mouse, .. } = cli.command.unwrap() {
+            assert!(no_mouse);
+        } else {
+            panic!("Expected Resume");
+        }
+    }
+
+    #[test]
     fn test_parse_plan_create_with_deps() {
         let cli = Cli::try_parse_from([
             "ralph-rs",
@@ -2322,10 +2354,45 @@ mod tests {
     fn test_parse_skip() {
         let cli = Cli::try_parse_from(["ralph-rs", "skip", "--step", "3"]).unwrap();
         if let Command::Skip { step, .. } = cli.command.unwrap() {
-            assert_eq!(step, Some(3));
+            assert_eq!(step.as_deref(), Some("3"));
         } else {
             panic!("Expected Skip");
         }
+    }
+
+    #[test]
+    fn test_parse_skip_short_id() {
+        let cli = Cli::try_parse_from(["ralph-rs", "skip", "--step", "abcDEF12"]).unwrap();
+        if let Command::Skip { step, .. } = cli.command.unwrap() {
+            assert_eq!(step.as_deref(), Some("abcDEF12"));
+        } else {
+            panic!("Expected Skip");
+        }
+    }
+
+    #[test]
+    fn test_parse_skip_force_hidden_compat_flag() {
+        let cli = Cli::try_parse_from(["ralph-rs", "skip", "--force"]).unwrap();
+        if let Command::Skip { force, .. } = cli.command.unwrap() {
+            assert!(force);
+        } else {
+            panic!("Expected Skip");
+        }
+    }
+
+    #[test]
+    fn test_skip_force_hidden_from_help() {
+        let mut cmd = Cli::command();
+        let skip = cmd
+            .find_subcommand_mut("skip")
+            .expect("skip subcommand exists");
+        let mut help = Vec::new();
+        skip.write_long_help(&mut help).unwrap();
+        let rendered = String::from_utf8(help).unwrap();
+        assert!(
+            !rendered.contains("--force"),
+            "deprecated skip --force must stay parseable but hidden from help:\n{rendered}"
+        );
     }
 
     #[test]
@@ -2418,7 +2485,19 @@ mod tests {
     fn test_parse_log() {
         let cli = Cli::try_parse_from(["ralph-rs", "log", "--step", "2", "--limit", "10"]).unwrap();
         if let Command::Log { step, limit, .. } = cli.command.unwrap() {
-            assert_eq!(step, Some(2));
+            assert_eq!(step.as_deref(), Some("2"));
+            assert_eq!(limit, Some(10));
+        } else {
+            panic!("Expected Log");
+        }
+    }
+
+    #[test]
+    fn test_parse_log_short_id() {
+        let cli = Cli::try_parse_from(["ralph-rs", "log", "--step", "abcDEF12", "--limit", "10"])
+            .unwrap();
+        if let Command::Log { step, limit, .. } = cli.command.unwrap() {
+            assert_eq!(step.as_deref(), Some("abcDEF12"));
             assert_eq!(limit, Some(10));
         } else {
             panic!("Expected Log");

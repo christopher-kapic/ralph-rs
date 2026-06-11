@@ -3,7 +3,9 @@
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::fs;
+use std::fs::OpenOptions;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config;
 
@@ -47,6 +49,10 @@ const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
     migrate_v35,
     migrate_v36,
     migrate_v37,
+    migrate_v38,
+    migrate_v39,
+    migrate_v40,
+    migrate_v41,
 ];
 
 /// Current schema version — derived from the length of `MIGRATIONS` so that
@@ -72,8 +78,25 @@ pub fn open() -> Result<Connection> {
 
 /// Opens a database at the given path and runs migrations.
 /// Useful for testing with a custom path.
-fn open_at<P: AsRef<std::path::Path>>(path: P) -> Result<Connection> {
+pub(crate) fn open_at<P: AsRef<std::path::Path>>(path: P) -> Result<Connection> {
     let path = path.as_ref();
+    #[cfg(unix)]
+    if !path.exists() {
+        use std::os::unix::fs::OpenOptionsExt;
+        match OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)
+        {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("Failed to create database at {}", path.display()));
+            }
+        }
+    }
     let conn = Connection::open(path)
         .with_context(|| format!("Failed to open database at {}", path.display()))?;
 
@@ -96,8 +119,16 @@ fn open_at<P: AsRef<std::path::Path>>(path: P) -> Result<Connection> {
             .with_context(|| format!("Failed to chmod database at {}", path.display()))?;
     }
 
-    // Enable foreign keys — must happen outside any transaction and on every connection.
-    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    // Enable WAL for multi-process TUI/runner/CLI concurrency. NORMAL is the
+    // standard WAL pairing: durable enough for this local state DB without
+    // forcing a full fsync on every transaction.
+    conn.execute_batch(
+        "
+        PRAGMA journal_mode = WAL;
+        PRAGMA synchronous = NORMAL;
+        PRAGMA foreign_keys = ON;
+        ",
+    )?;
 
     run_migrations(&conn)?;
     Ok(conn)
@@ -112,41 +143,91 @@ pub fn open_memory() -> Result<Connection> {
     Ok(conn)
 }
 
-/// Run `f` inside a single DEFERRED transaction over a shared `&Connection`.
+/// Run `f` inside a transaction over a shared `&Connection`.
 ///
-/// Commits when `f` returns `Ok`; on `Err` (or a panic / early `?`) the
-/// `Transaction` is dropped without `commit`, and rusqlite issues the
-/// `ROLLBACK` via its `Drop` impl — so a rollback path can never be
-/// missed or forgotten the way the hand-rolled `BEGIN;`/`COMMIT;`/
-/// `ROLLBACK;` `execute_batch` triples could. `unchecked_transaction`
-/// (not `transaction`) is used deliberately: the storage / command /
-/// review layers thread a shared `&Connection`, so requiring `&mut` only
-/// to open a transaction would force churn through every caller.
+/// Top-level calls use `BEGIN IMMEDIATE` so writers acquire the SQLite write
+/// lock up front. Nested calls use a uniquely named `SAVEPOINT`, which keeps
+/// storage helpers composable: a self-transactional helper can be called from
+/// a larger atomic operation without tripping "cannot start a transaction
+/// within a transaction", and an inner error rolls back only the savepoint.
 ///
 /// Two sites intentionally keep explicit blocks rather than this helper:
-/// the migration runner (single-threaded startup that must also bump
-/// `user_version` in the same transaction) and the run-lock
-/// (`BEGIN IMMEDIATE` — it must grab the write lock up front for the lock
-/// protocol; this helper is DEFERRED).
+/// the migration runner (it hand-rolls `BEGIN IMMEDIATE`, re-checks
+/// `user_version`, and bumps it in the same transaction) and the run-lock
+/// (it has extra stale-lock recovery work around its `BEGIN IMMEDIATE`).
 pub fn with_tx<T>(conn: &Connection, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-    let tx = conn
-        .unchecked_transaction()
+    if !conn.is_autocommit() {
+        return with_savepoint(conn, f);
+    }
+
+    struct RollbackGuard<'a> {
+        conn: &'a Connection,
+        active: bool,
+    }
+    impl Drop for RollbackGuard<'_> {
+        fn drop(&mut self) {
+            if self.active {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+            }
+        }
+    }
+
+    conn.execute_batch("BEGIN IMMEDIATE;")
         .context("Failed to begin transaction")?;
-    let out = f(&tx)?;
-    tx.commit().context("Failed to commit transaction")?;
+    let mut guard = RollbackGuard { conn, active: true };
+    let out = f(conn)?;
+    conn.execute_batch("COMMIT;")
+        .context("Failed to commit transaction")?;
+    guard.active = false;
+    Ok(out)
+}
+
+fn with_savepoint<T>(conn: &Connection, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    struct SavepointGuard<'a> {
+        conn: &'a Connection,
+        name: String,
+        active: bool,
+    }
+    impl Drop for SavepointGuard<'_> {
+        fn drop(&mut self) {
+            if self.active {
+                let _ = self.conn.execute_batch(&format!(
+                    "ROLLBACK TO {}; RELEASE {};",
+                    self.name, self.name
+                ));
+            }
+        }
+    }
+
+    static SAVEPOINT_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let name = format!(
+        "ralph_nested_tx_{}",
+        SAVEPOINT_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    conn.execute_batch(&format!("SAVEPOINT {name};"))
+        .context("Failed to create nested transaction savepoint")?;
+    let mut guard = SavepointGuard {
+        conn,
+        name,
+        active: true,
+    };
+    let out = f(conn)?;
+    conn.execute_batch(&format!("RELEASE {};", guard.name))
+        .context("Failed to release nested transaction savepoint")?;
+    guard.active = false;
     Ok(out)
 }
 
 /// Run all pending migrations in order, each inside its own transaction.
 fn run_migrations(conn: &Connection) -> Result<()> {
-    let current: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-
     for (i, migration) in MIGRATIONS.iter().enumerate() {
         let version = (i as u32) + 1;
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let current: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version <= current {
+            conn.execute_batch("COMMIT;")?;
             continue;
         }
-        conn.execute_batch("BEGIN;")?;
         match migration(conn) {
             Ok(()) => {
                 conn.pragma_update(None, "user_version", version)?;
@@ -231,6 +312,7 @@ fn migrate_v1(conn: &Connection) -> Result<()> {
 
         CREATE INDEX idx_logs_step_id ON execution_logs(step_id);
         CREATE INDEX idx_logs_step_attempt ON execution_logs(step_id, attempt);
+        CREATE INDEX IF NOT EXISTS idx_logs_step_started_at ON execution_logs(step_id, started_at);
         ",
     )?;
     Ok(())
@@ -628,6 +710,28 @@ fn migrate_v17(conn: &Connection) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Migration V18: pause_requested column on plans (graceful between-step pause)
+// ---------------------------------------------------------------------------
+
+fn migrate_v18(conn: &Connection) -> Result<()> {
+    // `plans.pause_requested` lets the user (via the TUI `P` keybinding or
+    // `ralph pause` CLI) ask the runner to stop after the currently-executing
+    // step finishes — distinct from the immediate SIGTERM-on-`S` path. The
+    // runner inspects it between steps and exits with
+    // `TerminationReason::PausedByUser`, clearing the flag in the same
+    // transaction so a subsequent `ralph resume` doesn't immediately re-pause.
+    //
+    // Stored as INTEGER (0/1) because SQLite has no native bool. NOT NULL
+    // with DEFAULT 0 keeps every pre-V18 row explicitly opted-out.
+    conn.execute_batch(
+        "
+        ALTER TABLE plans ADD COLUMN pause_requested INTEGER NOT NULL DEFAULT 0;
+        ",
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Migration V19: last_run_branch column on plans (branch-based resume resolver)
 // ---------------------------------------------------------------------------
 
@@ -647,28 +751,6 @@ fn migrate_v19(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
         ALTER TABLE plans ADD COLUMN last_run_branch TEXT;
-        ",
-    )?;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Migration V18: pause_requested column on plans (graceful between-step pause)
-// ---------------------------------------------------------------------------
-
-fn migrate_v18(conn: &Connection) -> Result<()> {
-    // `plans.pause_requested` lets the user (via the TUI `P` keybinding or
-    // `ralph pause` CLI) ask the runner to stop after the currently-executing
-    // step finishes — distinct from the immediate SIGTERM-on-`S` path. The
-    // runner inspects it between steps and exits with
-    // `TerminationReason::PausedByUser`, clearing the flag in the same
-    // transaction so a subsequent `ralph resume` doesn't immediately re-pause.
-    //
-    // Stored as INTEGER (0/1) because SQLite has no native bool. NOT NULL
-    // with DEFAULT 0 keeps every pre-V18 row explicitly opted-out.
-    conn.execute_batch(
-        "
-        ALTER TABLE plans ADD COLUMN pause_requested INTEGER NOT NULL DEFAULT 0;
         ",
     )?;
     Ok(())
@@ -1498,6 +1580,150 @@ fn migrate_v37(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Migration V38: preserve-list persistence for parked step worktrees
+// ---------------------------------------------------------------------------
+
+fn migrate_v38(conn: &Connection) -> Result<()> {
+    // V34 persisted the stash pointer and staged-file split for an interrupted
+    // step, but not the pre-step untracked preserve list that was used when
+    // creating the stash. If the step is restored and later parks again, the
+    // executor must keep excluding that same original user-owned scratch rather
+    // than recomputing from the already-restored worktree. Defaulting old rows
+    // to [] is the only honest upgrade path; new parked rows store the list.
+    conn.execute_batch(
+        "ALTER TABLE step_parked_worktrees \
+         ADD COLUMN preserve_files TEXT NOT NULL DEFAULT '[]';",
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V39: reject step moves that would break plan-local dependencies
+// ---------------------------------------------------------------------------
+
+fn migrate_v39(conn: &Connection) -> Result<()> {
+    // V31 enforced same-plan edges for inserts/updates to step_dependencies,
+    // but a raw `UPDATE steps SET plan_id = ...` could move an already-linked
+    // step and make those edges cross-plan after the fact. No live storage
+    // path moves steps between plans, but the DB boundary should still defend
+    // the invariant for ad-hoc SQL and future tooling.
+    conn.execute_batch(
+        "
+        CREATE TRIGGER steps_plan_move_keeps_outgoing_dependencies
+        BEFORE UPDATE OF plan_id ON steps
+        FOR EACH ROW
+        WHEN EXISTS (
+            SELECT 1
+            FROM step_dependencies sd
+            JOIN steps dep ON dep.id = sd.depends_on_step_id
+            WHERE sd.step_id = NEW.id
+              AND dep.plan_id IS NOT NEW.plan_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'step dependencies must stay within one plan');
+        END;
+
+        CREATE TRIGGER steps_plan_move_keeps_incoming_dependencies
+        BEFORE UPDATE OF plan_id ON steps
+        FOR EACH ROW
+        WHEN EXISTS (
+            SELECT 1
+            FROM step_dependencies sd
+            JOIN steps child ON child.id = sd.step_id
+            WHERE sd.depends_on_step_id = NEW.id
+              AND child.plan_id IS NOT NEW.plan_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'step dependencies must stay within one plan');
+        END;
+        ",
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V40: enforce corrective-step pointers at the DB boundary
+// ---------------------------------------------------------------------------
+
+fn migrate_v40(conn: &Connection) -> Result<()> {
+    // Storage paths already clear `corrects_step_id` when the referenced step
+    // is deleted. These triggers close the remaining raw-SQL/future-tooling
+    // gaps: a corrective pointer must reference an existing peer in the same
+    // plan, and a step cannot point at itself.
+    conn.execute_batch(
+        "
+        UPDATE steps
+           SET corrects_step_id = NULL
+         WHERE corrects_step_id IS NOT NULL
+           AND (
+                corrects_step_id = id
+                OR NOT EXISTS (
+                    SELECT 1
+                      FROM steps corrected
+                     WHERE corrected.id = steps.corrects_step_id
+                       AND corrected.plan_id = steps.plan_id
+                )
+           );
+
+        CREATE TRIGGER steps_corrects_step_insert_valid
+        BEFORE INSERT ON steps
+        FOR EACH ROW
+        WHEN NEW.corrects_step_id IS NOT NULL
+             AND (
+                 NEW.corrects_step_id = NEW.id
+                 OR NOT EXISTS (
+                     SELECT 1
+                       FROM steps corrected
+                      WHERE corrected.id = NEW.corrects_step_id
+                        AND corrected.plan_id = NEW.plan_id
+                 )
+             )
+        BEGIN
+            SELECT RAISE(ABORT, 'corrective step pointer must reference another step in the same plan');
+        END;
+
+        CREATE TRIGGER steps_corrects_step_update_valid
+        BEFORE UPDATE OF plan_id, corrects_step_id ON steps
+        FOR EACH ROW
+        WHEN NEW.corrects_step_id IS NOT NULL
+             AND (
+                 NEW.corrects_step_id = NEW.id
+                 OR NOT EXISTS (
+                     SELECT 1
+                       FROM steps corrected
+                      WHERE corrected.id = NEW.corrects_step_id
+                        AND corrected.plan_id = NEW.plan_id
+                 )
+             )
+        BEGIN
+            SELECT RAISE(ABORT, 'corrective step pointer must reference another step in the same plan');
+        END;
+
+        CREATE TRIGGER steps_corrects_step_delete_cleanup
+        AFTER DELETE ON steps
+        FOR EACH ROW
+        BEGIN
+            UPDATE steps SET corrects_step_id = NULL WHERE corrects_step_id = OLD.id;
+        END;
+        ",
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V41: covering index for plan-list recency aggregation
+// ---------------------------------------------------------------------------
+
+fn migrate_v41(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        CREATE INDEX IF NOT EXISTS idx_logs_step_started_at ON execution_logs(step_id, started_at);
+        ",
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1517,6 +1743,78 @@ mod tests {
             .pragma_query_value(None, "foreign_keys", |row| row.get(0))
             .expect("foreign_keys");
         assert_eq!(fk, 1);
+    }
+
+    #[test]
+    fn with_tx_uses_immediate_transaction_behavior() {
+        let src = include_str!("db.rs");
+        let start = src
+            .find("pub fn with_tx")
+            .expect("with_tx helper should exist");
+        let body = &src[start..];
+        assert!(
+            body.contains("BEGIN IMMEDIATE;"),
+            "with_tx must acquire the write lock up front to avoid DEFERRED lock-upgrade BUSY failures"
+        );
+        assert!(
+            body.contains("ROLLBACK;"),
+            "with_tx must still roll back if the closure returns an error or panics"
+        );
+    }
+
+    #[test]
+    fn with_tx_allows_nested_savepoint_commit() {
+        let conn = open_memory().expect("open_memory");
+        conn.execute("CREATE TEMP TABLE nested_tx_test (value TEXT)", [])
+            .unwrap();
+
+        with_tx(&conn, |conn| {
+            conn.execute("INSERT INTO nested_tx_test (value) VALUES ('outer')", [])?;
+            with_tx(conn, |conn| {
+                conn.execute("INSERT INTO nested_tx_test (value) VALUES ('inner')", [])?;
+                Ok(())
+            })?;
+            Ok(())
+        })
+        .unwrap();
+
+        let values: Vec<String> = conn
+            .prepare("SELECT value FROM nested_tx_test ORDER BY rowid")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(values, vec!["outer", "inner"]);
+    }
+
+    #[test]
+    fn with_tx_nested_error_rolls_back_only_savepoint() {
+        let conn = open_memory().expect("open_memory");
+        conn.execute("CREATE TEMP TABLE nested_tx_test (value TEXT)", [])
+            .unwrap();
+
+        with_tx(&conn, |conn| {
+            conn.execute("INSERT INTO nested_tx_test (value) VALUES ('outer')", [])?;
+            let err = with_tx(conn, |conn| -> Result<()> {
+                conn.execute("INSERT INTO nested_tx_test (value) VALUES ('inner')", [])?;
+                anyhow::bail!("inner failed")
+            })
+            .expect_err("inner savepoint should surface its error");
+            assert!(err.to_string().contains("inner failed"));
+            conn.execute("INSERT INTO nested_tx_test (value) VALUES ('after')", [])?;
+            Ok(())
+        })
+        .unwrap();
+
+        let values: Vec<String> = conn
+            .prepare("SELECT value FROM nested_tx_test ORDER BY rowid")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(values, vec!["outer", "after"]);
     }
 
     #[test]
@@ -1554,6 +1852,7 @@ mod tests {
             // V1
             "idx_logs_step_attempt",
             "idx_logs_step_id",
+            "idx_logs_step_started_at",
             "idx_plans_project",
             "idx_plans_project_status",
             "idx_steps_plan_id",
@@ -3473,8 +3772,20 @@ mod tests {
         conn.execute(
             "INSERT INTO steps \
                  (id, plan_id, sort_key, title, description, review_enabled, review_status, corrects_step_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            rusqlite::params!["s2", "p2", "a0", "Step", "d", 0_i64, "passed", "s1"],
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL),
+                    (?6, ?2, ?7, ?4, ?5, ?8, ?9, ?10)",
+            rusqlite::params![
+                "s2_reviewed",
+                "p2",
+                "a0",
+                "Step",
+                "d",
+                "s2",
+                "b0",
+                0_i64,
+                "passed",
+                "s2_reviewed"
+            ],
         )
         .unwrap();
         let plan_re2: Option<i64> = conn
@@ -3494,7 +3805,7 @@ mod tests {
         assert_eq!(plan_re2, Some(1));
         assert_eq!(step_re2, Some(0));
         assert_eq!(step_rstat2.as_deref(), Some("passed"));
-        assert_eq!(step_corrects2.as_deref(), Some("s1"));
+        assert_eq!(step_corrects2.as_deref(), Some("s2_reviewed"));
 
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
@@ -4104,6 +4415,166 @@ mod tests {
             err.to_string()
                 .contains("step dependencies must stay within one plan"),
             "unexpected update-trigger error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_migration_v39_rejects_step_plan_moves_that_break_dependencies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old_v38.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        for (i, migration) in MIGRATIONS.iter().enumerate().take(38) {
+            let version = (i as u32) + 1;
+            conn.execute_batch("BEGIN;").unwrap();
+            migration(&conn).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            conn.execute_batch("COMMIT;").unwrap();
+        }
+
+        conn.execute_batch(
+            "
+            INSERT INTO plans (id, slug, project, branch_name, description)
+            VALUES ('p1', 'p1', '/proj', 'b', 'd'),
+                   ('p2', 'p2', '/proj', 'b', 'd');
+            INSERT INTO steps (id, plan_id, sort_key, title, description, acceptance_criteria, short_id)
+            VALUES ('s1', 'p1', 'a', 's1', 'd', '[]', 'aaaaaaaa'),
+                   ('s2', 'p1', 'b', 's2', 'd', '[]', 'bbbbbbbb'),
+                   ('s3', 'p1', 'c', 's3', 'd', '[]', 'cccccccc');
+            INSERT INTO step_dependencies (step_id, depends_on_step_id)
+            VALUES ('s2', 's1');
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let conn = open_at(&path).unwrap();
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+
+        let err = conn
+            .execute("UPDATE steps SET plan_id = 'p2' WHERE id = 's2'", [])
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("step dependencies must stay within one plan"),
+            "unexpected outgoing dependency move error: {err}"
+        );
+
+        let err = conn
+            .execute("UPDATE steps SET plan_id = 'p2' WHERE id = 's1'", [])
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("step dependencies must stay within one plan"),
+            "unexpected incoming dependency move error: {err}"
+        );
+
+        conn.execute("UPDATE steps SET plan_id = 'p2' WHERE id = 's3'", [])
+            .unwrap();
+    }
+
+    #[test]
+    fn test_migration_v40_enforces_corrective_step_pointers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old_v39.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        for (i, migration) in MIGRATIONS.iter().enumerate().take(39) {
+            let version = (i as u32) + 1;
+            conn.execute_batch("BEGIN;").unwrap();
+            migration(&conn).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            conn.execute_batch("COMMIT;").unwrap();
+        }
+
+        conn.execute_batch(
+            "
+            INSERT INTO plans (id, slug, project, branch_name, description)
+            VALUES ('p1', 'p1', '/proj', 'b', 'd'),
+                   ('p2', 'p2', '/proj', 'b', 'd');
+            INSERT INTO steps (id, plan_id, sort_key, title, description, acceptance_criteria, short_id, corrects_step_id)
+            VALUES ('s1', 'p1', 'a', 's1', 'd', '[]', 'aaaaaaaa', NULL),
+                   ('s2', 'p1', 'b', 's2', 'd', '[]', 'bbbbbbbb', 's1'),
+                   ('s3', 'p1', 'c', 's3', 'd', '[]', 'cccccccc', 'missing'),
+                   ('s4', 'p1', 'd', 's4', 'd', '[]', 'dddddddd', 's4'),
+                   ('s5', 'p2', 'a', 's5', 'd', '[]', 'eeeeeeee', NULL),
+                   ('s6', 'p1', 'e', 's6', 'd', '[]', 'ffffffff', 's5');
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let conn = open_at(&path).unwrap();
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+
+        let valid: Option<String> = conn
+            .query_row(
+                "SELECT corrects_step_id FROM steps WHERE id = 's2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(valid.as_deref(), Some("s1"));
+
+        for id in ["s3", "s4", "s6"] {
+            let cleaned: Option<String> = conn
+                .query_row(
+                    "SELECT corrects_step_id FROM steps WHERE id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(cleaned, None, "V40 should clean invalid pointer for {id}");
+        }
+
+        for (sql, params) in [
+            (
+                "UPDATE steps SET corrects_step_id = ?1 WHERE id = ?2",
+                ["missing", "s2"],
+            ),
+            (
+                "UPDATE steps SET corrects_step_id = ?1 WHERE id = ?2",
+                ["s2", "s2"],
+            ),
+            (
+                "UPDATE steps SET corrects_step_id = ?1 WHERE id = ?2",
+                ["s5", "s2"],
+            ),
+        ] {
+            let err = conn.execute(sql, params).unwrap_err();
+            assert!(
+                err.to_string().contains(
+                    "corrective step pointer must reference another step in the same plan"
+                ),
+                "unexpected corrective pointer trigger error: {err}"
+            );
+        }
+
+        conn.execute(
+            "UPDATE steps SET corrects_step_id = 's1' WHERE id = 's2'",
+            [],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM steps WHERE id = 's1'", [])
+            .unwrap();
+        let cleaned: Option<String> = conn
+            .query_row(
+                "SELECT corrects_step_id FROM steps WHERE id = 's2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            cleaned, None,
+            "deleting the reviewed step must not leave dangling correction pointers"
         );
     }
 

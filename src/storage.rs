@@ -22,14 +22,32 @@ use crate::run_lock::{LIVE_RUN_COLUMNS, LiveRun};
 /// dozen scattered SELECTs.
 const STEP_COLUMNS: &str = "id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason, change_policy, tags, short_id, review_enabled, review_status, corrects_step_id, current_cycle_index";
 
+/// Canonical column list for `SELECT` queries against `execution_logs`.
+///
+/// The order matches [`ExecutionLog::from_row`]. Keep every log-reader query
+/// on this list so new execution-log columns do not require hand-updating
+/// several positional SELECTs and custom mappers.
+const EXECUTION_LOG_COLUMNS: &str = "id, step_id, attempt, started_at, duration_secs, prompt_text, diff, test_results, rolled_back, committed, commit_hash, harness_stdout, harness_stderr, cost_usd, input_tokens, output_tokens, session_id, termination_reason, test_status, cycle_index";
+
+fn prefixed_execution_log_columns(alias: &str) -> String {
+    EXECUTION_LOG_COLUMNS
+        .split(", ")
+        .map(|c| format!("{alias}.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Durably parked working-tree state for a step paused on a human-side
 /// interruption. The stash SHA identifies the parked git stash entry;
 /// `staged_files` records which paths were staged when the worktree was
 /// parked so a failed parking attempt can reconstruct the original state.
+/// `preserve_files` is the original pre-step untracked snapshot that must
+/// stay outside any later re-park of this same interrupted step.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParkedWorktreeState {
     pub stash_sha: String,
     pub staged_files: Vec<String>,
+    pub preserve_files: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -672,13 +690,17 @@ pub fn clear_skip_request(conn: &Connection, plan_id: &str) -> Result<()> {
 /// step. Used by the executor's `Completed` arm to tidy a request for the step
 /// that just finished naturally without clobbering a request a concurrent
 /// `ralph skip` queued for a different, not-yet-running step.
-pub fn clear_skip_request_for_step(conn: &Connection, plan_id: &str, step_id: &str) -> Result<()> {
-    conn.execute(
+pub fn clear_skip_request_for_step(
+    conn: &Connection,
+    plan_id: &str,
+    step_id: &str,
+) -> Result<bool> {
+    let affected = conn.execute(
         "UPDATE plans SET skip_requested_step_id = NULL, skip_changes = NULL \
          WHERE id = ?1 AND skip_requested_step_id = ?2",
         params![plan_id, step_id],
     )?;
-    Ok(())
+    Ok(affected > 0)
 }
 
 /// One open interruption enriched with the plan + step context the CLI
@@ -743,8 +765,11 @@ fn list_open_interruptions_enriched_impl(
         JOIN step_pos sp ON sp.id = i.step_id
         WHERE i.state = 'open' AND p.project = ?1",
     );
-    if let Some(k) = kind_filter {
-        base.push_str(&format!(" AND i.kind = '{}'", k.as_str()));
+    let kind_filter_str = kind_filter.map(|k| k.as_str());
+    if kind_filter_str.is_some() {
+        let kind_param = if plan_slug.is_some() { "?3" } else { "?2" };
+        base.push_str(" AND i.kind = ");
+        base.push_str(kind_param);
     }
 
     let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<OpenQuestion> {
@@ -786,16 +811,30 @@ fn list_open_interruptions_enriched_impl(
     if let Some(slug) = plan_slug {
         let sql = format!("{base} AND p.slug = ?2 ORDER BY i.asked_at ASC, i.id ASC");
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![project, slug], map_row)?;
-        for row in rows {
-            out.push(row?);
+        if let Some(kind) = kind_filter_str {
+            let rows = stmt.query_map(params![project, slug, kind], map_row)?;
+            for row in rows {
+                out.push(row?);
+            }
+        } else {
+            let rows = stmt.query_map(params![project, slug], map_row)?;
+            for row in rows {
+                out.push(row?);
+            }
         }
     } else {
         let sql = format!("{base} ORDER BY i.asked_at ASC, i.id ASC");
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![project], map_row)?;
-        for row in rows {
-            out.push(row?);
+        if let Some(kind) = kind_filter_str {
+            let rows = stmt.query_map(params![project, kind], map_row)?;
+            for row in rows {
+                out.push(row?);
+            }
+        } else {
+            let rows = stmt.query_map(params![project], map_row)?;
+            for row in rows {
+                out.push(row?);
+            }
         }
     }
     Ok(out)
@@ -1055,12 +1094,12 @@ pub struct InboxRow {
 /// keeps visible but dimmed for recent context (§12.3). `resolved_limit`
 /// bounds the trailing resolved tail so the inbox doesn't grow unbounded.
 ///
-/// The bound is **SQL-side**: a `UNION ALL` of "all open rows (oldest
-/// first)" + "the most-recent `resolved_limit` resolved rows" — neither
-/// branch ever fetches a row past its own bound. The pre-fix implementation
-/// pulled *every* row in the project and discarded the post-limit resolved
-/// tail in Rust, which scaled poorly once a project accumulated thousands
-/// of resolved interruptions. The Rust side is now a thin row-mapper.
+/// The bound is **SQL-side**: the open query fetches all open rows (oldest
+/// first), and the resolved query fetches only the most-recent
+/// `resolved_limit` rows. The pre-fix implementation pulled *every* row in
+/// the project and discarded the post-limit resolved tail in Rust, which
+/// scaled poorly once a project accumulated thousands of resolved
+/// interruptions. The Rust side is now a thin row-mapper.
 pub fn list_inbox_rows(
     conn: &Connection,
     project: &str,
@@ -1071,25 +1110,17 @@ pub fn list_inbox_rows(
         .map(|c| format!("i.{c}"))
         .collect::<Vec<_>>()
         .join(", ");
-    // Open branch + resolved branch UNION ALL'd; each branch carries its
-    // own ORDER BY + (for resolved) LIMIT, and a final ORDER BY on a
-    // synthesized `bucket` column re-imposes the "open first, then
-    // resolved" wrapper. Open rows order by `asked_at ASC` (oldest first,
-    // the §12.3 inbox UX); resolved rows order by `resolved_at DESC`
-    // (most-recently resolved first) — same ordering the Rust filter
-    // produced post-fetch, now done by SQLite.
-    //
-    // `resolved_limit = 0` legitimately means "no resolved tail" — the
-    // resolved branch's LIMIT 0 returns nothing and the Rust loop never
-    // sees a resolved row.
     // Two prepared statements (open, resolved) executed back-to-back —
     // simpler than a UNION ALL that would need a column shift to keep
     // `Interruption::from_row` happy, and gives the resolved branch its
     // own `LIMIT ?` natively without juggling parameter positions across
     // dialect quirks. Both queries share the same projection shape, so
-    // the row mapper is one closure.
+    // the row mapper is one closure. Open rows order by `asked_at ASC`
+    // (oldest first, the §12.3 inbox UX); resolved rows order by
+    // `resolved_at DESC` (most-recently resolved first). `resolved_limit = 0`
+    // legitimately means "no resolved tail".
     let open_sql = format!(
-        "SELECT {cols}, p.slug, s.short_id, i.state, i.resolved_at \
+        "SELECT {cols}, p.slug, s.short_id \
          FROM interruptions i \
          JOIN steps s ON s.id = i.step_id \
          JOIN plans p ON p.id = s.plan_id \
@@ -1097,7 +1128,7 @@ pub fn list_inbox_rows(
          ORDER BY i.asked_at ASC, i.id ASC"
     );
     let resolved_sql = format!(
-        "SELECT {cols}, p.slug, s.short_id, i.state, i.resolved_at \
+        "SELECT {cols}, p.slug, s.short_id \
          FROM interruptions i \
          JOIN steps s ON s.id = i.step_id \
          JOIN plans p ON p.id = s.plan_id \
@@ -1180,6 +1211,17 @@ pub fn list_resolved_interruptions_for_step(
 /// zero for the step is what un-shadows its `Blocked` overlay and lets the
 /// scheduler re-queue it (docs/dag-redesign.md §3.4/§3.5).
 pub fn resolve_interruption(
+    conn: &Connection,
+    id: &str,
+    resolution: &str,
+    comment: Option<&str>,
+) -> Result<()> {
+    crate::db::with_tx(conn, |conn| {
+        resolve_interruption_inner(conn, id, resolution, comment)
+    })
+}
+
+fn resolve_interruption_inner(
     conn: &Connection,
     id: &str,
     resolution: &str,
@@ -1591,24 +1633,15 @@ pub fn mint_short_id(conn: &Connection, plan_id: &str) -> Result<String> {
 /// small bound is ample — exhausting it signals something pathological, not
 /// genuine space exhaustion.
 const SHORT_ID_MINT_RETRIES: u32 = 8;
+const SORT_KEY_APPEND_RETRIES: u32 = 8;
 
-/// True when `err` is the `steps (plan_id, short_id)` uniqueness violation —
-/// i.e. a writer in another process committed the same minted handle between
-/// [`mint_short_id`]'s `SELECT EXISTS` check and our `INSERT`. We re-roll on
-/// exactly this error and surface every other error unchanged.
-fn is_short_id_unique_violation(err: &rusqlite::Error) -> bool {
-    // The only unique constraint on `steps` involving short_id is the
-    // `idx_steps_short_id` index on `(plan_id, short_id)`; SQLite reports a
-    // column-based unique-index violation by naming the columns, e.g.
-    // "UNIQUE constraint failed: steps.plan_id, steps.short_id". Match the
-    // qualified `steps.short_id` rather than a bare `short_id` substring so an
-    // unrelated constraint message that merely contains the word can't
-    // mis-trigger a short_id re-roll.
+/// True when `err` is a SQLite UNIQUE constraint violation.
+fn is_sqlite_unique_violation(err: &rusqlite::Error) -> bool {
     matches!(
         err,
-        rusqlite::Error::SqliteFailure(e, Some(msg))
+        rusqlite::Error::SqliteFailure(e, _)
             if e.code == rusqlite::ErrorCode::ConstraintViolation
-                && msg.contains("steps.short_id")
+                && e.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
     )
 }
 
@@ -1633,8 +1666,12 @@ fn insert_step_minting_short_id(
         let short_id = mint_short_id(conn, plan_id)?;
         match insert(&short_id) {
             Ok(_) => return Ok(()),
-            Err(e) if is_short_id_unique_violation(&e) && retries < SHORT_ID_MINT_RETRIES => {
-                retries += 1;
+            Err(e) if is_sqlite_unique_violation(&e) && retries < SHORT_ID_MINT_RETRIES => {
+                if plan_has_step_short_id(conn, plan_id, &short_id)? {
+                    retries += 1;
+                } else {
+                    return Err(e.into());
+                }
             }
             Err(e) => return Err(e.into()),
         }
@@ -1679,6 +1716,14 @@ pub fn plan_has_step_short_id(conn: &Connection, plan_id: &str, short_id: &str) 
     )?)
 }
 
+fn plan_has_step_sort_key(conn: &Connection, plan_id: &str, sort_key: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM steps WHERE plan_id = ?1 AND sort_key = ?2)",
+        params![plan_id, sort_key],
+        |r| r.get(0),
+    )?)
+}
+
 /// Create a new step appended at the end of the plan's step list.
 ///
 /// Automatically generates a sort_key after the last existing step.
@@ -1712,6 +1757,15 @@ pub struct NewStep<'a> {
 }
 
 pub fn create_step(conn: &Connection, plan_id: &str, new: NewStep<'_>) -> Result<(Step, usize)> {
+    create_step_inner(conn, plan_id, new, |_, _| Ok(()))
+}
+
+fn create_step_inner(
+    conn: &Connection,
+    plan_id: &str,
+    new: NewStep<'_>,
+    mut before_insert: impl FnMut(&Connection, &str) -> Result<()>,
+) -> Result<(Step, usize)> {
     let NewStep {
         title,
         description,
@@ -1728,32 +1782,50 @@ pub fn create_step(conn: &Connection, plan_id: &str, new: NewStep<'_>) -> Result
     let change_policy = change_policy.unwrap_or_default();
     let tags_json = serde_json::to_string(tags.unwrap_or(&[]))?;
 
-    // Determine sort_key: after the last existing step, or initial_key if none.
-    let last_key: Option<String> = conn
-        .query_row(
-            "SELECT sort_key FROM steps WHERE plan_id = ?1 ORDER BY sort_key DESC LIMIT 1",
-            params![plan_id],
-            |row| row.get(0),
-        )
-        .ok();
+    let mut append_retries = 0;
+    loop {
+        // Determine sort_key: after the last existing step, or initial_key if none.
+        let last_key: Option<String> = conn
+            .query_row(
+                "SELECT sort_key FROM steps WHERE plan_id = ?1 ORDER BY sort_key DESC LIMIT 1",
+                params![plan_id],
+                |row| row.get(0),
+            )
+            .optional()?;
 
-    let sort_key = match last_key {
-        Some(ref k) => frac_index::key_after(k)?,
-        None => frac_index::initial_key(),
-    };
+        let sort_key = match last_key {
+            Some(ref k) => frac_index::key_after(k)?,
+            None => frac_index::initial_key(),
+        };
 
-    // Mint the plan-unique short_id via the one shared helper so runtime
-    // step creation and the V25 migration/import backfill produce the same
-    // handle for the same input (docs/dag-redesign.md §3.1, §13.3). Re-rolls
-    // if a concurrent writer in another process raced us to the same handle.
-    insert_step_minting_short_id(conn, plan_id, |short_id| {
-        conn.execute(
-            "INSERT INTO steps (id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, max_retries, model, change_policy, tags, short_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-            params![id, plan_id, sort_key, title, description, agent, harness, criteria_json, max_retries, model, change_policy.as_str(), tags_json, short_id],
-        )
-    })
-    .with_context(|| format!("Failed to insert step '{title}' for plan '{plan_id}'"))?;
+        before_insert(conn, &sort_key)?;
+
+        // Mint the plan-unique short_id via the one shared helper so runtime
+        // step creation and the V25 migration/import backfill produce the same
+        // handle for the same input (docs/dag-redesign.md §3.1, §13.3).
+        match insert_step_minting_short_id(conn, plan_id, |short_id| {
+            conn.execute(
+                "INSERT INTO steps (id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, max_retries, model, change_policy, tags, short_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![id, plan_id, sort_key, title, description, agent, harness, criteria_json, max_retries, model, change_policy.as_str(), tags_json, short_id],
+            )
+        }) {
+            Ok(()) => break,
+            Err(e)
+                if e.downcast_ref::<rusqlite::Error>()
+                    .is_some_and(is_sqlite_unique_violation)
+                    && append_retries < SORT_KEY_APPEND_RETRIES
+                    && plan_has_step_sort_key(conn, plan_id, &sort_key)? =>
+            {
+                append_retries += 1;
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("Failed to insert step '{title}' for plan '{plan_id}'")
+                });
+            }
+        }
+    }
 
     // The new step is always appended, so its position is the total step count.
     let position: i64 = conn.query_row(
@@ -1810,11 +1882,14 @@ pub fn set_step_parked_worktree(
     step_id: &str,
     stash_sha: &str,
     staged_files: &[String],
+    preserve_files: &[String],
 ) -> Result<()> {
     let staged_json = serde_json::to_string(staged_files)?;
+    let preserve_json = serde_json::to_string(preserve_files)?;
     conn.execute(
-        "INSERT INTO step_parked_worktrees (step_id, stash_sha, staged_files) VALUES (?1, ?2, ?3)",
-        params![step_id, stash_sha, staged_json],
+        "INSERT INTO step_parked_worktrees (step_id, stash_sha, staged_files, preserve_files) \
+         VALUES (?1, ?2, ?3, ?4)",
+        params![step_id, stash_sha, staged_json, preserve_json],
     )
     .with_context(|| format!("Failed to persist parked worktree for step {step_id}"))?;
     Ok(())
@@ -1826,11 +1901,12 @@ pub fn get_step_parked_worktree(
     step_id: &str,
 ) -> Result<Option<ParkedWorktreeState>> {
     conn.query_row(
-        "SELECT stash_sha, staged_files FROM step_parked_worktrees WHERE step_id = ?1",
+        "SELECT stash_sha, staged_files, preserve_files FROM step_parked_worktrees WHERE step_id = ?1",
         params![step_id],
         |row| {
             let stash_sha: String = row.get(0)?;
             let staged_raw: String = row.get(1)?;
+            let preserve_raw: String = row.get(2)?;
             let staged_files = serde_json::from_str(&staged_raw).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
                     1,
@@ -1838,9 +1914,17 @@ pub fn get_step_parked_worktree(
                     Box::new(e),
                 )
             })?;
+            let preserve_files = serde_json::from_str(&preserve_raw).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
             Ok(ParkedWorktreeState {
                 stash_sha,
                 staged_files,
+                preserve_files,
             })
         },
     )
@@ -2012,6 +2096,8 @@ pub fn mark_step_skipped(
 /// (in a tree-shaped plan that is just "inherit the one parent"). Done in a
 /// transaction so the re-parent + delete is atomic.
 pub fn delete_step(conn: &Connection, step_id: &str) -> Result<()> {
+    use std::collections::HashSet;
+
     crate::db::with_tx(conn, |conn| {
         // Preserve the prior "Step not found" contract (was: affected == 0).
         if get_step_by_id(conn, step_id)?.is_none() {
@@ -2019,6 +2105,42 @@ pub fn delete_step(conn: &Connection, step_id: &str) -> Result<()> {
         }
         let parents = list_step_dependencies(conn, step_id)?;
         let dependents = list_step_dependents(conn, step_id)?;
+        let cycle_pairs = if parents.is_empty() || dependents.is_empty() {
+            HashSet::new()
+        } else {
+            let parent_placeholders = std::iter::repeat_n("?", parents.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let dependent_placeholders = std::iter::repeat_n("?", dependents.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "WITH RECURSIVE walk(root, dependency) AS ( \
+                     SELECT step_id, depends_on_step_id FROM step_dependencies \
+                     WHERE step_id IN ({parent_placeholders}) \
+                     UNION \
+                     SELECT walk.root, sd.depends_on_step_id \
+                     FROM walk \
+                     JOIN step_dependencies sd ON sd.step_id = walk.dependency \
+                 ) \
+                 SELECT root, dependency FROM walk \
+                 WHERE dependency IN ({dependent_placeholders})"
+            );
+            let mut query_params: Vec<&str> = Vec::with_capacity(parents.len() + dependents.len());
+            query_params.extend(parents.iter().map(String::as_str));
+            query_params.extend(dependents.iter().map(String::as_str));
+
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(query_params), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut pairs = HashSet::new();
+            for row in rows {
+                pairs.insert(row?);
+            }
+            pairs
+        };
+
         for d in &dependents {
             for p in &parents {
                 if d == p {
@@ -2027,7 +2149,7 @@ pub fn delete_step(conn: &Connection, step_id: &str) -> Result<()> {
                 // Defensive: never close a cycle to delete a step. This
                 // cannot happen for ancestor<-descendant re-parenting on an
                 // acyclic DAG, but skip rather than corrupt the graph.
-                if would_create_step_cycle(conn, d, p)? {
+                if cycle_pairs.contains(&(p.clone(), d.clone())) {
                     continue;
                 }
                 // `INSERT OR IGNORE`: a dependent may already depend on a
@@ -2040,6 +2162,10 @@ pub fn delete_step(conn: &Connection, step_id: &str) -> Result<()> {
                 )?;
             }
         }
+        conn.execute(
+            "UPDATE steps SET corrects_step_id = NULL WHERE corrects_step_id = ?1",
+            params![step_id],
+        )?;
         // CASCADE drops step_id's own in/out edges with the row.
         conn.execute("DELETE FROM steps WHERE id = ?1", params![step_id])?;
         Ok(())
@@ -2389,7 +2515,7 @@ pub fn sweep_stale_in_progress(conn: &Connection, plan_id: &str) -> Result<Vec<S
                WHERE c.reviewed_step_id = steps.id AND c.state = 'open'
            )
            AND NOT (
-               review_status IN (?4, ?5)
+               COALESCE(review_status, ?5) IN (?4, ?5)
                AND {HAS_COMMITTED_ATTEMPT}
            )
          RETURNING {STEP_COLUMNS}",
@@ -2518,10 +2644,11 @@ pub fn delete_execution_log(conn: &Connection, log_id: i64) -> Result<()> {
 /// natural helper for anyone adding log-replay or post-mortem features.
 #[allow(dead_code)]
 pub fn get_latest_log_for_step(conn: &Connection, step_id: &str) -> Result<Option<ExecutionLog>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, step_id, attempt, started_at, duration_secs, prompt_text, diff, test_results, rolled_back, committed, commit_hash, harness_stdout, harness_stderr, cost_usd, input_tokens, output_tokens, session_id, termination_reason, test_status, cycle_index
+    let sql = format!(
+        "SELECT {EXECUTION_LOG_COLUMNS} \
          FROM execution_logs WHERE step_id = ?1 ORDER BY id DESC LIMIT 1",
-    )?;
+    );
+    let mut stmt = conn.prepare(&sql)?;
 
     let mut rows = stmt.query_map(params![step_id], ExecutionLog::from_row)?;
     match rows.next() {
@@ -2644,10 +2771,11 @@ pub fn update_execution_log(
 
 /// List execution logs for a step, ordered chronologically by row creation.
 pub fn list_execution_logs_for_step(conn: &Connection, step_id: &str) -> Result<Vec<ExecutionLog>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, step_id, attempt, started_at, duration_secs, prompt_text, diff, test_results, rolled_back, committed, commit_hash, harness_stdout, harness_stderr, cost_usd, input_tokens, output_tokens, session_id, termination_reason, test_status, cycle_index
+    let sql = format!(
+        "SELECT {EXECUTION_LOG_COLUMNS} \
          FROM execution_logs WHERE step_id = ?1 ORDER BY id ASC",
-    )?;
+    );
+    let mut stmt = conn.prepare(&sql)?;
 
     let rows = stmt.query_map(params![step_id], ExecutionLog::from_row)?;
     let mut logs = Vec::new();
@@ -2673,91 +2801,20 @@ pub fn list_execution_logs_for_plan(
         Some(n) => n as i64,
         None => -1,
     };
-    let mut stmt = conn.prepare(
-        "SELECT s.title, el.id, el.step_id, el.attempt, el.started_at, el.duration_secs,
-                el.prompt_text, el.diff, el.test_results, el.rolled_back, el.committed,
-                el.commit_hash, el.harness_stdout, el.harness_stderr, el.cost_usd,
-                el.input_tokens, el.output_tokens, el.session_id,
-                el.termination_reason, el.test_status, el.cycle_index
+    let log_cols = prefixed_execution_log_columns("el");
+    let sql = format!(
+        "SELECT {log_cols}, s.title
          FROM execution_logs el
          JOIN steps s ON s.id = el.step_id
          WHERE s.plan_id = ?1
          ORDER BY el.started_at DESC
          LIMIT ?2",
-    )?;
+    );
+    let mut stmt = conn.prepare(&sql)?;
 
     let rows = stmt.query_map(params![plan_id, limit_val], |row| {
-        let step_title: String = row.get(0)?;
-        // Shift columns by 1 for the ExecutionLog fields.
-        let termination_reason_str: Option<String> = row.get(18)?;
-        let termination_reason = match termination_reason_str {
-            Some(s) => Some(s.parse::<crate::plan::TerminationReason>().map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    18,
-                    rusqlite::types::Type::Text,
-                    Box::new(e),
-                )
-            })?),
-            None => None,
-        };
-        let test_status_str: Option<String> = row.get(19)?;
-        let test_status = match test_status_str {
-            Some(s) => Some(s.parse::<crate::plan::TestStatus>().map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    19,
-                    rusqlite::types::Type::Text,
-                    Box::new(e),
-                )
-            })?),
-            None => None,
-        };
-        let cycle_index: i32 = row.get(20)?;
-        let log = ExecutionLog {
-            id: row.get(1)?,
-            step_id: row.get(2)?,
-            attempt: row.get(3)?,
-            started_at: {
-                let s: String = row.get(4)?;
-                s.parse::<chrono::DateTime<chrono::Utc>>().map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        4,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })?
-            },
-            duration_secs: row.get(5)?,
-            prompt_text: row.get(6)?,
-            diff: row.get(7)?,
-            test_results: {
-                let s: String = row.get(8)?;
-                serde_json::from_str(&s).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        8,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })?
-            },
-            rolled_back: {
-                let v: i32 = row.get(9)?;
-                v != 0
-            },
-            committed: {
-                let v: i32 = row.get(10)?;
-                v != 0
-            },
-            commit_hash: row.get(11)?,
-            harness_stdout: row.get(12)?,
-            harness_stderr: row.get(13)?,
-            cost_usd: row.get(14)?,
-            input_tokens: row.get(15)?,
-            output_tokens: row.get(16)?,
-            session_id: row.get(17)?,
-            termination_reason,
-            test_status,
-            cycle_index,
-        };
+        let log = ExecutionLog::from_row(row)?;
+        let step_title: String = row.get(20)?;
         Ok((step_title, log))
     })?;
 
@@ -2770,13 +2827,9 @@ pub fn list_execution_logs_for_plan(
 
 /// Fetch an execution log by its primary key.
 pub(crate) fn get_execution_log_by_id(conn: &Connection, id: i64) -> Result<ExecutionLog> {
-    conn.query_row(
-        "SELECT id, step_id, attempt, started_at, duration_secs, prompt_text, diff, test_results, rolled_back, committed, commit_hash, harness_stdout, harness_stderr, cost_usd, input_tokens, output_tokens, session_id, termination_reason, test_status, cycle_index
-         FROM execution_logs WHERE id = ?1",
-        params![id],
-        ExecutionLog::from_row,
-    )
-    .with_context(|| format!("Execution log not found: {id}"))
+    let sql = format!("SELECT {EXECUTION_LOG_COLUMNS} FROM execution_logs WHERE id = ?1");
+    conn.query_row(&sql, params![id], ExecutionLog::from_row)
+        .with_context(|| format!("Execution log not found: {id}"))
 }
 
 /// Mark the live execution log row as interrupted by the user without
@@ -2931,7 +2984,9 @@ pub fn would_create_cycle(conn: &Connection, plan_id: &str, new_dep_id: &str) ->
 pub fn topo_sort_plans(conn: &Connection, plan_ids: &[String]) -> Result<Vec<String>> {
     use std::collections::{HashMap, HashSet, VecDeque};
 
-    let id_set: HashSet<&str> = plan_ids.iter().map(|s| s.as_str()).collect();
+    if plan_ids.is_empty() {
+        return Ok(Vec::new());
+    }
 
     // Build adjacency: for each plan, which plans within the input set does it depend on?
     // edges_in_degree[p] = number of dependencies of p that are in the input set.
@@ -2944,14 +2999,25 @@ pub fn topo_sort_plans(conn: &Connection, plan_ids: &[String]) -> Result<Vec<Str
         reverse.entry(p.clone()).or_default();
     }
 
-    for p in plan_ids {
-        let deps = list_plan_dependencies(conn, p)?;
-        for d in deps {
-            if id_set.contains(d.as_str()) {
-                *in_degree.entry(p.clone()).or_insert(0) += 1;
-                reverse.entry(d).or_default().push(p.clone());
-            }
-        }
+    let placeholders = std::iter::repeat_n("?", plan_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT plan_id, depends_on_plan_id FROM plan_dependencies \
+         WHERE plan_id IN ({placeholders}) AND depends_on_plan_id IN ({placeholders})"
+    );
+    let mut query_params: Vec<&str> = Vec::with_capacity(plan_ids.len() * 2);
+    query_params.extend(plan_ids.iter().map(String::as_str));
+    query_params.extend(plan_ids.iter().map(String::as_str));
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(query_params), |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (plan_id, dependency_id) = row?;
+        *in_degree.entry(plan_id.clone()).or_insert(0) += 1;
+        reverse.entry(dependency_id).or_default().push(plan_id);
     }
 
     // Kahn's algorithm: seed queue with zero-in-degree nodes, preserving input
@@ -2979,9 +3045,10 @@ pub fn topo_sort_plans(conn: &Connection, plan_ids: &[String]) -> Result<Vec<Str
     }
 
     if sorted.len() != plan_ids.len() {
+        let sorted_set: HashSet<&str> = sorted.iter().map(String::as_str).collect();
         let remaining: Vec<String> = plan_ids
             .iter()
-            .filter(|p| !sorted.contains(p))
+            .filter(|p| !sorted_set.contains(p.as_str()))
             .cloned()
             .collect();
         anyhow::bail!(
@@ -3560,6 +3627,7 @@ pub fn bind_live_run_to_plan(
     plan_id: &str,
     plan_slug: &str,
 ) -> Result<()> {
+    let pid = std::process::id() as i64;
     let affected = conn.execute(
         "UPDATE run_locks SET
             plan_id = ?1,
@@ -3575,12 +3643,12 @@ pub fn bind_live_run_to_plan(
             child_pid = NULL,
             child_start_token = NULL,
             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-         WHERE project = ?4",
-        params![plan_id, plan_slug, Phase::Idle.as_str(), project],
+         WHERE project = ?4 AND pid = ?5",
+        params![plan_id, plan_slug, Phase::Idle.as_str(), project, pid],
     )?;
 
     if affected == 0 {
-        anyhow::bail!("No run_locks row for project: {project}");
+        anyhow::bail!("No run_locks row for project owned by current process: {project}");
     }
     Ok(())
 }
@@ -3614,6 +3682,7 @@ pub fn bind_live_run_to_plan(
 /// by [`crate::run_lock::acquire`] before the executor starts, so a missing
 /// row indicates a programming error (likely a test forgot to seed the row).
 pub fn clear_live_run_step(conn: &Connection, project: &str) -> Result<()> {
+    let pid = std::process::id() as i64;
     let affected = conn.execute(
         "UPDATE run_locks SET
             step_id = NULL,
@@ -3625,12 +3694,12 @@ pub fn clear_live_run_step(conn: &Connection, project: &str) -> Result<()> {
             child_pid = NULL,
             child_start_token = NULL,
             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-         WHERE project = ?1",
-        params![project],
+         WHERE project = ?1 AND pid = ?2",
+        params![project, pid],
     )?;
 
     if affected == 0 {
-        anyhow::bail!("No run_locks row for project: {project}");
+        anyhow::bail!("No run_locks row for project owned by current process: {project}");
     }
     Ok(())
 }
@@ -3703,6 +3772,7 @@ pub fn update_live_phase(
     phase: Phase,
     live: LivePhase<'_>,
 ) -> Result<()> {
+    let pid = std::process::id() as i64;
     let LivePhase {
         step_id,
         step_num,
@@ -3749,7 +3819,7 @@ pub fn update_live_phase(
             current_command = ?7,
             {child_sql}
             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-         WHERE project = ?10",
+         WHERE project = ?10 AND pid = ?11",
     );
     let affected = conn.execute(
         &sql,
@@ -3764,11 +3834,12 @@ pub fn update_live_phase(
             child_pid_param,
             child_token_param,
             project,
+            pid,
         ],
     )?;
 
     if affected == 0 {
-        anyhow::bail!("No run_locks row for project: {project}");
+        anyhow::bail!("No run_locks row for project owned by current process: {project}");
     }
     Ok(())
 }
@@ -3931,6 +4002,91 @@ mod tests {
         assert!(!s3.short_id.is_empty());
         assert_ne!(s3.short_id, s1.short_id);
         assert_ne!(s3.short_id, s2.short_id);
+    }
+
+    #[test]
+    fn test_insert_step_minting_short_id_rerolls_observed_short_id_collision() {
+        let conn = setup();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "sid-reroll",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+
+        let mut attempts = 0;
+        insert_step_minting_short_id(&conn, &plan.id, |short_id| {
+            attempts += 1;
+            if attempts == 1 {
+                conn.execute(
+                    "INSERT INTO steps (id, plan_id, sort_key, title, description, short_id)
+                     VALUES (?1, ?2, 'a0', 'racer', 'd', ?3)",
+                    params![Uuid::new_v4().to_string(), plan.id, short_id],
+                )?;
+                return conn.execute(
+                    "INSERT INTO steps (id, plan_id, sort_key, title, description, short_id)
+                     VALUES (?1, ?2, 'a1', 'collider', 'd', ?3)",
+                    params![Uuid::new_v4().to_string(), plan.id, short_id],
+                );
+            }
+
+            conn.execute(
+                "INSERT INTO steps (id, plan_id, sort_key, title, description, short_id)
+                 VALUES (?1, ?2, 'a2', 'success', 'd', ?3)",
+                params![Uuid::new_v4().to_string(), plan.id, short_id],
+            )
+        })
+        .unwrap();
+
+        assert_eq!(attempts, 2, "helper should re-mint after a true collision");
+    }
+
+    #[test]
+    fn test_insert_step_minting_short_id_does_not_reroll_other_unique_violation() {
+        let conn = setup();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "sid-no-reroll",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps (id, plan_id, sort_key, title, description, short_id)
+             VALUES (?1, ?2, 'a0', 'existing', 'd', 'AbCdEfGh')",
+            params![Uuid::new_v4().to_string(), plan.id],
+        )
+        .unwrap();
+
+        let mut attempts = 0;
+        let err = insert_step_minting_short_id(&conn, &plan.id, |short_id| {
+            attempts += 1;
+            conn.execute(
+                "INSERT INTO steps (id, plan_id, sort_key, title, description, short_id)
+                 VALUES (?1, ?2, 'a0', 'duplicate sort', 'd', ?3)",
+                params![Uuid::new_v4().to_string(), plan.id, short_id],
+            )
+        })
+        .unwrap_err();
+
+        assert_eq!(attempts, 1, "non-short_id unique failures must surface");
+        assert!(
+            err.to_string().contains("UNIQUE constraint failed"),
+            "unexpected error: {err:#}"
+        );
     }
 
     // -- Plan tests --
@@ -5854,6 +6010,84 @@ mod tests {
     }
 
     #[test]
+    fn test_create_step_retries_concurrent_sort_key_collision() {
+        let conn = setup();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+
+        let (first, _) = create_step(
+            &conn,
+            &plan.id,
+            NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+
+        let mut injected_collision = false;
+        let (created, position) = create_step_inner(
+            &conn,
+            &plan.id,
+            NewStep {
+                title: "Created after collision",
+                description: "d2",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+            |conn, sort_key| {
+                if !injected_collision {
+                    injected_collision = true;
+                    conn.execute(
+                        "INSERT INTO steps (id, plan_id, sort_key, title, description)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![
+                            Uuid::new_v4().to_string(),
+                            &plan.id,
+                            sort_key,
+                            "Concurrent append",
+                            "raced us to this sort key"
+                        ],
+                    )?;
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(first.sort_key < created.sort_key);
+        assert_eq!(position, 3);
+        let steps = list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(
+            steps.iter().map(|s| s.title.as_str()).collect::<Vec<_>>(),
+            vec!["First", "Concurrent append", "Created after collision"]
+        );
+    }
+
+    #[test]
     fn test_list_steps_ordered_by_sort_key() {
         let conn = setup();
         let plan = create_plan(
@@ -6417,6 +6651,81 @@ mod tests {
     }
 
     #[test]
+    fn test_delete_step_uses_batch_cycle_guard() {
+        let src = include_str!("storage.rs");
+        let start = src.find("pub fn delete_step").unwrap();
+        let end = src[start..]
+            .find("/// Create a new step inserted at a specific sort_key position.")
+            .map(|offset| start + offset)
+            .unwrap();
+        let body = &src[start..end];
+
+        assert!(!body.contains("would_create_step_cycle(conn"));
+        assert!(body.contains("WITH RECURSIVE walk(root, dependency)"));
+    }
+
+    #[test]
+    fn test_delete_step_clears_corrective_links_to_deleted_step() {
+        let conn = setup();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "corrective-delete",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let (original, _) = create_step(
+            &conn,
+            &plan.id,
+            NewStep {
+                title: "Original",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+        let (corrective, _) = create_step(
+            &conn,
+            &plan.id,
+            NewStep {
+                title: "Corrective",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+        set_step_corrects_step_id(&conn, &corrective.id, Some(&original.id)).unwrap();
+        assert_eq!(corrective_chain_len(&conn, &corrective.id).unwrap(), 1);
+
+        delete_step(&conn, &original.id).unwrap();
+
+        let after = get_step(&conn, &corrective.id).unwrap();
+        assert_eq!(
+            after.corrects_step_id, None,
+            "deleting a corrected step must not leave dangling corrects_step_id pointers"
+        );
+        assert_eq!(corrective_chain_len(&conn, &corrective.id).unwrap(), 0);
+    }
+
+    #[test]
     fn test_reset_step_clears_execution_logs() {
         // Regression: `ralph resume` on an in-progress step called reset_step,
         // which zeroed `attempts` but left old execution_logs in place. The
@@ -6751,6 +7060,15 @@ mod tests {
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0].termination_reason, Some(TerminationReason::Success));
         assert_eq!(logs[0].test_status, Some(TestStatus::Passed));
+
+        let plan_logs = list_execution_logs_for_plan(&conn, &plan.id, None).unwrap();
+        assert_eq!(plan_logs.len(), 1);
+        assert_eq!(plan_logs[0].0, "Step");
+        assert_eq!(
+            plan_logs[0].1.termination_reason,
+            Some(TerminationReason::Success)
+        );
+        assert_eq!(plan_logs[0].1.test_status, Some(TestStatus::Passed));
     }
 
     #[test]
@@ -7588,6 +7906,21 @@ mod tests {
     }
 
     #[test]
+    fn test_topo_sort_uses_batch_dependency_query() {
+        let src = include_str!("storage.rs");
+        let start = src.find("pub fn topo_sort_plans").unwrap();
+        let end = src[start..]
+            .find("// ---------------------------------------------------------------------------\n// Step dependency operations")
+            .map(|offset| start + offset)
+            .unwrap();
+        let body = &src[start..end];
+
+        assert!(!body.contains("list_plan_dependencies(conn"));
+        assert!(body.contains("plan_id IN"));
+        assert!(body.contains("depends_on_plan_id IN"));
+    }
+
+    #[test]
     fn test_topo_sort_cycle_detection_error() {
         let conn = setup();
         let ids = make_plans(&conn, 3);
@@ -7839,6 +8172,35 @@ mod tests {
     }
 
     #[test]
+    fn test_create_step_propagates_last_sort_key_query_error() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE steps (plan_id TEXT)", [])
+            .unwrap();
+
+        let err = create_step(
+            &conn,
+            "plan-id",
+            NewStep {
+                title: "new",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .expect_err("sort-key query errors must not be treated as an empty plan");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("sort_key") || msg.contains("no such column"),
+            "error should surface the failed sort-key lookup, got: {msg}"
+        );
+    }
+
+    #[test]
     fn test_create_step_at_persists_change_policy() {
         let conn = setup();
         let plan = create_plan(
@@ -8074,6 +8436,65 @@ mod tests {
         assert_eq!(target, Some(("deadbeefcafe".to_string(), 1)));
     }
 
+    #[test]
+    fn test_sweep_keeps_committed_null_review_status_step_explicitly() {
+        let conn = setup();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "sweep-null-review",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+
+        let (step, _) = create_step(
+            &conn,
+            &plan.id,
+            NewStep {
+                title: "A",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+        update_step_status(&conn, &step.id, StepStatus::InProgress).unwrap();
+        assert_eq!(
+            get_step(&conn, &step.id).unwrap().review_status,
+            None,
+            "test setup expects an on-disk NULL review_status"
+        );
+        let log = create_execution_log(&conn, &step.id, 1, None, None).unwrap();
+        conn.execute(
+            "UPDATE execution_logs SET commit_hash = 'deadbeefcafe' WHERE id = ?1",
+            params![log.id],
+        )
+        .unwrap();
+
+        let swept = sweep_stale_in_progress(&conn, &plan.id).unwrap();
+        assert!(
+            swept.is_empty(),
+            "a committed step with NULL review_status must be preserved explicitly"
+        );
+        let after = get_step(&conn, &step.id).unwrap();
+        assert_eq!(after.status, StepStatus::InProgress);
+        assert_eq!(
+            after.review_status, None,
+            "the reclaim pass only rewrites literal in_flight; NULL remains NULL"
+        );
+    }
+
     /// An InProgress step carrying an OPEN corrective request must NOT be
     /// swept. After a human resolves a review-loop escalation blocker the
     /// step is InProgress with NO open interruption but an open corrective
@@ -8172,7 +8593,7 @@ mod tests {
     fn seed_run_lock(conn: &Connection, project: &str) {
         conn.execute(
             "INSERT INTO run_locks (project, pid, plan_id, plan_slug) VALUES (?1, ?2, ?3, ?4)",
-            params![project, 1i64, "p1", "slug"],
+            params![project, std::process::id() as i64, "p1", "slug"],
         )
         .unwrap();
     }
@@ -8203,7 +8624,7 @@ mod tests {
 
         let live = get_live_run(&conn, "/proj-lp1").unwrap().unwrap();
         assert_eq!(live.project, "/proj-lp1");
-        assert_eq!(live.pid, 1);
+        assert_eq!(live.pid, std::process::id() as i64);
         assert_eq!(live.phase, Some(Phase::Harness));
         assert_eq!(live.step_id.as_deref(), Some("step-uuid"));
         assert_eq!(live.step_num, Some(2));
@@ -8467,7 +8888,7 @@ mod tests {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 "/proj-bind",
-                1i64,
+                std::process::id() as i64,
                 "old-plan",
                 "old-slug",
                 "old-step",
@@ -8515,7 +8936,7 @@ mod tests {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 "/proj-clear",
-                1i64,
+                std::process::id() as i64,
                 "plan-A",
                 "plan-A-slug",
                 "step-A",
@@ -8537,7 +8958,7 @@ mod tests {
         // Plan binding preserved.
         assert_eq!(live.plan_id.as_deref(), Some("plan-A"));
         assert_eq!(live.plan_slug.as_deref(), Some("plan-A-slug"));
-        assert_eq!(live.pid, 1);
+        assert_eq!(live.pid, std::process::id() as i64);
         // Every per-step field is NULL.
         assert_eq!(live.step_id, None);
         assert_eq!(live.step_num, None);
@@ -8629,6 +9050,54 @@ mod tests {
             err.to_string().contains("No run_locks row"),
             "missing-row error must mention the gap; got: {err}",
         );
+    }
+
+    #[test]
+    fn test_live_run_writes_do_not_mutate_foreign_pid_row() {
+        let conn = setup();
+        let me = std::process::id() as i64;
+        let foreign_pid = if me == 1 { 2 } else { 1 };
+        conn.execute(
+            "INSERT INTO run_locks (project, pid, plan_id, plan_slug, phase, step_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                "/proj-foreign",
+                foreign_pid,
+                "old-plan",
+                "old-slug",
+                Phase::Harness.as_str(),
+                "old-step",
+            ],
+        )
+        .unwrap();
+
+        let err = update_live_phase(
+            &conn,
+            "/proj-foreign",
+            Phase::Tests,
+            LivePhase {
+                step_id: Some("new-step"),
+                step_num: Some(2),
+                attempt: Some(1),
+                max_attempts: Some(3),
+                execution_log_id: Some(9),
+                current_command: Some("cargo test"),
+                child: ChildUpdate::Clear,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("owned by current process"),
+            "foreign pid row should not be treated as writable by this process: {err}",
+        );
+
+        let live = get_live_run(&conn, "/proj-foreign").unwrap().unwrap();
+        assert_eq!(live.pid, foreign_pid);
+        assert_eq!(live.plan_id.as_deref(), Some("old-plan"));
+        assert_eq!(live.plan_slug.as_deref(), Some("old-slug"));
+        assert_eq!(live.phase, Some(Phase::Harness));
+        assert_eq!(live.step_id.as_deref(), Some("old-step"));
+        assert_eq!(live.current_command, None);
     }
 
     // -- finalize_execution_log_as_interrupted_if_exists tests --
@@ -9069,13 +9538,15 @@ mod tests {
         let step_id = step_for_interruptions(&conn);
 
         let staged = vec!["a.txt".to_string(), "b.txt".to_string()];
-        set_step_parked_worktree(&conn, &step_id, "deadbeef", &staged).unwrap();
+        let preserve = vec!["notes.txt".to_string()];
+        set_step_parked_worktree(&conn, &step_id, "deadbeef", &staged, &preserve).unwrap();
 
         let parked = get_step_parked_worktree(&conn, &step_id)
             .unwrap()
             .expect("parked row should exist");
         assert_eq!(parked.stash_sha, "deadbeef");
         assert_eq!(parked.staged_files, staged);
+        assert_eq!(parked.preserve_files, preserve);
 
         clear_step_parked_worktree(&conn, &step_id).unwrap();
         assert!(get_step_parked_worktree(&conn, &step_id).unwrap().is_none());
@@ -9086,7 +9557,7 @@ mod tests {
         let conn = setup();
         let step_id = step_for_interruptions(&conn);
 
-        set_step_parked_worktree(&conn, &step_id, "deadbeef", &[]).unwrap();
+        set_step_parked_worktree(&conn, &step_id, "deadbeef", &[], &[]).unwrap();
         let parked = reset_step(&conn, &step_id)
             .unwrap()
             .expect("reset should return the parked stash pointer");
@@ -9100,7 +9571,7 @@ mod tests {
         let conn = setup();
         let step_id = step_for_interruptions(&conn);
 
-        set_step_parked_worktree(&conn, &step_id, "deadbeef", &[]).unwrap();
+        set_step_parked_worktree(&conn, &step_id, "deadbeef", &[], &[]).unwrap();
         let parked = mark_step_skipped(&conn, &step_id, Some("no longer needed"))
             .unwrap()
             .expect("skip should return the parked stash pointer");
@@ -9461,6 +9932,56 @@ mod tests {
         // Unknown id is a distinct precise error.
         let err = resolve_interruption(&conn, "no-such-id", "x", None).unwrap_err();
         assert!(err.to_string().contains("not found"), "got: {err}");
+    }
+
+    #[test]
+    fn test_resolve_interruption_reuses_existing_transaction() {
+        let conn = setup();
+        let step_id = step_for_interruptions(&conn);
+        let id = insert_interruption(
+            &conn,
+            &step_id,
+            1,
+            InterruptionKind::Question,
+            "Which DB?",
+            &[InterruptionOption {
+                text: "SQLite".to_string(),
+                priority: 1,
+            }],
+        )
+        .unwrap();
+
+        crate::db::with_tx(&conn, |tx| {
+            resolve_interruption(tx, &id, "SQLite", None)?;
+            Ok(())
+        })
+        .unwrap();
+
+        let resolved = get_interruption(&conn, &id).unwrap();
+        assert_eq!(resolved.state, InterruptionState::Resolved);
+        assert_eq!(resolved.resolution.as_deref(), Some("SQLite"));
+    }
+
+    #[test]
+    fn test_resolve_interruption_uses_shared_immediate_tx_wrapper() {
+        let src = include_str!("storage.rs");
+        let start = src
+            .find("pub fn resolve_interruption(")
+            .expect("resolve_interruption exists");
+        let end = src[start..]
+            .find("fn resolve_interruption_inner")
+            .map(|i| start + i)
+            .expect("resolve_interruption_inner follows wrapper");
+        let body = &src[start..end];
+
+        assert!(
+            body.contains("crate::db::with_tx"),
+            "resolve_interruption must use the shared BEGIN IMMEDIATE/savepoint wrapper"
+        );
+        assert!(
+            !body.contains("unchecked_transaction"),
+            "resolve_interruption must not use a deferred unchecked transaction"
+        );
     }
 
     #[test]

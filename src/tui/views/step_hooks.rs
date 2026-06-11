@@ -28,6 +28,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState};
 
 use crate::hook_library::Lifecycle;
+use crate::tui::chrome::display_width;
 use crate::tui::help::{self, HelpState};
 use crate::tui::theme;
 use crate::tui::toast::{ToastKind, ToastQueue};
@@ -405,7 +406,7 @@ fn lifecycle_index(l: Lifecycle) -> usize {
 // Rendering
 // ---------------------------------------------------------------------------
 
-const LIST_HINT: &str = " [a] add   [d] remove   [j/k] move   [q/Esc] back ";
+const LIST_HINT: &str = " [a] add   [d] remove   [I] inbox   [j/k] move   [q/Esc] back ";
 const LIFECYCLE_HINT: &str = " [Enter] choose   [j/k] move   [Esc] cancel ";
 const HOOK_HINT: &str = " [Enter] attach   [j/k] move   [Esc] back ";
 
@@ -567,10 +568,10 @@ fn render_hook_picker(frame: &mut Frame, area: Rect, app: &StepHooksApp, lifecyc
     let candidates = app.candidates_for(lifecycle);
     let max_label = candidates
         .iter()
-        .map(|c| c.name.chars().count())
+        .map(|c| display_width(&c.name))
         .max()
         .unwrap_or(0);
-    let body_w = max_label.max(HOOK_HINT.chars().count()) + 4;
+    let body_w = max_label.max(display_width(HOOK_HINT)) + 4;
     let row_count = candidates.len().max(1);
     let dialog = centered_picker_rect(area, body_w as u16, row_count);
     if dialog.width == 0 || dialog.height == 0 {

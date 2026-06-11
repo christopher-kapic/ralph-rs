@@ -17,6 +17,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 
 use crate::plan::{Interruption, InterruptionState};
 use crate::tui::help::HelpState;
+use crate::tui::toast::{ToastKind, ToastQueue};
 use crate::tui::views::answer_modal::InterruptionModal;
 
 /// One inbox row: an interruption plus the owning plan slug + step short id
@@ -99,6 +100,9 @@ pub struct InboxState {
     run_through_target: Option<RunThroughKey>,
     /// `?` help overlay state (per-view, per CLAUDE.md).
     pub help: HelpState,
+    /// Transient user-visible messages for dispatcher-owned side effects
+    /// such as `$EDITOR` handoff failures.
+    pub toasts: ToastQueue,
     /// Pop request latch.
     should_pop: bool,
 }
@@ -114,8 +118,13 @@ impl InboxState {
             modal: None,
             run_through_target: None,
             help: HelpState::new(),
+            toasts: ToastQueue::new(),
             should_pop: false,
         }
+    }
+
+    pub fn push_toast(&mut self, text: impl Into<String>, kind: ToastKind) {
+        self.toasts.push(text, kind, std::time::Instant::now());
     }
 
     /// Replace the item list after a DB poll, preserving the cursor by
@@ -206,6 +215,18 @@ impl InboxState {
         } else {
             self.cursor - 1
         };
+    }
+
+    fn jump_top(&mut self) {
+        if !self.items.is_empty() {
+            self.cursor = 0;
+        }
+    }
+
+    fn jump_bottom(&mut self) {
+        if !self.items.is_empty() {
+            self.cursor = self.items.len() - 1;
+        }
     }
 
     /// The open item with the smallest stable `(asked_at, id)` key (the head
@@ -354,6 +375,14 @@ impl InboxState {
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.navigate_up();
+                InboxOutcome::Handled
+            }
+            KeyCode::Char('g') | KeyCode::Home => {
+                self.jump_top();
+                InboxOutcome::Handled
+            }
+            KeyCode::Char('G') | KeyCode::End => {
+                self.jump_bottom();
                 InboxOutcome::Handled
             }
             KeyCode::Enter | KeyCode::Char('a') => {
@@ -545,6 +574,15 @@ mod tests {
         assert_eq!(st.selected().unwrap().interruption.id, "1");
         st.handle_key(key(KeyCode::Char('k')));
         assert_eq!(st.selected().unwrap().interruption.id, "2");
+    }
+
+    #[test]
+    fn g_and_capital_g_jump_to_top_and_bottom() {
+        let mut st = InboxState::new(vec![item("1", true), item("2", false), item("3", true)]);
+        st.handle_key(key(KeyCode::Char('G')));
+        assert_eq!(st.selected().unwrap().interruption.id, "3");
+        st.handle_key(key(KeyCode::Char('g')));
+        assert_eq!(st.selected().unwrap().interruption.id, "1");
     }
 
     #[test]

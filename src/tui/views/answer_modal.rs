@@ -46,12 +46,19 @@ impl ResumeModal {
         }
     }
 
-    /// Map a key event to a [`ResumeModalAction`]. Y / Enter accept (default
-    /// is Yes per §17 `[Y/n]`); n / Esc / Ctrl-C decline. Pure for tests.
+    /// Map a key event to a [`ResumeModalAction`]. Unmodified y / Enter accept
+    /// (default is Yes per §17 `[Y/n]`); unmodified n / Esc / Ctrl-C decline.
+    /// Pure for tests.
     pub fn handle_key(&self, key: KeyEvent) -> ResumeModalAction {
         match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => ResumeModalAction::Accept,
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => ResumeModalAction::Decline,
+            KeyCode::Char('y') | KeyCode::Char('Y') if key.modifiers == KeyModifiers::NONE => {
+                ResumeModalAction::Accept
+            }
+            KeyCode::Enter => ResumeModalAction::Accept,
+            KeyCode::Char('n') | KeyCode::Char('N') if key.modifiers == KeyModifiers::NONE => {
+                ResumeModalAction::Decline
+            }
+            KeyCode::Esc => ResumeModalAction::Decline,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 ResumeModalAction::Decline
             }
@@ -350,6 +357,10 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::CONTROL)
     }
 
+    fn modified(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
     // -- ResumeModal.handle_key -----------------------------------------------
 
     #[test]
@@ -383,6 +394,27 @@ mod tests {
             m.handle_key(key(KeyCode::Char('N'))),
             ResumeModalAction::Decline
         );
+    }
+
+    #[test]
+    fn resume_modified_y_n_are_pending() {
+        let m = ResumeModal::new("plan", false);
+
+        for code in [
+            KeyCode::Char('y'),
+            KeyCode::Char('Y'),
+            KeyCode::Char('n'),
+            KeyCode::Char('N'),
+        ] {
+            assert_eq!(
+                m.handle_key(modified(code, KeyModifiers::CONTROL)),
+                ResumeModalAction::Pending
+            );
+            assert_eq!(
+                m.handle_key(modified(code, KeyModifiers::ALT)),
+                ResumeModalAction::Pending
+            );
+        }
     }
 
     #[test]

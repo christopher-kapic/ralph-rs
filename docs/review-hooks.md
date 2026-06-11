@@ -145,8 +145,11 @@ ralph hooks export --path /home/me/projects/rust -o rust-hooks.json
 Your teammate imports:
 
 ```bash
-ralph hooks import my-hooks.json
+ralph hooks import my-hooks.json --trust
 ```
+
+Import previews the hook shell commands and requires `--trust` before writing
+them into your local hook library.
 
 **Collision policy:** by default, import **errors out** if any hook in the bundle already exists in the teammate's library — they won't silently overwrite their own work. Pass `--force` to overwrite on purpose.
 

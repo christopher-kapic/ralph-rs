@@ -106,7 +106,7 @@ pub fn render(frame: &mut Frame, area: Rect, args: RenderSteps<'_>, list_state: 
     let block = Block::default()
         .title(format!(" {title} "))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(theme::BORDER_ACTIVE));
 
     // Cursor row uses theme::CURSOR as background with black text for
     // contrast (TUI-plan.md §12). When a run is bound, layer REVERSED on

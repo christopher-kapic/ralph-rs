@@ -77,7 +77,7 @@ fn main() -> Result<()> {
         None => {
             let stdout_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
             if stdout_is_tty && !cli.json && !cli.non_interactive {
-                return commands::run_plan_list_tui(&conn, &config, &project, &out, None);
+                return commands::run_plan_list_tui(&conn, &config, &project, &out, true, None);
             }
             use clap::CommandFactory;
             let _ = Cli::command().print_help();
@@ -144,7 +144,7 @@ fn main() -> Result<()> {
             PlanCommand::Show { slug } => commands::plan_show(&conn, &slug, &project, &out),
             PlanCommand::Approve { slug } => commands::plan_approve(&conn, &slug, &project, &out),
             PlanCommand::Delete { slug, force } => {
-                commands::plan_delete(&conn, &slug, &project, force, &out)
+                commands::plan_delete(&conn, &slug, &project, force, cli.non_interactive, &out)
             }
             PlanCommand::Archive { slug } => commands::plan_archive(&conn, &slug, &project, &out),
             PlanCommand::Unarchive { slug } => {
@@ -321,6 +321,7 @@ fn main() -> Result<()> {
                     step.as_deref(),
                     step_id.as_deref(),
                     force,
+                    cli.non_interactive,
                     &out,
                 )
             }
@@ -381,6 +382,7 @@ fn main() -> Result<()> {
                     step.as_deref(),
                     step_id.as_deref(),
                     force,
+                    cli.non_interactive,
                     &out,
                 )
             }
@@ -489,6 +491,7 @@ fn main() -> Result<()> {
             harness: run_harness,
             force,
             verbose,
+            no_mouse,
         } => {
             let args = commands::RunArgs {
                 plan_slug,
@@ -503,6 +506,7 @@ fn main() -> Result<()> {
                 run_harness,
                 force,
                 verbose,
+                no_mouse,
                 cli_harness: cli.harness,
                 non_interactive: cli.non_interactive,
                 json: cli.json,
@@ -524,10 +528,12 @@ fn main() -> Result<()> {
         Command::Resume {
             plan: plan_slug,
             force,
+            no_mouse,
         } => {
             let args = commands::ResumeArgs {
                 plan_slug,
                 force,
+                no_mouse,
                 non_interactive: cli.non_interactive,
                 json: cli.json,
                 quiet: cli.quiet,
@@ -552,7 +558,7 @@ fn main() -> Result<()> {
 
         // -- Pause --
         Command::Pause { plan: plan_slug } => {
-            commands::cmd_pause(&conn, &project, plan_slug.as_deref(), cli.quiet)
+            commands::cmd_pause(&conn, &project, plan_slug.as_deref(), &out)
         }
 
         // -- Cancel --
@@ -588,9 +594,21 @@ fn main() -> Result<()> {
             // polls and consumes mid-attempt; a non-running step is a plain
             // synchronous DB flip. Both are single-row writes safe to race a
             // concurrent run (same lock-free model as `ralph pause`). The
-            // legacy `--force` flag is accepted for compatibility but no
-            // longer has a lock to steal.
-            runner::skip_step(&conn, &plan, step_num, reason.as_deref(), changes.into())?;
+            // Deprecated hidden `--force` is accepted for compatibility but
+            // no longer has a lock to steal.
+            let resolved_step_num = match step_num.as_deref() {
+                Some(selector) => {
+                    Some(commands::resolve_step(&conn, &plan.id, Some(selector), None)?.1)
+                }
+                None => None,
+            };
+            runner::skip_step(
+                &conn,
+                &plan,
+                resolved_step_num,
+                reason.as_deref(),
+                changes.into(),
+            )?;
             Ok(())
         }
 
@@ -625,6 +643,7 @@ fn main() -> Result<()> {
                     review_harness_configured,
                     global_review_enabled,
                 },
+                &out,
             )
         }
 
@@ -652,7 +671,7 @@ fn main() -> Result<()> {
                 &conn,
                 &project,
                 plan.as_deref(),
-                step,
+                step.as_deref(),
                 limit,
                 &output_mode,
                 &out,
@@ -816,7 +835,9 @@ fn main() -> Result<()> {
             HooksCommand::Export { output, all, path } => {
                 commands::cmd_hooks_export(&project, output.as_deref(), all, path.as_deref(), &out)
             }
-            HooksCommand::Import { file, force } => commands::cmd_hooks_import(&file, force, &out),
+            HooksCommand::Import { file, force, trust } => {
+                commands::cmd_hooks_import(&file, force, trust, &out)
+            }
         },
 
         // -- Prompt --
@@ -852,7 +873,7 @@ fn main() -> Result<()> {
         Command::Config(sub) => match sub {
             cli::ConfigCommand::Show => commands::config_cmd::config_show(&out),
             cli::ConfigCommand::SetTimezone { tz } => {
-                commands::config_cmd::config_set_timezone(&tz)
+                commands::config_cmd::config_set_timezone(&tz, &out)
             }
             cli::ConfigCommand::Review(cli::ConfigReviewCommand::Set {
                 harness,
@@ -862,6 +883,7 @@ fn main() -> Result<()> {
                 harness.as_deref(),
                 model.as_deref(),
                 enabled,
+                &out,
             ),
         },
 

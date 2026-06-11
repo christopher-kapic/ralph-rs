@@ -135,7 +135,7 @@ pub fn render(frame: &mut Frame, area: Rect, args: RenderOutline<'_>, list_state
     let block = Block::default()
         .title(format!(" {title} "))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(theme::BORDER_ACTIVE));
 
     let mut highlight = Style::default()
         .bg(theme::CURSOR)

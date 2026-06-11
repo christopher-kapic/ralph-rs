@@ -24,6 +24,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use crate::plan::ChangePolicy;
+use crate::tui::chrome::display_width;
 use crate::tui::theme;
 
 // ---------------------------------------------------------------------------
@@ -114,6 +115,7 @@ impl PickerKind {
 /// free-text input mode (Model picker only).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PickerItem {
+    Inherit,
     Value(String),
     Custom,
 }
@@ -121,6 +123,7 @@ pub enum PickerItem {
 impl PickerItem {
     pub fn label(&self) -> &str {
         match self {
+            PickerItem::Inherit => "(inherit)",
             PickerItem::Value(s) => s,
             PickerItem::Custom => "Custom…",
         }
@@ -158,7 +161,7 @@ pub enum PickerOutcome {
     /// `apply_*` methods on [`super::step_detail::StepDetailApp`].
     Submit {
         kind: PickerKind,
-        value: String,
+        value: Option<String>,
     },
 }
 
@@ -168,7 +171,8 @@ impl PickerState {
     /// pre-selected so Enter without movement is a no-op confirmation of
     /// the existing value.
     pub fn for_harness(harnesses: &[String], current: Option<&str>) -> Self {
-        let items: Vec<PickerItem> = harnesses.iter().cloned().map(PickerItem::Value).collect();
+        let mut items: Vec<PickerItem> = vec![PickerItem::Inherit];
+        items.extend(harnesses.iter().cloned().map(PickerItem::Value));
         let selected = current
             .and_then(|c| {
                 items
@@ -189,7 +193,7 @@ impl PickerState {
     /// from the default), and a synthetic "Custom…" entry. Pre-selects the
     /// step's current model when present, otherwise the harness default.
     pub fn for_model(harness_default: Option<&str>, current: Option<&str>) -> Self {
-        let mut items: Vec<PickerItem> = Vec::new();
+        let mut items: Vec<PickerItem> = vec![PickerItem::Inherit];
         if let Some(d) = harness_default
             && !d.is_empty()
         {
@@ -227,7 +231,8 @@ impl PickerState {
     /// create <name>`)" placeholder. Confirming with no items does nothing
     /// (no submit, no cancel).
     pub fn for_agent(agents: &[String], current: Option<&str>) -> Self {
-        let items: Vec<PickerItem> = agents.iter().cloned().map(PickerItem::Value).collect();
+        let mut items: Vec<PickerItem> = vec![PickerItem::Inherit];
+        items.extend(agents.iter().cloned().map(PickerItem::Value));
         let selected = current
             .and_then(|c| {
                 items
@@ -320,9 +325,10 @@ impl PickerState {
                     return PickerOutcome::Pending;
                 };
                 match item {
+                    PickerItem::Inherit => PickerOutcome::Submit { kind, value: None },
                     PickerItem::Value(s) => PickerOutcome::Submit {
                         kind,
-                        value: s.clone(),
+                        value: Some(s.clone()),
                     },
                     PickerItem::Custom => {
                         // The picker stays open; the caller observes the
@@ -356,7 +362,10 @@ impl PickerState {
                     // user can either type something or `Esc` back to the list.
                     return PickerOutcome::Pending;
                 }
-                PickerOutcome::Submit { kind, value }
+                PickerOutcome::Submit {
+                    kind,
+                    value: Some(value),
+                }
             }
             KeyCode::Backspace => {
                 if let PickerMode::CustomInput { buffer } = &mut self.mode {
@@ -502,11 +511,11 @@ fn centered_rect(area: Rect, picker: &PickerState) -> Rect {
     let label_w = picker
         .items
         .iter()
-        .map(|i| i.label().chars().count())
+        .map(|i| display_width(i.label()))
         .max()
         .unwrap_or(0);
-    let title_w = picker.kind.title().chars().count() + 2;
-    let hint_w = LIST_HINT.chars().count().max(INPUT_HINT.chars().count());
+    let title_w = display_width(picker.kind.title()) + 2;
+    let hint_w = display_width(LIST_HINT).max(display_width(INPUT_HINT));
     let body_w = label_w.max(title_w).max(hint_w) + 4;
     let desired_w = (body_w as u16).max(40).min(area.width.max(20));
 
@@ -610,8 +619,9 @@ mod tests {
             Some("codex"),
         );
         assert_eq!(picker.kind, PickerKind::Harness);
-        assert_eq!(picker.selected, 1);
-        assert_eq!(picker.items.len(), 3);
+        assert_eq!(picker.selected, 2);
+        assert_eq!(picker.items.len(), 4);
+        assert!(matches!(picker.items[0], PickerItem::Inherit));
         assert!(matches!(picker.mode, PickerMode::List));
     }
 
@@ -630,35 +640,37 @@ mod tests {
     #[test]
     fn for_model_includes_custom_entry() {
         let picker = PickerState::for_model(Some("claude-sonnet-4-6"), None);
-        // [default, Custom…]
-        assert_eq!(picker.items.len(), 2);
-        assert!(matches!(picker.items[0], PickerItem::Value(_)));
-        assert!(matches!(picker.items[1], PickerItem::Custom));
+        // [(inherit), default, Custom…]
+        assert_eq!(picker.items.len(), 3);
+        assert!(matches!(picker.items[0], PickerItem::Inherit));
+        assert!(matches!(picker.items[1], PickerItem::Value(_)));
+        assert!(matches!(picker.items[2], PickerItem::Custom));
         assert_eq!(picker.selected, 0);
     }
 
     #[test]
-    fn for_model_with_no_default_only_has_custom() {
+    fn for_model_with_no_default_has_inherit_and_custom() {
         let picker = PickerState::for_model(None, None);
-        assert_eq!(picker.items.len(), 1);
-        assert!(matches!(picker.items[0], PickerItem::Custom));
+        assert_eq!(picker.items.len(), 2);
+        assert!(matches!(picker.items[0], PickerItem::Inherit));
+        assert!(matches!(picker.items[1], PickerItem::Custom));
     }
 
     #[test]
     fn for_model_appends_step_override_distinct_from_default() {
         let picker = PickerState::for_model(Some("default-A"), Some("override-B"));
-        // [default-A, override-B, Custom…]
-        assert_eq!(picker.items.len(), 3);
+        // [(inherit), default-A, override-B, Custom…]
+        assert_eq!(picker.items.len(), 4);
         // Step's current override is preselected.
-        assert_eq!(picker.selected, 1);
+        assert_eq!(picker.selected, 2);
     }
 
     #[test]
     fn for_model_does_not_duplicate_when_override_matches_default() {
         let picker = PickerState::for_model(Some("same"), Some("same"));
-        // [same, Custom…]
-        assert_eq!(picker.items.len(), 2);
-        assert_eq!(picker.selected, 0);
+        // [(inherit), same, Custom…]
+        assert_eq!(picker.items.len(), 3);
+        assert_eq!(picker.selected, 1);
     }
 
     #[test]
@@ -667,14 +679,16 @@ mod tests {
             &["alpha".into(), "beta".into(), "gamma".into()],
             Some("beta"),
         );
-        assert_eq!(picker.selected, 1);
-        assert_eq!(picker.items.len(), 3);
+        assert_eq!(picker.selected, 2);
+        assert_eq!(picker.items.len(), 4);
+        assert!(matches!(picker.items[0], PickerItem::Inherit));
     }
 
     #[test]
-    fn for_agent_with_empty_list_renders_placeholder() {
+    fn for_agent_with_empty_list_still_offers_inherit() {
         let picker = PickerState::for_agent(&[], None);
-        assert!(picker.items.is_empty());
+        assert_eq!(picker.items.len(), 1);
+        assert!(matches!(picker.items[0], PickerItem::Inherit));
     }
 
     #[test]
@@ -723,10 +737,8 @@ mod tests {
 
     #[test]
     fn j_and_k_navigate_selection() {
-        let mut picker = PickerState::for_harness(
-            &["claude".into(), "codex".into(), "goose".into()],
-            Some("claude"),
-        );
+        let mut picker =
+            PickerState::for_harness(&["claude".into(), "codex".into(), "goose".into()], None);
         assert_eq!(picker.selected, 0);
         assert_eq!(
             picker.handle_key(key(KeyCode::Char('j'))),
@@ -738,22 +750,27 @@ mod tests {
             PickerOutcome::Pending
         );
         assert_eq!(picker.selected, 2);
+        assert_eq!(
+            picker.handle_key(key(KeyCode::Char('j'))),
+            PickerOutcome::Pending
+        );
+        assert_eq!(picker.selected, 3);
         // At the bottom — j is a no-op.
         assert_eq!(
             picker.handle_key(key(KeyCode::Char('j'))),
             PickerOutcome::Pending
         );
-        assert_eq!(picker.selected, 2);
+        assert_eq!(picker.selected, 3);
         assert_eq!(
             picker.handle_key(key(KeyCode::Char('k'))),
             PickerOutcome::Pending
         );
-        assert_eq!(picker.selected, 1);
+        assert_eq!(picker.selected, 2);
     }
 
     #[test]
     fn arrows_navigate_selection() {
-        let mut picker = PickerState::for_harness(&["a".into(), "b".into(), "c".into()], Some("a"));
+        let mut picker = PickerState::for_harness(&["a".into(), "b".into(), "c".into()], None);
         picker.handle_key(key(KeyCode::Down));
         assert_eq!(picker.selected, 1);
         picker.handle_key(key(KeyCode::Up));
@@ -763,11 +780,11 @@ mod tests {
     #[test]
     fn home_g_jumps_to_top_and_end_to_bottom() {
         let mut picker = PickerState::for_harness(&["a".into(), "b".into(), "c".into()], Some("c"));
-        assert_eq!(picker.selected, 2);
+        assert_eq!(picker.selected, 3);
         picker.handle_key(key(KeyCode::Char('g')));
         assert_eq!(picker.selected, 0);
         picker.handle_key(key(KeyCode::Char('G')));
-        assert_eq!(picker.selected, 2);
+        assert_eq!(picker.selected, 3);
     }
 
     #[test]
@@ -778,7 +795,7 @@ mod tests {
         match picker.handle_key(key(KeyCode::Enter)) {
             PickerOutcome::Submit { kind, value } => {
                 assert_eq!(kind, PickerKind::Harness);
-                assert_eq!(value, "codex");
+                assert_eq!(value.as_deref(), Some("codex"));
             }
             other => panic!("expected Submit, got {other:?}"),
         }
@@ -790,8 +807,8 @@ mod tests {
         // enter_custom_input — the state machine just reports Pending so
         // there's no submit racing the mode flip.
         let mut picker = PickerState::for_model(Some("default"), None);
-        // [default, Custom…] — move to Custom.
-        picker.handle_key(key(KeyCode::Char('j')));
+        // [(inherit), default, Custom…] — move to Custom.
+        picker.handle_key(key(KeyCode::Char('G')));
         assert!(picker.is_custom_row_selected());
         assert_eq!(
             picker.handle_key(key(KeyCode::Enter)),
@@ -802,7 +819,7 @@ mod tests {
     #[test]
     fn enter_custom_input_flips_mode_when_on_custom_row() {
         let mut picker = PickerState::for_model(Some("default"), None);
-        picker.handle_key(key(KeyCode::Char('j')));
+        picker.handle_key(key(KeyCode::Char('G')));
         picker.enter_custom_input();
         assert!(matches!(
             picker.mode,
@@ -813,7 +830,7 @@ mod tests {
     #[test]
     fn enter_custom_input_is_noop_when_already_in_input() {
         let mut picker = PickerState::for_model(Some("default"), None);
-        picker.handle_key(key(KeyCode::Char('j')));
+        picker.handle_key(key(KeyCode::Char('G')));
         picker.enter_custom_input();
         if let PickerMode::CustomInput { ref mut buffer } = picker.mode {
             buffer.push_str("anthropic-9999");
@@ -827,12 +844,15 @@ mod tests {
     }
 
     #[test]
-    fn enter_with_empty_list_is_noop() {
+    fn enter_on_inherit_row_submits_none() {
         let mut picker = PickerState::for_agent(&[], None);
-        assert_eq!(
-            picker.handle_key(key(KeyCode::Enter)),
-            PickerOutcome::Pending
-        );
+        match picker.handle_key(key(KeyCode::Enter)) {
+            PickerOutcome::Submit { kind, value } => {
+                assert_eq!(kind, PickerKind::Agent);
+                assert_eq!(value, None);
+            }
+            other => panic!("expected inherit Submit, got {other:?}"),
+        }
     }
 
     // -- CustomInput-mode key handling ------------------------------------
@@ -840,7 +860,7 @@ mod tests {
     fn make_custom_input(seed: &str) -> PickerState {
         let mut picker = PickerState::for_model(Some("default"), None);
         // Move to "Custom…" and flip to input mode.
-        picker.handle_key(key(KeyCode::Char('j')));
+        picker.handle_key(key(KeyCode::Char('G')));
         picker.enter_custom_input();
         if let PickerMode::CustomInput { ref mut buffer } = picker.mode {
             buffer.push_str(seed);
@@ -887,7 +907,7 @@ mod tests {
         match picker.handle_key(key(KeyCode::Enter)) {
             PickerOutcome::Submit { kind, value } => {
                 assert_eq!(kind, PickerKind::Model);
-                assert_eq!(value, "claude-opus-4-7");
+                assert_eq!(value.as_deref(), Some("claude-opus-4-7"));
             }
             other => panic!("expected Submit, got {other:?}"),
         }
@@ -982,7 +1002,7 @@ mod tests {
     #[test]
     fn render_shows_input_mode_after_custom_chosen() {
         let mut picker = PickerState::for_model(Some("default"), None);
-        picker.handle_key(key(KeyCode::Char('j')));
+        picker.handle_key(key(KeyCode::Char('G')));
         picker.enter_custom_input();
         if let PickerMode::CustomInput { ref mut buffer } = picker.mode {
             buffer.push_str("typed");
@@ -994,12 +1014,12 @@ mod tests {
     }
 
     #[test]
-    fn render_shows_placeholder_for_empty_agent_list() {
+    fn render_shows_inherit_for_empty_agent_list() {
         let picker = PickerState::for_agent(&[], None);
         let out = render_to_string(80, 20, &picker);
         assert!(
-            out.contains("no agents"),
-            "empty-agents placeholder missing:\n{out}"
+            out.contains("(inherit)"),
+            "inherit row missing for empty agent list:\n{out}"
         );
     }
 

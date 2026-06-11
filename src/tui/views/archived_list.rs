@@ -17,8 +17,9 @@ use ratatui::text::Span;
 use ratatui::widgets::{Clear, Paragraph, Widget};
 
 use crate::plan::Plan;
-use crate::tui::chrome::{self, Chrome};
+use crate::tui::chrome::{self, Chrome, display_width};
 use crate::tui::help::{self, HelpState};
+use crate::tui::read_only::{self, ReadOnly};
 use crate::tui::selection::Selection;
 use crate::tui::toast::ToastQueue;
 use crate::tui::views::plan_list::{self, PlanTile, TILE_HEIGHT};
@@ -41,6 +42,9 @@ pub struct ArchivedListApp {
     pub project: String,
     /// Toast queue rendered over the bottom chrome row.
     pub toasts: ToastQueue,
+    /// Read-only attach state. When locked, archive-list mutations
+    /// (unarchive/delete) are suppressed and the persistent banner is shown.
+    pub read_only: ReadOnly,
     /// Set when the user asks to return to the main plan list (`←`/`h`/`q`).
     pub should_pop: bool,
     /// Help-overlay state. `?` toggles visibility; while visible the
@@ -81,6 +85,7 @@ impl ArchivedListApp {
             display_timezone: display_timezone.into(),
             project: project.into(),
             toasts: ToastQueue::new(),
+            read_only: ReadOnly::Editable,
             should_pop: false,
             help: HelpState::new(),
             palette_bar: None,
@@ -103,6 +108,10 @@ impl ArchivedListApp {
     /// Whether the palette bar is currently open and consuming keys.
     pub fn palette_active(&self) -> bool {
         self.palette_bar.is_some()
+    }
+
+    pub fn set_read_only(&mut self, state: ReadOnly) {
+        self.read_only = state;
     }
 
     /// Map a click at `(column, row)` to a tile index. Each tile is
@@ -282,21 +291,21 @@ pub fn draw(frame: &mut Frame, app: &mut ArchivedListApp) {
     app.toasts.prune(Instant::now());
 
     let crumbs: [&str; 2] = ["ralph", "Archived plans"];
-    let normal_hint =
-        "[j/k] nav  [enter] unarchive  [space] select  [d] delete  [/:] cmd  [h/←/q] back";
+    let normal_hint = "[j/k] nav  [enter] unarchive  [I] inbox  [d] delete  [/:] cmd  [h/←/q] back";
     let palette_hint = "[tab] complete  [enter] submit  [esc] cancel";
     let hint = if app.palette_active() {
         palette_hint
     } else {
         normal_hint
     };
+    let banner = read_only::banner(app.read_only);
     let body = chrome::render(
         frame,
         &Chrome {
             breadcrumbs: &crumbs,
             hint,
             cwd: Path::new(&app.project),
-            banner: None,
+            banner: banner.as_deref(),
             running_indicator: None,
         },
     );
@@ -337,7 +346,7 @@ pub fn draw(frame: &mut Frame, app: &mut ArchivedListApp) {
 
 fn render_toast_overlay(frame: &mut Frame, area: Rect, text: &str, color: ratatui::style::Color) {
     let max_toast = area.width.saturating_sub(1).max(1);
-    let desired = text.chars().count().min(max_toast as usize) as u16;
+    let desired = display_width(text).min(max_toast as usize) as u16;
     if desired == 0 {
         return;
     }
@@ -641,6 +650,39 @@ mod tests {
         assert!(
             top.contains("Archived plans"),
             "expected breadcrumb header: {top:?}"
+        );
+    }
+
+    #[test]
+    fn read_only_state_renders_lock_banner() {
+        use crate::tui::read_only::ReadOnly;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(90, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = ArchivedListApp::new(make_tiles(1), "/proj", "UTC");
+        assert_eq!(app.read_only, ReadOnly::Editable);
+        app.set_read_only(ReadOnly::Locked { pid: 4242 });
+
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rendered = (0..buffer.area().height)
+            .map(|y| {
+                (0..buffer.area().width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("Read-only"),
+            "archived view should render lock banner:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("[S]"),
+            "archived view must not advertise a stop binding it does not handle:\n{rendered}"
         );
     }
 

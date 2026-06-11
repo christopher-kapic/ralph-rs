@@ -4,8 +4,10 @@
 // same project directory. Uses a SQLite row keyed on absolute project path
 // plus a PID liveness check to recover from crashed runs.
 
-use std::process::Command;
 use std::sync::{Arc, Mutex as StdMutex};
+
+#[cfg(not(target_os = "linux"))]
+use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, Row, params};
@@ -235,6 +237,9 @@ pub fn acquire(
     let release_conn = Connection::open(db::db_path()?)
         .with_context(|| "opening database for run lock release")?;
     release_conn.execute("PRAGMA foreign_keys = ON;", [])?;
+    release_conn
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .context("setting busy_timeout on run lock release connection")?;
     let release_conn = Arc::new(StdMutex::new(release_conn));
 
     let release_conn_for_drop = Arc::clone(&release_conn);
@@ -294,8 +299,10 @@ fn acquire_inner(
 
     match &result {
         Ok(()) => {
-            conn.execute_batch("COMMIT;")
-                .context("committing run-lock acquisition transaction")?;
+            if let Err(e) = conn.execute_batch("COMMIT;") {
+                let _ = conn.execute_batch("ROLLBACK;");
+                return Err(e).context("committing run-lock acquisition transaction");
+            }
         }
         Err(_) => {
             let _ = conn.execute_batch("ROLLBACK;");
@@ -371,8 +378,8 @@ fn acquire_txn(
     Ok(())
 }
 
-/// Returns true if a process with `pid` is still running. Uses `kill -0`,
-/// which works on every Unix without pulling in libc as a direct dependency.
+/// Returns true if a process with `pid` is still running. Uses `kill(pid, 0)`,
+/// which asks the kernel about liveness without sending a signal.
 /// On non-Unix platforms this conservatively returns true (better to block a
 /// duplicate run than risk trampling a live one).
 fn pid_is_alive(pid: i64) -> bool {
@@ -381,14 +388,17 @@ fn pid_is_alive(pid: i64) -> bool {
     }
     #[cfg(unix)]
     {
-        Command::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+        // SAFETY: `kill(pid, 0)` sends no signal. It only asks the kernel
+        // whether the process exists and whether we may signal it.
+        let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        if rc == 0 {
+            return true;
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EPERM) => true,
+            Some(libc::ESRCH) => false,
+            _ => false,
+        }
     }
     #[cfg(not(unix))]
     {
@@ -830,6 +840,29 @@ mod tests {
     fn pid_is_alive_zero_or_negative() {
         assert!(!pid_is_alive(0));
         assert!(!pid_is_alive(-1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_is_alive_treats_permission_denied_as_alive() {
+        let src = std::fs::read_to_string(file!()).unwrap();
+        assert!(
+            src.contains("Some(libc::EPERM) => true"),
+            "permission-denied process probes must be treated as live"
+        );
+        assert!(
+            !src.contains("Command::new(\"kill\")"),
+            "pid liveness must not shell out through kill(1)"
+        );
+    }
+
+    #[test]
+    fn acquire_release_connection_sets_busy_timeout() {
+        let src = std::fs::read_to_string(file!()).unwrap();
+        assert!(
+            src.contains("setting busy_timeout on run lock release connection"),
+            "release connection should wait briefly on SQLITE_BUSY"
+        );
     }
 
     #[test]

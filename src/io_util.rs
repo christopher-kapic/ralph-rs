@@ -126,7 +126,7 @@ where
                             if b == b'\n' {
                                 emit_line(em, &line_buf);
                                 line_buf.clear();
-                            } else {
+                            } else if line_buf.len() < em.max_bytes {
                                 line_buf.push(b);
                             }
                         }
@@ -267,11 +267,45 @@ pub struct WaitCappedResult {
 /// On a `child.wait()` error the captured tails are still returned (so the
 /// caller keeps diagnostics) with `success = false`, `code = None`,
 /// `timed_out = false`.
-pub async fn wait_capped(
+pub fn wait_capped(
     mut child: tokio::process::Child,
     timeout: Option<Duration>,
     cap: usize,
-) -> WaitCappedResult {
+) -> impl std::future::Future<Output = WaitCappedResult> {
+    #[cfg(unix)]
+    struct ProcessGroupKillGuard {
+        pid: Option<i32>,
+        armed: bool,
+    }
+
+    #[cfg(unix)]
+    impl ProcessGroupKillGuard {
+        fn new(child: &tokio::process::Child) -> Self {
+            Self {
+                pid: child.id().and_then(|id| i32::try_from(id).ok()),
+                armed: true,
+            }
+        }
+
+        fn disarm(&mut self) {
+            self.armed = false;
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ProcessGroupKillGuard {
+        fn drop(&mut self) {
+            if self.armed
+                && let Some(pid) = self.pid
+            {
+                crate::executor::signal_process_group(pid, libc::SIGKILL);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    let mut process_group_guard = ProcessGroupKillGuard::new(&child);
+
     // Machine-check the process-group precondition. The child is freshly
     // spawned and alive here, so `getpgid` is meaningful. If it is its own
     // group leader, `pgid == pid` and the timeout's `kill(-pid)` tears down
@@ -298,46 +332,60 @@ pub async fn wait_capped(
         }
     }
 
-    // Take the pipe handles and start draining *immediately* — before the
-    // wait — so a child that writes more than the kernel pipe buffer
-    // (~64 KiB) doesn't block on write(2) while we block on wait(),
-    // deadlocking. Same rationale as `drain_bounded`'s module doc.
-    let stdout_task = drain_bounded(child.stdout.take(), cap);
-    let stderr_task = drain_bounded(child.stderr.take(), cap);
+    async move {
+        // Take the pipe handles and start draining *immediately* — before the
+        // wait — so a child that writes more than the kernel pipe buffer
+        // (~64 KiB) doesn't block on write(2) while we block on wait(),
+        // deadlocking. Same rationale as `drain_bounded`'s module doc.
+        let stdout_task = drain_bounded(child.stdout.take(), cap);
+        let stderr_task = drain_bounded(child.stderr.take(), cap);
 
-    // Reap the child after a timeout kill (or just collect on normal exit),
-    // fanning the kill to the whole process group on unix.
-    async fn kill_group_and_reap(child: &mut tokio::process::Child) {
-        #[cfg(unix)]
-        {
-            if let Some(pid) = child.id().and_then(|id| i32::try_from(id).ok()) {
-                crate::executor::signal_process_group(pid, libc::SIGKILL);
+        // Reap the child after a timeout kill (or just collect on normal exit),
+        // fanning the kill to the whole process group on unix.
+        async fn kill_group_and_reap(child: &mut tokio::process::Child) {
+            #[cfg(unix)]
+            {
+                if let Some(pid) = child.id().and_then(|id| i32::try_from(id).ok()) {
+                    crate::executor::signal_process_group(pid, libc::SIGKILL);
+                }
             }
+            let _ = child.kill().await;
+            // Reap so the child doesn't linger as a zombie. After wait()
+            // returns the pipes are definitively closed and the drain tasks
+            // exit promptly.
+            let _ = child.wait().await;
         }
-        let _ = child.kill().await;
-        // Reap so the child doesn't linger as a zombie. After wait()
-        // returns the pipes are definitively closed and the drain tasks
-        // exit promptly.
-        let _ = child.wait().await;
-    }
 
-    match timeout {
-        Some(dur) => {
-            tokio::select! {
-                status = child.wait() => match status {
-                    Ok(es) => {
-                        let stdout = join_drain_string(stdout_task).await;
-                        let stderr = join_drain_string(stderr_task).await;
-                        WaitCappedResult {
-                            success: es.success(),
-                            code: es.code(),
-                            stdout,
-                            stderr,
-                            timed_out: false,
+        let result = match timeout {
+            Some(dur) => {
+                tokio::select! {
+                    status = child.wait() => match status {
+                        Ok(es) => {
+                            let stdout = join_drain_string(stdout_task).await;
+                            let stderr = join_drain_string(stderr_task).await;
+                            WaitCappedResult {
+                                success: es.success(),
+                                code: es.code(),
+                                stdout,
+                                stderr,
+                                timed_out: false,
+                            }
                         }
-                    }
-                    Err(_) => {
-                        // Still collect whatever the drainers captured.
+                        Err(_) => {
+                            // Still collect whatever the drainers captured.
+                            let stdout = join_drain_string(stdout_task).await;
+                            let stderr = join_drain_string(stderr_task).await;
+                            WaitCappedResult {
+                                success: false,
+                                code: None,
+                                stdout,
+                                stderr,
+                                timed_out: false,
+                            }
+                        }
+                    },
+                    _ = tokio::time::sleep(dur) => {
+                        kill_group_and_reap(&mut child).await;
                         let stdout = join_drain_string(stdout_task).await;
                         let stderr = join_drain_string(stderr_task).await;
                         WaitCappedResult {
@@ -345,12 +393,24 @@ pub async fn wait_capped(
                             code: None,
                             stdout,
                             stderr,
-                            timed_out: false,
+                            timed_out: true,
                         }
                     }
-                },
-                _ = tokio::time::sleep(dur) => {
-                    kill_group_and_reap(&mut child).await;
+                }
+            }
+            None => match child.wait().await {
+                Ok(es) => {
+                    let stdout = join_drain_string(stdout_task).await;
+                    let stderr = join_drain_string(stderr_task).await;
+                    WaitCappedResult {
+                        success: es.success(),
+                        code: es.code(),
+                        stdout,
+                        stderr,
+                        timed_out: false,
+                    }
+                }
+                Err(_) => {
                     let stdout = join_drain_string(stdout_task).await;
                     let stderr = join_drain_string(stderr_task).await;
                     WaitCappedResult {
@@ -358,35 +418,16 @@ pub async fn wait_capped(
                         code: None,
                         stdout,
                         stderr,
-                        timed_out: true,
+                        timed_out: false,
                     }
                 }
-            }
-        }
-        None => match child.wait().await {
-            Ok(es) => {
-                let stdout = join_drain_string(stdout_task).await;
-                let stderr = join_drain_string(stderr_task).await;
-                WaitCappedResult {
-                    success: es.success(),
-                    code: es.code(),
-                    stdout,
-                    stderr,
-                    timed_out: false,
-                }
-            }
-            Err(_) => {
-                let stdout = join_drain_string(stdout_task).await;
-                let stderr = join_drain_string(stderr_task).await;
-                WaitCappedResult {
-                    success: false,
-                    code: None,
-                    stdout,
-                    stderr,
-                    timed_out: false,
-                }
-            }
-        },
+            },
+        };
+
+        #[cfg(unix)]
+        process_group_guard.disarm();
+
+        result
     }
 }
 
@@ -528,6 +569,24 @@ mod tests {
         );
         assert_eq!(events[0].1, "x".repeat(max_bytes));
         assert_eq!(events[1].1, "short");
+    }
+
+    #[tokio::test]
+    async fn test_drain_emitter_bounds_newline_free_line_buffer() {
+        let (mut w, r) = tokio::io::duplex(64 * 1024);
+        let seq = Arc::new(AtomicU64::new(0));
+        let max_bytes = 16;
+        let (emitter, collected) = collecting_emitter(ChunkStream::Stdout, seq, max_bytes);
+
+        let handle = drain_bounded_with_emitter(Some(r), 64 * 1024, Some(emitter));
+        w.write_all("x".repeat(8192).as_bytes()).await.unwrap();
+        drop(w);
+        let _ = join_drain(handle).await;
+
+        let events = collected.lock().unwrap().clone();
+        assert_eq!(events.len(), 1, "expected EOF flush, got {events:?}");
+        assert_eq!(events[0].1.len(), max_bytes);
+        assert_eq!(events[0].1, "x".repeat(max_bytes));
     }
 
     /// Truncation must cut at a UTF-8 character boundary so the emitted
@@ -715,6 +774,52 @@ mod tests {
             elapsed < Duration::from_secs(10),
             "timeout should fire promptly, elapsed = {elapsed:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_wait_capped_future_abort_kills_process_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ready = tmp.path().join("ready");
+        let grandchild = tmp.path().join("grandchild");
+        let body = format!(
+            "sleep 1000 & echo $! > {grandchild}; touch {ready}; wait",
+            grandchild = grandchild.display(),
+            ready = ready.display(),
+        );
+        let child = spawn_sh(&body);
+        let handle = tokio::spawn(wait_capped(child, Some(Duration::from_secs(60)), 1024));
+
+        for _ in 0..100 {
+            if ready.exists() && grandchild.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(ready.exists(), "child did not signal readiness");
+        let grandchild_pid: i32 = std::fs::read_to_string(&grandchild)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+
+        handle.abort();
+        let _ = handle.await;
+
+        for _ in 0..100 {
+            // SAFETY: kill(pid, 0) probes process existence without sending a signal.
+            let alive = unsafe { libc::kill(grandchild_pid, 0) } == 0;
+            if !alive {
+                return;
+            }
+            if let Ok(status) = std::fs::read_to_string(format!("/proc/{grandchild_pid}/status"))
+                && status.lines().any(|line| line.starts_with("State:\tZ"))
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("grandchild process {grandchild_pid} survived wait_capped future abort");
     }
 
     /// The process-group precondition is machine-checked, not doc-only: a

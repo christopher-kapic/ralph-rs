@@ -2,6 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use rusqlite::Row;
+use rusqlite::types::FromSql;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -899,13 +900,10 @@ impl Plan {
 
         // `max_review_corrections` is a nullable INTEGER column (V30) at
         // index 18. NULL (pre-V30 / never-set) stays `None` — the runner
-        // then uses the built-in default. `.ok()`-tolerant for raw test
-        // inserts / SELECTs that predate the column.
-        let max_review_corrections: Option<i32> = row
-            .get::<_, Option<i64>>(18)
-            .ok()
-            .flatten()
-            .map(|v| v as i32);
+        // then uses the built-in default. SELECTs that predate the column
+        // map to None, but present-column type errors still surface.
+        let max_review_corrections: Option<i32> =
+            optional_legacy_column::<i64>(row, 18)?.map(|v| v as i32);
 
         Ok(Plan {
             id: row.get(0)?,
@@ -1044,8 +1042,9 @@ impl Step {
         // V13 won't include the column (handled by callers using the
         // canonical column list); for callers that do include it, a NULL or
         // empty string is defensively treated as an empty list so raw rows
-        // from legacy inserts keep round-tripping.
-        let tags_raw: Option<String> = row.get(16).ok();
+        // from legacy inserts keep round-tripping. Present-column type errors
+        // still surface.
+        let tags_raw: Option<String> = optional_legacy_column(row, 16)?;
         let tags: Vec<String> = match tags_raw.as_deref() {
             None | Some("") => Vec::new(),
             Some(json) => serde_json::from_str(json).map_err(|e| {
@@ -1061,13 +1060,13 @@ impl Step {
         // that predate V25 omit the column and raw test inserts may leave
         // it NULL; either case is defensively mapped to an empty string so
         // legacy rows keep round-tripping (mirrors the `tags` handling).
-        let short_id: String = row.get::<_, String>(17).ok().unwrap_or_default();
+        // Present-column type errors still surface.
+        let short_id: String = optional_legacy_column::<String>(row, 17)?.unwrap_or_default();
 
         // V27 review columns at indices 18/19/20. SELECTs that predate V27
-        // omit them and raw test inserts may leave them NULL; `.get(..).ok()`
-        // + the `Option` mapping defensively treats either case as the
-        // inherit / pending default so legacy rows keep round-tripping
-        // (mirrors the `short_id` / `tags` handling above).
+        // omit them and raw test inserts may leave them NULL. Missing/NULL
+        // values map to the inherit / pending default so legacy rows keep
+        // round-tripping, while present-column type errors still surface.
         //
         // - `review_enabled` (18): nullable INTEGER tri-state bool; non-null
         //   coerces to a bool (any non-zero = true), like `review_enabled`
@@ -1075,9 +1074,8 @@ impl Step {
         // - `review_status` (19): nullable TEXT; a non-null value must parse
         //   to a known `ReviewStatus` variant (NULL = pending).
         // - `corrects_step_id` (20): nullable TEXT step-id pointer.
-        let review_enabled: Option<bool> =
-            row.get::<_, Option<i64>>(18).ok().flatten().map(|v| v != 0);
-        let review_status_str: Option<String> = row.get::<_, Option<String>>(19).ok().flatten();
+        let review_enabled: Option<bool> = optional_legacy_column::<i64>(row, 18)?.map(|v| v != 0);
+        let review_status_str: Option<String> = optional_legacy_column(row, 19)?;
         let review_status = match review_status_str {
             Some(s) => Some(s.parse::<ReviewStatus>().map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
@@ -1088,7 +1086,7 @@ impl Step {
             })?),
             None => None,
         };
-        let corrects_step_id: Option<String> = row.get::<_, Option<String>>(20).ok().flatten();
+        let corrects_step_id: Option<String> = optional_legacy_column(row, 20)?;
 
         Ok(Step {
             id: row.get(0)?,
@@ -1170,9 +1168,8 @@ impl ExecutionLog {
     /// session_id, termination_reason, test_status, cycle_index
     ///
     /// `cycle_index` (column 19) is the V33 per-step retry-from-scratch
-    /// pointer. SELECTs that predate V33 may omit the column; `.get(19).ok()`
-    /// defensively maps a missing or NULL value to 0 (mirrors the
-    /// `short_id` / `tags` handling on [`Step`]).
+    /// pointer. SELECTs that predate V33 may omit the column; missing or NULL
+    /// maps to 0, while present-column type errors still surface.
     pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         let started_str: String = row.get(3)?;
         let started_at = parse_datetime(&started_str).map_err(|e| {
@@ -1211,7 +1208,7 @@ impl ExecutionLog {
             None => None,
         };
 
-        let cycle_index: i32 = row.get::<_, Option<i32>>(19).ok().flatten().unwrap_or(0);
+        let cycle_index: i32 = optional_legacy_column::<i32>(row, 19)?.unwrap_or(0);
 
         Ok(ExecutionLog {
             id: row.get(0)?,
@@ -1246,6 +1243,17 @@ impl ExecutionLog {
 fn parse_datetime(s: &str) -> Result<DateTime<Utc>, chrono::ParseError> {
     // SQLite stores as "YYYY-MM-DDTHH:MM:SS.fffZ"
     s.parse::<DateTime<Utc>>()
+}
+
+fn optional_legacy_column<T: FromSql>(
+    row: &rusqlite::Row<'_>,
+    idx: usize,
+) -> rusqlite::Result<Option<T>> {
+    match row.get::<_, Option<T>>(idx) {
+        Ok(value) => Ok(value),
+        Err(rusqlite::Error::InvalidColumnIndex(_)) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(test)]
@@ -1560,6 +1568,31 @@ mod tests {
     }
 
     #[test]
+    fn test_plan_from_row_surfaces_present_max_review_corrections_type_errors() {
+        let conn = db::open_memory().expect("open_memory");
+
+        let err = conn
+            .query_row(
+                "SELECT 'p1', 'slug', '/proj', 'branch', 'desc', 'ready',
+                        NULL, NULL, '[]', '2026-01-01T00:00:00Z',
+                        '2026-01-01T00:00:00Z', NULL, 0, NULL, NULL,
+                        NULL, NULL, NULL, 'not-an-int'",
+                [],
+                Plan::from_row,
+            )
+            .expect_err("present malformed max_review_corrections must not default to None");
+
+        assert!(
+            matches!(
+                err,
+                rusqlite::Error::InvalidColumnType(..)
+                    | rusqlite::Error::FromSqlConversionFailure(..)
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
     fn test_step_from_row() {
         let conn = db::open_memory().expect("open_memory");
 
@@ -1606,6 +1639,31 @@ mod tests {
         assert_eq!(step.attempts, 2);
         assert_eq!(step.max_retries, Some(3));
         assert_eq!(step.acceptance_criteria, vec!["tests pass", "lint clean"]);
+    }
+
+    #[test]
+    fn test_step_from_row_surfaces_present_column_type_errors() {
+        let conn = db::open_memory().expect("open_memory");
+
+        let err = conn
+            .query_row(
+                "SELECT 's1', 'p1', 'a0', 'Step 1', 'First step', NULL, NULL, '[]',
+                        'pending', 0, NULL, '2026-01-01T00:00:00Z',
+                        '2026-01-01T00:00:00Z', NULL, NULL, 'required', '[]',
+                        'abcd1234', 'not-an-int', NULL, NULL",
+                [],
+                Step::from_row,
+            )
+            .expect_err("present malformed review_enabled must not default to None");
+
+        assert!(
+            matches!(
+                err,
+                rusqlite::Error::InvalidColumnType(..)
+                    | rusqlite::Error::FromSqlConversionFailure(..)
+            ),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]
@@ -1668,6 +1726,30 @@ mod tests {
         assert_eq!(log.input_tokens, Some(1000));
         assert_eq!(log.output_tokens, Some(500));
         assert_eq!(log.session_id.as_deref(), Some("session-1"));
+    }
+
+    #[test]
+    fn test_execution_log_from_row_surfaces_present_cycle_index_type_errors() {
+        let conn = db::open_memory().expect("open_memory");
+
+        let err = conn
+            .query_row(
+                "SELECT 1, 's1', 1, '2026-01-01T00:00:00Z', NULL, NULL, NULL,
+                        '[]', 0, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                        NULL, NULL, 'not-an-int'",
+                [],
+                ExecutionLog::from_row,
+            )
+            .expect_err("present malformed cycle_index must not default to zero");
+
+        assert!(
+            matches!(
+                err,
+                rusqlite::Error::InvalidColumnType(..)
+                    | rusqlite::Error::FromSqlConversionFailure(..)
+            ),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]

@@ -337,7 +337,7 @@ impl PlanDetailApp {
         // Hit-test against the *outline's* visible rows (same index space as
         // `outline.cursor()`), respecting the scroll offset + focus filter.
         self.outline
-            .visible_rows()
+            .visible_rows_ref()
             .get(idx)
             .map(|r| (idx, r.step_id.clone()))
     }
@@ -363,9 +363,9 @@ impl PlanDetailApp {
     /// path does. For the degenerate no-edge linear case the outline order
     /// equals construction order, so behavior is identical to before.
     ///
-    /// Subsequent drags recompute `split_pct` from
-    /// `cursor_column / last_body_width` (clamped 20..=80); release clears
-    /// the drag flag.
+    /// Subsequent drags recompute `split_pct` from the cursor's body-relative
+    /// column over `last_body_width` (clamped 20..=80); release clears the
+    /// drag flag.
     pub fn handle_mouse(&mut self, event: MouseEvent) {
         use crossterm::event::{MouseButton, MouseEventKind};
 
@@ -393,14 +393,16 @@ impl PlanDetailApp {
         if self.last_body_width == 0 {
             return;
         }
+        let body_x = self.step_list_area.x as i32;
         let body_width = self.last_body_width as u32;
-        let divider_col = (body_width * self.split_pct as u32 / 100) as i32;
+        let divider_col = body_x + (body_width * self.split_pct as u32 / 100) as i32;
 
         match event.kind {
             // An armed divider drag takes precedence over row hit-testing
             // so a drag that wanders over the step list keeps resizing.
             MouseEventKind::Drag(MouseButton::Left) if self.dragging_split => {
-                let pct = (event.column as u32 * 100) / body_width.max(1);
+                let rel_col = (event.column as i32 - body_x).max(0) as u32;
+                let pct = (rel_col * 100) / body_width.max(1);
                 self.split_pct = pct.clamp(20, 80) as u16;
             }
             MouseEventKind::Down(MouseButton::Left) => {
@@ -460,6 +462,18 @@ impl PlanDetailApp {
         self.execution_logs.insert(step_id.to_string(), logs);
     }
 
+    /// True when the cached log rows for `step_id` are fresh enough for the
+    /// step's current attempt count. Empty cached rows count as fresh for a
+    /// zero-attempt terminal step, which avoids rereading "no logs" every
+    /// tick.
+    pub fn execution_logs_cache_covers_attempts(&self, step_id: &str, attempts: i32) -> bool {
+        let Some(logs) = self.execution_logs.get(step_id) else {
+            return false;
+        };
+        let latest_attempt = logs.iter().map(|log| log.attempt).max().unwrap_or(0);
+        latest_attempt >= attempts.max(0)
+    }
+
     /// Cached execution-log rows for `step_id`, or an empty slice when none
     /// have been loaded / the step has no recorded attempts.
     pub fn execution_logs_for(&self, step_id: &str) -> &[ExecutionLog] {
@@ -486,7 +500,9 @@ impl PlanDetailApp {
 
     // -- Navigation -------------------------------------------------------
 
-    /// Move selection down one step (wraps around).
+    /// Test-only flat-list navigation helper. Production input routes through
+    /// `on_key`, which keeps the outline cursor and flat selection aligned.
+    #[cfg(test)]
     pub fn navigate_down(&mut self) {
         if self.steps.is_empty() {
             return;
@@ -494,7 +510,9 @@ impl PlanDetailApp {
         self.selected_index = (self.selected_index + 1) % self.steps.len();
     }
 
-    /// Move selection up one step (wraps around).
+    /// Test-only flat-list navigation helper. Production input routes through
+    /// `on_key`, which keeps the outline cursor and flat selection aligned.
+    #[cfg(test)]
     pub fn navigate_up(&mut self) {
         if self.steps.is_empty() {
             return;
@@ -554,7 +572,7 @@ impl PlanDetailApp {
     /// Returns `Some(step_id)` if the selected step is in a skippable status,
     /// or `None` if skipping is not allowed (e.g. step is already complete).
     pub fn request_skip(&self) -> Option<String> {
-        let step = self.selected_step()?;
+        let step = self.current_step()?;
         match step.status {
             StepStatus::Pending
             | StepStatus::InProgress
@@ -575,7 +593,9 @@ impl PlanDetailApp {
 
     // -- Step state updates -----------------------------------------------
 
-    /// Update the status and attempt count for a step by ID.
+    /// Test-only flat-list state helper; production refreshes from storage and
+    /// then resyncs the outline projection.
+    #[cfg(test)]
     pub fn update_step_status(&mut self, step_id: &str, status: StepStatus, attempts: i32) {
         if let Some(step) = self.steps.iter_mut().find(|s| s.id == step_id) {
             step.status = status;
@@ -583,7 +603,9 @@ impl PlanDetailApp {
         }
     }
 
-    /// Insert a new step into the list, maintaining sort_key order.
+    /// Test-only flat-list state helper; production insertions go through
+    /// storage and refresh the outline projection immediately.
+    #[cfg(test)]
     pub fn insert_step(&mut self, step: Step) {
         let pos = self
             .steps
@@ -638,7 +660,7 @@ impl PlanDetailApp {
     pub fn delete_targets(&self) -> Vec<String> {
         if !self.selection.is_empty() {
             self.selection.as_slice().to_vec()
-        } else if let Some(step) = self.selected_step() {
+        } else if let Some(step) = self.current_step() {
             vec![step.id.clone()]
         } else {
             Vec::new()
@@ -650,7 +672,7 @@ impl PlanDetailApp {
     /// Step ID to reset, or `None` when the step list is empty. Cursor-only
     /// (selection is ignored — reset is a single-step operation).
     pub fn reset_target(&self) -> Option<String> {
-        self.selected_step().map(|s| s.id.clone())
+        self.current_step().map(|s| s.id.clone())
     }
 
     // -- Move (Shift-J / Shift-K) -----------------------------------------
@@ -830,7 +852,7 @@ impl PlanDetailApp {
     /// only fall back to the `selected_index` path when the outline yields
     /// nothing (e.g. an empty outline). Mirrors the Enter/open path, which was
     /// already hardened to resolve through the outline.
-    fn selected_step(&self) -> Option<&Step> {
+    pub(crate) fn current_step(&self) -> Option<&Step> {
         if let Some(id) = self.outline.selected_step_id()
             && let Some(s) = self.steps.iter().find(|s| s.id == id)
         {
@@ -1139,7 +1161,7 @@ const _: () = {
 mod tests {
     use super::{AddPosition, InputMode, PlanDetailApp};
     use crate::config::Config;
-    use crate::plan::{Plan, PlanStatus, Step, StepStatus};
+    use crate::plan::{ExecutionLog, Plan, PlanStatus, Step, StepStatus};
     use crate::run_lock::LiveRun;
     use chrono::Utc;
 
@@ -1203,6 +1225,31 @@ mod tests {
             .collect()
     }
 
+    fn make_log(step_id: &str, attempt: i32) -> ExecutionLog {
+        ExecutionLog {
+            id: attempt as i64,
+            step_id: step_id.to_string(),
+            attempt,
+            started_at: Utc::now(),
+            duration_secs: None,
+            prompt_text: None,
+            diff: None,
+            test_results: vec![],
+            rolled_back: false,
+            committed: false,
+            commit_hash: None,
+            harness_stdout: None,
+            harness_stderr: None,
+            cost_usd: None,
+            input_tokens: None,
+            output_tokens: None,
+            session_id: None,
+            termination_reason: None,
+            test_status: None,
+            cycle_index: 0,
+        }
+    }
+
     #[test]
     fn test_app_creation() {
         let plan = make_plan();
@@ -1215,6 +1262,36 @@ mod tests {
         assert!(!app.should_pop);
         assert!(matches!(app.input_mode, InputMode::Normal));
         assert!(app.selection.is_empty());
+    }
+
+    #[test]
+    fn execution_log_cache_covers_attempts_by_latest_attempt() {
+        let plan = make_plan();
+        let steps = make_steps(1);
+        let mut app = PlanDetailApp::new(plan, steps, &Config::default());
+
+        assert!(
+            !app.execution_logs_cache_covers_attempts("s0", 0),
+            "missing cache should request an initial load"
+        );
+
+        app.set_execution_logs("s0", Vec::new());
+        assert!(
+            app.execution_logs_cache_covers_attempts("s0", 0),
+            "empty cached rows cover a zero-attempt terminal step"
+        );
+        assert!(
+            !app.execution_logs_cache_covers_attempts("s0", 1),
+            "a later attempt count invalidates an empty cache"
+        );
+
+        app.set_execution_logs("s0", vec![make_log("s0", 1), make_log("s0", 2)]);
+        assert!(app.execution_logs_cache_covers_attempts("s0", 1));
+        assert!(app.execution_logs_cache_covers_attempts("s0", 2));
+        assert!(
+            !app.execution_logs_cache_covers_attempts("s0", 3),
+            "new attempts must trigger a reload"
+        );
     }
 
     #[test]
@@ -2395,6 +2472,32 @@ mod tests {
 
         app.handle_mouse(mouse_event(60, 5, MouseEventKind::Up(MouseButton::Left)));
         assert!(!app.dragging_split, "Up should clear the drag flag");
+    }
+
+    #[test]
+    fn split_drag_uses_body_relative_columns() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        use ratatui::layout::Rect;
+
+        let mut app = PlanDetailApp::new(make_plan(), make_steps(3), &Config::default());
+        app.last_body_width = 100;
+        app.step_list_area = Rect {
+            x: 12,
+            y: 2,
+            width: 40,
+            height: 20,
+        };
+
+        // Divider is body_x + 40% of 100 = absolute column 52. Dragging to
+        // absolute 72 means body-relative 60, so split_pct should become 60.
+        app.handle_mouse(mouse_event(52, 5, MouseEventKind::Down(MouseButton::Left)));
+        assert!(app.dragging_split);
+
+        app.handle_mouse(mouse_event(72, 5, MouseEventKind::Drag(MouseButton::Left)));
+        assert_eq!(
+            app.split_pct, 60,
+            "divider drag must use body-relative, not absolute, columns"
+        );
     }
 
     #[test]

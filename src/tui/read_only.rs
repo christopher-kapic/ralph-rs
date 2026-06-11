@@ -133,13 +133,13 @@ impl ReadOnlyTracker {
 }
 
 /// Banner text shown across all views while in read-only mode. Returns
-/// `None` when the TUI is not locked. The text matches the §13.2
-/// specification verbatim: `🔒 Read-only — run in progress (PID <n>).
-/// [S] cancel  [q] quit`.
+/// `None` when the TUI is not locked. Keep this view-agnostic: only some
+/// views bind `S` to stop/cancel, so the global lock banner must not
+/// advertise that key.
 pub fn banner(state: ReadOnly) -> Option<String> {
     state
         .pid()
-        .map(|pid| format!("🔒 Read-only — run in progress (PID {pid}). [S] cancel  [q] quit"))
+        .map(|pid| format!("🔒 Read-only — run in progress (PID {pid}). [q] quit"))
 }
 
 /// Detect read-only state by querying `run_locks` for the project. Returns
@@ -302,7 +302,10 @@ mod tests {
     fn banner_includes_pid_and_keybinding_hints() {
         let text = banner(ReadOnly::Locked { pid: 4242 }).expect("banner");
         assert!(text.contains("PID 4242"), "missing PID: {text}");
-        assert!(text.contains("[S] cancel"), "missing [S]: {text}");
+        assert!(
+            !text.contains("[S]"),
+            "shared banner must not advertise view-specific stop binding: {text}"
+        );
         assert!(text.contains("[q] quit"), "missing [q]: {text}");
         assert!(text.contains("Read-only"), "missing label: {text}");
     }

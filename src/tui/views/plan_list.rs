@@ -261,9 +261,9 @@ impl PlanListApp {
     ///   by setting `open_request` via [`Self::request_open`];
     /// * the scroll wheel maps to `k` / `j` (cursor up / down).
     ///
-    /// Subsequent drags recompute `split_pct` from
-    /// `cursor_column / last_body_width` (clamped 20..=80); release clears
-    /// the drag flag.
+    /// Subsequent drags recompute `split_pct` from the cursor's body-relative
+    /// column over `last_body_width` (clamped 20..=80); release clears the
+    /// drag flag.
     pub fn handle_mouse(&mut self, event: MouseEvent) {
         use crossterm::event::{MouseButton, MouseEventKind};
 
@@ -282,13 +282,15 @@ impl PlanListApp {
         if self.last_body_width == 0 {
             return;
         }
+        let body_x = self.tile_area.x as i32;
         let body_width = self.last_body_width as u32;
-        let divider_col = (body_width * self.split_pct as u32 / 100) as i32;
+        let divider_col = body_x + (body_width * self.split_pct as u32 / 100) as i32;
 
         match event.kind {
             // An armed divider drag takes precedence over tile hit-testing.
             MouseEventKind::Drag(MouseButton::Left) if self.dragging_split => {
-                let pct = (event.column as u32 * 100) / body_width.max(1);
+                let rel_col = (event.column as i32 - body_x).max(0) as u32;
+                let pct = (rel_col * 100) / body_width.max(1);
                 self.split_pct = pct.clamp(20, 80) as u16;
             }
             MouseEventKind::Down(MouseButton::Left) => {
@@ -406,12 +408,10 @@ impl PlanListApp {
         self.selection.clear();
     }
 
-    /// Handle `<esc>` per TUI-plan.md §5: clear the selection if any items
-    /// are selected, otherwise quit. Returns `true` when the press
-    /// consumed a non-empty selection (so the caller can suppress quit).
+    /// Handle `<esc>`: clear the selection if any items are selected;
+    /// otherwise do nothing. `q` is the explicit quit binding.
     pub fn escape(&mut self) -> bool {
         if self.selection.is_empty() {
-            self.should_quit = true;
             false
         } else {
             self.selection.clear();
@@ -718,7 +718,7 @@ fn render_toast_overlay(frame: &mut Frame, area: Rect, text: &str, color: ratatu
     // cwd/version column. A 1-char trailing pad keeps the toast visually
     // distinct from the cwd when both fit on the row.
     let max_toast = area.width.saturating_sub(1).max(1);
-    let desired = text.chars().count().min(max_toast as usize) as u16;
+    let desired = chrome::display_width(text).min(max_toast as usize) as u16;
     if desired == 0 {
         return;
     }
@@ -892,7 +892,7 @@ pub(crate) fn render_tile(
     let badge_text = selection_badge.map(|n| format!("[{n}]"));
     let badge_cols = badge_text
         .as_deref()
-        .map(|s| s.chars().count())
+        .map(chrome::display_width)
         .unwrap_or(0);
     let title_max = (inner.width as usize).saturating_sub(badge_cols);
     let title = Paragraph::new(Line::from(Span::styled(
@@ -984,21 +984,29 @@ pub(crate) fn render_tile(
 }
 
 /// Right-truncate a string to fit `max_cols` display columns, appending `…`
-/// when truncation occurs. Width is approximated by `char` count, which is
-/// good enough for the slugs / timestamps the tile renders (no CJK / emoji
-/// in those fields).
+/// when truncation occurs.
 pub(crate) fn truncate(s: &str, max_cols: usize) -> String {
     if max_cols == 0 {
         return String::new();
     }
-    if s.chars().count() <= max_cols {
+    if chrome::display_width(s) <= max_cols {
         return s.to_string();
     }
     if max_cols == 1 {
         return "…".to_string();
     }
-    let take = max_cols - 1;
-    let mut out: String = s.chars().take(take).collect();
+    let target = max_cols - 1;
+    let mut end_byte = 0;
+    let mut used = 0;
+    for (i, ch) in s.char_indices() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w > target {
+            break;
+        }
+        used += w;
+        end_byte = i + ch.len_utf8();
+    }
+    let mut out = String::from(&s[..end_byte]);
     out.push('…');
     out
 }
@@ -1334,11 +1342,11 @@ mod tests {
     }
 
     #[test]
-    fn test_escape_with_no_selection_quits() {
+    fn test_escape_with_no_selection_is_noop() {
         let mut app = PlanListApp::new(make_tiles(2), "/proj", "UTC");
         let consumed = app.escape();
         assert!(!consumed, "esc without selection should not be consumed");
-        assert!(app.should_quit);
+        assert!(!app.should_quit);
     }
 
     #[test]
@@ -1778,8 +1786,8 @@ mod tests {
     #[test]
     fn test_status_dot_color_legend() {
         // docs/dag-redesign.md §12.5: the dot now routes through the single
-        // mapping. Ready/Planning moved blue→bright-white (STATUS_WAITING,
-        // the old pending-blue was reused as STATUS_REVIEWING) and
+        // mapping. Ready/Planning moved blue→neutral waiting
+        // (STATUS_WAITING, the old pending-blue was reused as STATUS_REVIEWING) and
         // Interrupted moved purple→orange (STATUS_BLOCKED, retiring the
         // purple STATUS_QUESTION). Complete/InProgress/Failed are unchanged.
         assert_eq!(
@@ -2258,6 +2266,32 @@ mod tests {
 
         app.handle_mouse(mouse_event(60, 5, MouseEventKind::Up(MouseButton::Left)));
         assert!(!app.dragging_split, "Up should clear the drag flag");
+    }
+
+    #[test]
+    fn split_drag_uses_body_relative_columns_in_plan_list() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        use ratatui::layout::Rect;
+
+        let mut app = PlanListApp::new(make_tiles(3), "/proj", "UTC");
+        app.last_body_width = 100;
+        app.tile_area = Rect {
+            x: 12,
+            y: 2,
+            width: 40,
+            height: 20,
+        };
+
+        // Divider is body_x + 40% of 100 = absolute column 52. Dragging to
+        // absolute 72 means body-relative 60, so split_pct should become 60.
+        app.handle_mouse(mouse_event(52, 5, MouseEventKind::Down(MouseButton::Left)));
+        assert!(app.dragging_split);
+
+        app.handle_mouse(mouse_event(72, 5, MouseEventKind::Drag(MouseButton::Left)));
+        assert_eq!(
+            app.split_pct, 60,
+            "divider drag must use body-relative, not absolute, columns"
+        );
     }
 
     #[test]

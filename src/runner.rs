@@ -763,10 +763,10 @@ async fn scheduler_tick(
     // the next tick (the blocker's open interruption shadows the step
     // via the derived `Blocked` overlay, so `pick_next_step` excludes
     // it).
-    let resumed_parked_worktree =
+    let (resumed_parked_worktree, resumed_preserve_files) =
         match restore_parked_step_worktree(conn, &current_step, workdir, out).await? {
-            RestoreParkedOutcome::Resumed => true,
-            RestoreParkedOutcome::NotParked => false,
+            RestoreParkedOutcome::Resumed { preserve_files } => (true, preserve_files),
+            RestoreParkedOutcome::NotParked => (false, Vec::new()),
             RestoreParkedOutcome::BlockedAfterFailure => {
                 // Mark as "seen this tick" so the immediate re-pick
                 // doesn't return the same step (defense-in-depth — the
@@ -816,7 +816,7 @@ async fn scheduler_tick(
     // same-process `ralph skip` (CLI or TUI) routes through the cancel
     // ladder instead of just flipping the DB status. The guard clears
     // the flag on drop — covering the `?`-early-return path too.
-    let _in_flight = crate::signal::StepInFlightGuard::enter();
+    let _in_flight = crate::signal::StepInFlightGuard::enter(&current_step.id);
 
     // Acquire the single implementation slot (§9-inv-1 / §3.5 item 2).
     // Held ONLY for implement+test+commit; explicitly released before any
@@ -848,6 +848,7 @@ async fn scheduler_tick(
             chunk_seq: Some(chunk_seq.clone()),
             chunk_max_bytes: config.harness_chunk_max_bytes,
             resumed_parked_worktree,
+            resumed_preserve_files,
         },
     })
     .await?;
@@ -1009,6 +1010,15 @@ async fn scheduler_tick(
                 );
             }
             // Mark plan as failed and stop.
+            drain_reviews_on_abort(
+                conn,
+                effective_plan,
+                &mut state.reviews,
+                workdir,
+                out,
+                &mut state.abort_rx,
+            )
+            .await;
             storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Failed)?;
             result.final_status = PlanStatus::Failed;
             result.step_results.push(step_result);
@@ -1069,6 +1079,15 @@ async fn scheduler_tick(
                     step_num, total_now, current_step.title
                 );
             }
+            drain_reviews_on_abort(
+                conn,
+                effective_plan,
+                &mut state.reviews,
+                workdir,
+                out,
+                &mut state.abort_rx,
+            )
+            .await;
             storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Failed)?;
             result.final_status = PlanStatus::Failed;
             result.step_results.push(step_result);
@@ -1116,7 +1135,6 @@ async fn scheduler_tick(
             // twice in the summary / "paused after N steps" totals. Mirrors
             // the `state.executed_step_ids.remove` directly above.
             result.steps_executed = result.steps_executed.saturating_sub(1);
-            result.step_results.push(step_result);
             return Ok(TickOutcome::Continue);
         }
     }
@@ -1957,7 +1975,7 @@ pub fn skip_step(
     // executor owns that on the skip path, and a double write would race the
     // in-flight attempt.
     if step.status == StepStatus::InProgress {
-        if crate::signal::request_skip_in_flight(changes) {
+        if crate::signal::request_skip_in_flight_for_step(&step.id, changes) {
             eprintln!(
                 "Skipping in-flight step {} '{}' — interrupting the harness…",
                 actual_num, step.title
@@ -1996,7 +2014,17 @@ pub fn skip_step(
         step.status == StepStatus::InProgress && changes == crate::git::ParkStrategyKind::Commit;
     if handled_stale_commit {
         let workdir = Path::new(&plan.project);
-        let has_changes = git::has_uncommitted_changes(workdir).unwrap_or(false);
+        let has_changes = match git::has_uncommitted_changes(workdir) {
+            Ok(has_changes) => has_changes,
+            Err(e) => {
+                eprintln!(
+                    "Warning: could not inspect crashed-runner residue for step {} '{}': {e}. \
+                     Check the worktree manually before assuming no WIP remains.",
+                    actual_num, step.title
+                );
+                false
+            }
+        };
         if has_changes {
             let trailer_id = &step.id;
             let subject = format!(
@@ -2168,6 +2196,15 @@ fn prompt_crash_reconcile(dirty_files: &[String], step_hint: &str) -> Result<Rec
     Ok(ReconcileAction::Cancel)
 }
 
+async fn prompt_crash_reconcile_blocking(
+    dirty_files: Vec<String>,
+    step_hint: String,
+) -> Result<ReconcileAction> {
+    tokio::task::spawn_blocking(move || prompt_crash_reconcile(&dirty_files, &step_hint))
+        .await
+        .context("crash-reconcile prompt task panicked")?
+}
+
 /// If the working tree is dirty, stash it with a ralph-branded message and
 /// return the stash's commit SHA plus the list of files that were staged at
 /// stash time. Returns `Ok(None)` on a clean tree. Bails with a user-facing
@@ -2240,10 +2277,20 @@ async fn stash_if_dirty(
             let wdir3 = wdir_clone.clone();
             let br3 = br.clone();
             let tgt3 = tgt.clone();
-            let is_residue =
-                blocking_git(move || git::has_crash_residue_overlap_for_step(&wdir3, &br3, &tgt3))
-                    .await
-                    .unwrap_or(false);
+            let is_residue = match blocking_git(move || {
+                git::has_crash_residue_overlap_for_step(&wdir3, &br3, &tgt3)
+            })
+            .await
+            {
+                Ok(is_residue) => is_residue,
+                Err(e) => {
+                    eprintln!(
+                        "Warning: could not inspect crashed-runner residue overlap for step \
+                         '{tgt}': {e}. Check the worktree manually before discarding or stashing."
+                    );
+                    false
+                }
+            };
 
             if is_residue {
                 // The prompt reads from stdin and writes to stderr, so gate
@@ -2253,7 +2300,7 @@ async fn stash_if_dirty(
                 // enter the prompt, hit EOF, and silently Cancel the run.
                 let is_tty = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
                 if is_tty {
-                    match prompt_crash_reconcile(&files, tgt) {
+                    match prompt_crash_reconcile_blocking(files.clone(), tgt.clone()).await {
                         Ok(ReconcileAction::CommitWip) => {
                             let subject =
                                 format!("[ralph wip] crashed-residue before step {}", tgt);
@@ -2302,7 +2349,11 @@ async fn stash_if_dirty(
                                 move || git::list_staged_files(&wd)
                             })
                             .await
-                            .unwrap_or_default();
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "could not list staged files before crash-residue stash: {e}"
+                                )
+                            })?;
                             let ts = chrono::Utc::now()
                                 .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
                             let message = format!(
@@ -2517,7 +2568,7 @@ enum RestoreParkedOutcome {
     NotParked,
     /// The parked stash was applied cleanly; the worktree carries the
     /// resumed WIP and the bridge row was cleared.
-    Resumed,
+    Resumed { preserve_files: Vec<String> },
     /// The parked stash could not be applied: NotFound (admin `git stash
     /// clear` / IDE plugin dropped it) or Conflicted (apply ran but left
     /// conflict markers, or returned non-zero). A `kind=Blocker`
@@ -2583,7 +2634,9 @@ async fn restore_parked_step_worktree(
                 .await?;
             }
             storage::clear_step_parked_worktree(conn, &step.id)?;
-            Ok(RestoreParkedOutcome::Resumed)
+            Ok(RestoreParkedOutcome::Resumed {
+                preserve_files: parked.preserve_files,
+            })
         }
         StashPopOutcome::Conflicted(_stderr) => {
             // Cluster 3 Fix #2: per-step blocker, NOT a whole-run bail.
@@ -2885,9 +2938,16 @@ async fn setup_branch(workdir: &Path, plan: &Plan, parent_sha: Option<&str>) -> 
         .await
     };
 
-    if create_result.is_err() {
+    if let Err(create_err) = create_result {
         // Branch might already exist; try a plain checkout.
-        checkout_existing_branch(workdir, &plan.branch_name).await?;
+        if let Err(checkout_err) = checkout_existing_branch(workdir, &plan.branch_name).await {
+            return Err(checkout_err).with_context(|| {
+                format!(
+                    "failed to create branch '{}' ({create_err:#}); fallback checkout also failed",
+                    plan.branch_name
+                )
+            });
+        }
     }
 
     Ok(())
@@ -4813,7 +4873,7 @@ mod tests {
         // Register a cancel sender for this process (as the signal listener
         // would for a real run) and mark a step in-flight.
         let (_handle, mut rx) = crate::signal::install_and_spawn_with_handle();
-        let _in_flight = crate::signal::StepInFlightGuard::enter();
+        let _in_flight = crate::signal::StepInFlightGuard::enter(&s1.id);
 
         let skipped = skip_step(
             &conn,
@@ -4837,6 +4897,67 @@ mod tests {
             steps[0].status,
             StepStatus::InProgress,
             "in-flight skip must defer the status flip to the executor"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_skip_step_same_process_in_flight_requires_matching_step() {
+        let _guard = crate::signal::lock_exit_cleanup_test();
+        let conn = setup();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let (s1, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            storage::NewStep {
+                title: "target",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+        storage::update_step_status(&conn, &s1.id, StepStatus::InProgress).unwrap();
+
+        let (_handle, rx) = crate::signal::install_and_spawn_with_handle();
+        let _in_flight = crate::signal::StepInFlightGuard::enter("other-step");
+
+        let skipped = skip_step(
+            &conn,
+            &plan,
+            Some(1),
+            None,
+            crate::git::ParkStrategyKind::Stash,
+        )
+        .unwrap();
+        assert_eq!(skipped, 1);
+        assert_eq!(
+            *rx.borrow(),
+            None,
+            "mismatched in-process step must not receive a skip cancel"
+        );
+
+        let step_after = storage::get_step(&conn, &s1.id).unwrap();
+        assert_eq!(
+            step_after.status,
+            StepStatus::Skipped,
+            "without a matching in-process runner or live DB bridge, stale InProgress falls back to DB flip"
         );
     }
 
@@ -5954,7 +6075,7 @@ mod tests {
     fn seed_run_lock_row(conn: &Connection, project: &str) {
         conn.execute(
             "INSERT INTO run_locks (project, pid, plan_id, plan_slug) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![project, 1i64, "p-test", "slug"],
+            rusqlite::params![project, std::process::id() as i64, "p-test", "slug"],
         )
         .unwrap();
     }
@@ -6054,6 +6175,49 @@ mod tests {
         assert!(
             ticks.load(Ordering::SeqCst) > 0,
             "ticker made no progress — setup_branch blocked the runtime"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_setup_branch_reports_create_and_fallback_checkout_errors() {
+        let (_tmp, dir) = init_git_repo();
+        let plan = Plan {
+            id: "p1".to_string(),
+            slug: "test".to_string(),
+            project: dir.to_string_lossy().to_string(),
+            branch_name: "feat/missing".to_string(),
+            description: String::new(),
+            status: PlanStatus::Ready,
+            harness: None,
+            agent: None,
+            deterministic_tests: vec![],
+            plan_harness: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            pause_requested: false,
+            last_run_branch: None,
+            last_run_started_at: None,
+            skip_requested_step_id: None,
+            skip_changes: None,
+            review_enabled: None,
+            max_review_corrections: None,
+        };
+
+        let err = setup_branch(&dir, &plan, Some("definitely-not-a-sha"))
+            .await
+            .expect_err("invalid create target and missing branch should both fail");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("fallback checkout also failed"),
+            "fallback failure context missing: {rendered}"
+        );
+        assert!(
+            rendered.contains("feat/missing"),
+            "branch name missing from error: {rendered}"
+        );
+        assert!(
+            rendered.contains("definitely-not-a-sha"),
+            "original branch-create failure must be preserved: {rendered}"
         );
     }
 
@@ -6481,6 +6645,44 @@ mod tests {
 
     // -- stash_if_dirty / setup_branch --
 
+    #[test]
+    fn crash_reconcile_prompt_is_offloaded_from_async_path() {
+        let src = include_str!("runner.rs");
+        assert!(
+            src.contains("async fn prompt_crash_reconcile_blocking("),
+            "crash-reconcile prompt needs an async wrapper"
+        );
+        let wrapper_start = src
+            .find("async fn prompt_crash_reconcile_blocking(")
+            .expect("wrapper exists");
+        let wrapper_end = src[wrapper_start..]
+            .find("\n}\n")
+            .map(|n| wrapper_start + n)
+            .expect("wrapper end");
+        let wrapper = &src[wrapper_start..wrapper_end];
+        assert!(
+            wrapper.contains("tokio::task::spawn_blocking"),
+            "stdio prompt must run on the blocking pool"
+        );
+
+        let stash_start = src
+            .find("async fn stash_if_dirty(")
+            .expect("stash_if_dirty exists");
+        let stash_end = src[stash_start..]
+            .find("\nasync fn restore_working_tree")
+            .map(|n| stash_start + n)
+            .expect("stash_if_dirty end");
+        let stash_body = &src[stash_start..stash_end];
+        assert!(
+            stash_body.contains("prompt_crash_reconcile_blocking("),
+            "async stash path must call the offloaded prompt wrapper"
+        );
+        assert!(
+            !stash_body.contains("prompt_crash_reconcile(&"),
+            "async stash path must not call the blocking stdio prompt directly"
+        );
+    }
+
     /// With `--no-auto-stash`, a dirty tree must bail cleanly and list the
     /// files that are blocking the switch so the user can stage or
     /// discard them intentionally.
@@ -6696,7 +6898,7 @@ mod tests {
             .expect("expected parked stash");
         assert!(!git::has_uncommitted_changes(&dir).unwrap());
 
-        storage::set_step_parked_worktree(&conn, &step.id, stash_ref.as_str(), &staged_files)
+        storage::set_step_parked_worktree(&conn, &step.id, stash_ref.as_str(), &staged_files, &[])
             .unwrap();
 
         let out = OutputContext::from_cli(false, false, false);
@@ -6704,7 +6906,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            matches!(restored, RestoreParkedOutcome::Resumed),
+            matches!(restored, RestoreParkedOutcome::Resumed { .. }),
             "a parked row must be restored cleanly; got {restored:?}"
         );
         assert_eq!(
@@ -6782,7 +6984,7 @@ mod tests {
         // exist on the stash stack. Mirrors the post-admin-`git stash
         // clear` state exactly.
         let bogus_sha = "deadbeef0000000000000000000000000000beef";
-        storage::set_step_parked_worktree(&conn, &step.id, bogus_sha, &[]).unwrap();
+        storage::set_step_parked_worktree(&conn, &step.id, bogus_sha, &[], &[]).unwrap();
 
         let out = OutputContext::from_cli(false, false, false);
         let outcome = restore_parked_step_worktree(&conn, &step, &dir, &out)
@@ -6895,7 +7097,7 @@ mod tests {
             .output()
             .unwrap();
 
-        storage::set_step_parked_worktree(&conn, &step.id, stash_ref.as_str(), &[]).unwrap();
+        storage::set_step_parked_worktree(&conn, &step.id, stash_ref.as_str(), &[], &[]).unwrap();
 
         // Regression for the snapshot-based-cleanup data-loss bug: simulate a
         // file created "after the (old) snapshot" — concurrently, by the
@@ -7044,7 +7246,7 @@ mod tests {
             .current_dir(&dir)
             .output()
             .unwrap();
-        storage::set_step_parked_worktree(&conn, &step.id, stash_ref.as_str(), &[]).unwrap();
+        storage::set_step_parked_worktree(&conn, &step.id, stash_ref.as_str(), &[], &[]).unwrap();
 
         let out = OutputContext::from_cli(false, false, false);
         let outcome = restore_parked_step_worktree(&conn, &step, &dir, &out)
@@ -7143,7 +7345,7 @@ mod tests {
             .current_dir(&dir)
             .output()
             .unwrap();
-        storage::set_step_parked_worktree(&conn, &step.id, stash_ref.as_str(), &[]).unwrap();
+        storage::set_step_parked_worktree(&conn, &step.id, stash_ref.as_str(), &[], &[]).unwrap();
 
         let out = OutputContext::from_cli(false, false, false);
         restore_parked_step_worktree(&conn, &step, &dir, &out)
@@ -9438,6 +9640,30 @@ mod tests {
              verdicts aren't silently discarded when the executor aborts \
              mid-step"
         );
+
+        for (arm_name, next_arm, reason) in [
+            (
+                "StepOutcome::Failed => {",
+                "StepOutcome::Aborted => {",
+                "a terminal failure",
+            ),
+            (
+                "StepOutcome::Timeout => {",
+                "StepOutcome::PausedForQuestion => {",
+                "a terminal timeout",
+            ),
+        ] {
+            let arm_start = body.find(arm_name).expect("terminal arm must exist");
+            let arm = &body[arm_start..];
+            let arm_end = arm
+                .find(next_arm)
+                .expect("expected the next StepOutcome arm");
+            let terminal_arm = &arm[..arm_end];
+            assert!(
+                terminal_arm.contains("drain_reviews_on_abort("),
+                "{arm_name} must drain finished reviews before returning after {reason}"
+            );
+        }
     }
 
     #[test]

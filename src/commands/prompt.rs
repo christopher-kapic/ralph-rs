@@ -148,15 +148,13 @@ pub fn cmd_prompt_set(
         },
     }
 
-    if !out.quiet {
-        let icon = output::check_icon(out.color);
-        let verb = if value.is_some() {
-            "Updated"
-        } else {
-            "Cleared"
-        };
-        eprintln!("{icon} {verb} {} prompt", scope_name(scope));
-    }
+    let icon = output::check_icon(out.color);
+    let verb = if value.is_some() {
+        "Updated"
+    } else {
+        "Cleared"
+    };
+    out.status(format!("{icon} {verb} {} prompt", scope_name(scope)));
     Ok(())
 }
 
@@ -177,10 +175,8 @@ pub fn cmd_prompt_clear(
         PromptScope::Project => clear_project_layer(conn, project)?,
     }
 
-    if !out.quiet {
-        let icon = output::check_icon(out.color);
-        eprintln!("{icon} Cleared {} prompt", scope_name(scope));
-    }
+    let icon = output::check_icon(out.color);
+    out.status(format!("{icon} Cleared {} prompt", scope_name(scope)));
     Ok(())
 }
 
@@ -477,10 +473,11 @@ mod tests {
         assert_eq!(cfg.prompt.as_deref(), Some("from universal alias"));
     }
 
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::MutexGuard;
 
     /// Serialize tests that mutate `$XDG_CONFIG_HOME` (process-wide env).
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// Shared crate-wide so it serializes across test modules.
+    use crate::config::XDG_ENV_LOCK as ENV_LOCK;
 
     struct XdgGuard {
         _lock: MutexGuard<'static, ()>,

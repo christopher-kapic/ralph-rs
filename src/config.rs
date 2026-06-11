@@ -454,7 +454,7 @@ impl Config {
         fs::create_dir_all(dir)
             .with_context(|| format!("Failed to create config directory {}", dir.display()))?;
         let path = dir.join("config.json");
-        write_config_atomic(dir, &path, self)
+        write_config_atomic_preserving_unknown(dir, &path, self)
     }
 }
 
@@ -464,7 +464,26 @@ impl Config {
 /// see the old file or the new file — never a half-written one.
 fn write_config_atomic(dir: &Path, path: &Path, config: &Config) -> Result<()> {
     let json = serde_json::to_string_pretty(config)?;
+    write_config_json_atomic(dir, path, &json)
+}
 
+fn write_config_atomic_preserving_unknown(dir: &Path, path: &Path, config: &Config) -> Result<()> {
+    let replacement = serde_json::to_value(config)?;
+    let value = if path.exists() {
+        let contents = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read existing config {}", path.display()))?;
+        let mut existing: serde_json::Value = serde_json::from_str(&contents)
+            .with_context(|| format!("Failed to parse existing config {}", path.display()))?;
+        merge_json_preserving_unknown(&mut existing, replacement);
+        existing
+    } else {
+        replacement
+    };
+    let json = serde_json::to_string_pretty(&value)?;
+    write_config_json_atomic(dir, path, &json)
+}
+
+fn write_config_json_atomic(dir: &Path, path: &Path, json: &str) -> Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
@@ -498,6 +517,26 @@ fn write_config_atomic(dir: &Path, path: &Path, config: &Config) -> Result<()> {
         let _ = fs::remove_file(&tmp);
     }
     result
+}
+
+fn merge_json_preserving_unknown(existing: &mut serde_json::Value, replacement: serde_json::Value) {
+    match (existing, replacement) {
+        (serde_json::Value::Object(existing), serde_json::Value::Object(replacement)) => {
+            for (key, replacement_value) in replacement {
+                match existing.get_mut(&key) {
+                    Some(existing_value) => {
+                        merge_json_preserving_unknown(existing_value, replacement_value);
+                    }
+                    None => {
+                        existing.insert(key, replacement_value);
+                    }
+                }
+            }
+        }
+        (existing, replacement) => {
+            *existing = replacement;
+        }
+    }
 }
 
 impl Default for Config {
@@ -1162,6 +1201,15 @@ pub fn agents_dir() -> Result<PathBuf> {
     Ok(config_dir()?.join("agents"))
 }
 
+/// Shared process-wide lock serializing every test that mutates the global
+/// `$XDG_CONFIG_HOME`. It lives at crate scope so test guards in different
+/// modules contend on the *same* mutex — per-module locks don't serialize
+/// across modules, and the racing writes to the process-global env var made
+/// `load_or_create_config` intermittently observe a redirected/missing config
+/// dir ("Failed to publish …").
+#[cfg(test)]
+pub(crate) static XDG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Loads configuration from disk, or creates a default config file if none exists.
 pub fn load_or_create_config() -> Result<Config> {
     let dir = config_dir()?;
@@ -1363,8 +1411,10 @@ fn migrate_legacy_prompt_fields(raw: &mut serde_json::Value) -> bool {
 /// empty/null value" for recognized harness fields. User-set known keys,
 /// including explicit `[]` arrays or `null` values, are never touched —
 /// only known keys that don't appear in the user's object are filled in.
-/// The config file is a closed schema: callers that persist the merged
-/// result through [`Config`] do not preserve unknown JSON keys.
+/// Normal config mutators persist through [`Config::save_at`], which merges
+/// serialized known fields into the existing JSON file so unknown keys survive
+/// round trips. Schema migrations that intentionally remove obsolete keys use
+/// the exact-replacement writer instead.
 ///
 /// Only applied to harnesses whose *name* matches one of the built-ins
 /// defined by [`Config::default`]. Custom-named harnesses are left alone
@@ -2327,6 +2377,50 @@ mod tests {
         let loaded = read_and_validate(&path).expect("read_and_validate");
         assert_eq!(loaded, config);
         assert_eq!(loaded.display_timezone, "America/New_York");
+    }
+
+    #[test]
+    fn test_save_at_preserves_unknown_json_keys() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
+        let path = dir.join("config.json");
+
+        let mut raw = serde_json::to_value(Config::default()).unwrap();
+        let root = raw.as_object_mut().unwrap();
+        root.insert("future_top_level".into(), serde_json::json!({"keep": true}));
+        root.get_mut("harnesses")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .get_mut("codex")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("future_harness_field".into(), serde_json::json!("keep-me"));
+        std::fs::write(&path, serde_json::to_string_pretty(&raw).unwrap()).unwrap();
+
+        let mut config = read_and_validate(&path).expect("read existing config");
+        config.display_timezone = "America/New_York".to_string();
+        config.save_at(&dir).expect("save_at");
+
+        let on_disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            on_disk
+                .pointer("/display_timezone")
+                .and_then(|v| v.as_str()),
+            Some("America/New_York")
+        );
+        assert_eq!(
+            on_disk.pointer("/future_top_level/keep"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(
+            on_disk
+                .pointer("/harnesses/codex/future_harness_field")
+                .and_then(|v| v.as_str()),
+            Some("keep-me")
+        );
     }
 
     #[test]

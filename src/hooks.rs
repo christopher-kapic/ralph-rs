@@ -96,6 +96,34 @@ impl std::fmt::Display for HookFailure {
 
 impl std::error::Error for HookFailure {}
 
+fn apply_minimal_child_env(cmd: &mut Command) {
+    let keep = [
+        "PATH",
+        "HOME",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "SHELL",
+        "USER",
+        "USERNAME",
+        "SYSTEMROOT",
+        "SystemRoot",
+        "COMSPEC",
+    ];
+    let preserved: Vec<(String, String)> = keep
+        .iter()
+        .filter_map(|key| {
+            std::env::var(key)
+                .ok()
+                .map(|value| ((*key).to_string(), value))
+        })
+        .collect();
+    cmd.env_clear();
+    for (key, value) in preserved {
+        cmd.env(key, value);
+    }
+}
+
 /// Build the warning text emitted when a post-lifecycle hook fails non-fatally.
 /// Kept separate from emission so it can be unit-tested without capturing
 /// stderr. The `Db` variant is intentionally handled here too even though the
@@ -187,6 +215,7 @@ async fn run_one_hook(
         // Defense-in-depth: the timeout path below already SIGKILLs the
         // process group and reaps explicitly.
         .kill_on_drop(true);
+    apply_minimal_child_env(&mut cmd);
 
     // Put the hook into its own process group so the timeout kill fans out
     // to grandchildren (e.g. a hook that backgrounds `(sleep 99 &)`). Mirrors
@@ -663,6 +692,45 @@ mod tests {
 
         let contents = std::fs::read_to_string(&marker).unwrap();
         assert_eq!(contents.trim(), "timeout");
+    }
+
+    #[tokio::test]
+    async fn test_hook_commands_do_not_inherit_caller_environment() {
+        let conn = db::open_memory().unwrap();
+        let plan = make_plan("p1", "my-plan");
+        let step = make_step("s1", "p1", "Step one");
+        insert_plan_and_step(&conn, &plan, &step);
+
+        let tmp = TempDir::new().unwrap();
+        let marker = tmp.path().join("env.txt");
+        // SAFETY: this test uses a uniquely named variable and removes it
+        // immediately after the child process completes.
+        unsafe {
+            std::env::set_var("RALPH_HOOK_SECRET_ENV", "leaked");
+        }
+        let capture = Hook {
+            name: "capture".to_string(),
+            description: String::new(),
+            lifecycle: Lifecycle::PostStep,
+            scope: Scope::Global,
+            command: format!(
+                "printf '%s %s' \"${{RALPH_HOOK_SECRET_ENV-unset}}\" \"$RALPH_PLAN_SLUG\" > {}",
+                marker.display()
+            ),
+        };
+        let ctx = ctx_for(vec![capture], tmp.path().to_path_buf());
+        storage::attach_hook_to_step(&conn, &plan.id, &step.id, "post-step", "capture").unwrap();
+
+        run_post_step(&conn, &ctx, &plan, &step, 1, "complete", tmp.path())
+            .await
+            .unwrap();
+        // SAFETY: see set_var above.
+        unsafe {
+            std::env::remove_var("RALPH_HOOK_SECRET_ENV");
+        }
+
+        let contents = std::fs::read_to_string(&marker).unwrap();
+        assert_eq!(contents, "unset my-plan");
     }
 
     #[tokio::test]

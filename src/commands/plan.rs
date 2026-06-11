@@ -53,6 +53,11 @@ pub fn plan_create(conn: &Connection, args: PlanCreateArgs<'_>, out: &OutputCont
         bail!("invalid plan slug: slug is empty or whitespace-only");
     }
     crate::git::check_ref_format(branch_name)?;
+    if let Some(cap) = max_review_corrections
+        && cap < 0
+    {
+        bail!("--max-review-corrections must be non-negative, got {cap}");
+    }
 
     // Resolve dependency slugs to plan IDs BEFORE creating the plan so we
     // fail fast if any are missing. We must look them up in the same
@@ -104,17 +109,17 @@ pub fn plan_create(conn: &Connection, args: PlanCreateArgs<'_>, out: &OutputCont
         Ok(plan)
     })?;
 
-    eprintln!(
+    out.status(format!(
         "{} Created plan: {}",
         output::check_icon(out.color),
         output::bold(&plan.slug, out.color),
-    );
+    ));
     if !tests.is_empty() {
-        eprintln!("  Tests: {}", tests.join(", "));
+        out.status(format!("  Tests: {}", tests.join(", ")));
     }
     if !resolved_deps.is_empty() {
         let slugs: Vec<&str> = resolved_deps.iter().map(|(s, _)| s.as_str()).collect();
-        eprintln!("  Depends on: {}", slugs.join(", "));
+        out.status(format!("  Depends on: {}", slugs.join(", ")));
     }
     Ok(())
 }
@@ -142,12 +147,12 @@ pub fn plan_dependency_add(
         let dep = storage::get_plan_by_slug(conn, dep_slug, project)?
             .with_context(|| format!("Dependency plan not found: {dep_slug}"))?;
         storage::add_plan_dependency(conn, &plan.id, &dep.id)?;
-        eprintln!(
+        out.status(format!(
             "{} Added dependency: {} -> {}",
             output::check_icon(out.color),
             slug,
             dep_slug
-        );
+        ));
     }
 
     Ok(())
@@ -172,12 +177,12 @@ pub fn plan_dependency_remove(
         let dep = storage::get_plan_by_slug(conn, dep_slug, project)?
             .with_context(|| format!("Dependency plan not found: {dep_slug}"))?;
         storage::remove_plan_dependency(conn, &plan.id, &dep.id)?;
-        eprintln!(
+        out.status(format!(
             "{} Removed dependency: {} -> {}",
             output::check_icon(out.color),
             slug,
             dep_slug
-        );
+        ));
     }
 
     Ok(())
@@ -286,7 +291,7 @@ pub fn plan_list(
     }
 
     if plans.is_empty() {
-        eprintln!("No plans found.");
+        out.status("No plans found.");
         return Ok(());
     }
 
@@ -381,11 +386,11 @@ pub fn plan_approve(
     }
 
     storage::update_plan_status(conn, &plan.id, PlanStatus::Ready)?;
-    eprintln!(
+    out.status(format!(
         "{} Plan '{}' approved and ready for execution",
         output::check_icon(out.color),
         slug
-    );
+    ));
     Ok(())
 }
 
@@ -408,11 +413,11 @@ pub fn plan_archive(
     }
 
     storage::update_plan_status(conn, &plan.id, PlanStatus::Archived)?;
-    eprintln!(
+    out.status(format!(
         "{} Archived plan '{}'",
         output::plan_status_icon(PlanStatus::Archived, out.color),
         slug
-    );
+    ));
     Ok(())
 }
 
@@ -435,11 +440,11 @@ pub fn plan_unarchive(
 
     // Restore to complete — the most neutral terminal state.
     storage::update_plan_status(conn, &plan.id, PlanStatus::Complete)?;
-    eprintln!(
+    out.status(format!(
         "{} Unarchived plan '{}' (status: complete)",
         output::check_icon(out.color),
         slug
-    );
+    ));
     Ok(())
 }
 
@@ -448,12 +453,16 @@ pub fn plan_delete(
     slug: &str,
     project: &str,
     force: bool,
+    non_interactive: bool,
     out: &OutputContext,
 ) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, slug, project)?
         .with_context(|| format!("Plan not found: {slug}"))?;
 
     if !force {
+        if non_interactive {
+            bail!("confirmation required to delete plan '{slug}'; pass --force to confirm");
+        }
         let prompt = format!("Delete plan '{}' and all its steps/logs?", slug);
         if !output::confirm(&prompt)? {
             eprintln!("Aborted.");
@@ -462,7 +471,11 @@ pub fn plan_delete(
     }
 
     storage::delete_plan(conn, &plan.id)?;
-    eprintln!("{} Deleted plan '{}'", output::check_icon(out.color), slug);
+    out.status(format!(
+        "{} Deleted plan '{}'",
+        output::check_icon(out.color),
+        slug
+    ));
     Ok(())
 }
 
@@ -504,7 +517,7 @@ pub fn cmd_plan_review(
         println!("{}", serde_json::to_string(&json)?);
     } else {
         let verb = if enabled { "enabled" } else { "disabled" };
-        println!("Review {verb} for plan '{plan_slug}'.");
+        out.status(format!("Review {verb} for plan '{plan_slug}'."));
     }
     Ok(())
 }
@@ -515,7 +528,7 @@ pub fn cmd_plan_set_hook(
     project: &str,
     lifecycle: Lifecycle,
     hook_name: &str,
-    _out: &OutputContext,
+    out: &OutputContext,
 ) -> Result<()> {
     if hook_library::try_load(hook_name)?.is_none() {
         eprintln!(
@@ -526,7 +539,9 @@ pub fn cmd_plan_set_hook(
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
     storage::attach_hook_to_plan(conn, &plan.id, lifecycle.as_str(), hook_name)?;
-    println!("Attached plan-wide hook '{hook_name}' to '{plan_slug}' at {lifecycle}");
+    out.status(format!(
+        "Attached plan-wide hook '{hook_name}' to '{plan_slug}' at {lifecycle}"
+    ));
     Ok(())
 }
 
@@ -536,7 +551,7 @@ pub fn cmd_plan_unset_hook(
     project: &str,
     lifecycle: Lifecycle,
     hook_name: &str,
-    _out: &OutputContext,
+    out: &OutputContext,
 ) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
@@ -544,7 +559,9 @@ pub fn cmd_plan_unset_hook(
     if removed == 0 {
         bail!("No plan-wide hook '{hook_name}' attached to '{plan_slug}' at {lifecycle}");
     }
-    println!("Detached plan-wide hook '{hook_name}' from '{plan_slug}'");
+    out.status(format!(
+        "Detached plan-wide hook '{hook_name}' from '{plan_slug}'"
+    ));
     Ok(())
 }
 
@@ -603,10 +620,10 @@ pub fn plan_harness_set(
         });
         println!("{}", serde_json::to_string(&json)?);
     } else {
-        eprintln!(
+        out.status(format!(
             "Set plan-generation harness for '{}' to '{}'.",
             plan_slug, harness
-        );
+        ));
     }
     Ok(())
 }
@@ -631,11 +648,14 @@ pub fn plan_harness_show(
         println!("{}", serde_json::to_string(&json)?);
     } else {
         match &plan.plan_harness {
-            Some(h) => eprintln!("Plan '{}' plan-generation harness: {}", plan.slug, h),
-            None => eprintln!(
+            Some(h) => out.status(format!(
+                "Plan '{}' plan-generation harness: {}",
+                plan.slug, h
+            )),
+            None => out.status(format!(
                 "Plan '{}' plan-generation harness: (default: {})",
                 plan.slug, config.default_harness
-            ),
+            )),
         }
     }
     Ok(())
@@ -918,6 +938,39 @@ mod tests {
         // before any write — verify the plan list stayed empty.
         let plans = storage::list_plans(&conn, project, false).unwrap();
         assert!(plans.is_empty(), "no plan row may be written: {plans:?}");
+    }
+
+    #[test]
+    fn test_plan_create_negative_max_review_corrections_errors_and_writes_no_plan() {
+        let conn = crate::db::open_memory().expect("open_memory");
+        let project = "/tmp/pc-negative-review-cap";
+
+        let err = plan_create(
+            &conn,
+            PlanCreateArgs {
+                slug: "bad-cap",
+                project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: Some(-1),
+                tests: &[],
+                depends_on: &[],
+            },
+            &quiet_out(),
+        )
+        .expect_err("a negative review correction cap must fail fast");
+        assert!(
+            err.to_string().contains("must be non-negative"),
+            "error must cite the invalid cap: {err}"
+        );
+        assert!(
+            storage::get_plan_by_slug(&conn, "bad-cap", project)
+                .unwrap()
+                .is_none(),
+            "no plan row may be written when the cap is invalid"
+        );
     }
 
     #[test]

@@ -6,8 +6,8 @@
 //
 // The state machine has two modes mirroring the spec from step 36:
 //   * `List` shows the current working tag list as a `ratatui::Table`. The
-//     keybindings `i` (add), `d` (remove), `Enter`/`q` (save), `Esc`
-//     (discard) live here.
+//     keybindings `i` (add), `d` (remove), `Enter` (save), `q`/`Esc`
+//     (cancel) live here.
 //   * `Input` shows a centered text-input modal triggered by `i`. Enter
 //     accepts the typed tag (after trim + non-empty + dedup validation) and
 //     returns to `List`; Esc abandons the input without committing it.
@@ -54,8 +54,8 @@ pub enum Mode {
 pub enum Outcome {
     /// Key consumed; no side effect required.
     Pending,
-    /// User pressed `Enter` / `q` in list mode — persist the working tag list
-    /// via [`crate::storage::update_step_fields_ext`] and pop the sub-view.
+    /// User pressed `Enter` in list mode — persist the working tag list via
+    /// [`crate::storage::update_step_fields_ext`] and pop the sub-view.
     SaveAndPop { tags: Vec<String> },
     /// User pressed `<esc>` in list mode (or Ctrl-C anywhere) — pop without
     /// touching the database. Mirrors the universal "esc cancels" rule.
@@ -74,8 +74,8 @@ pub struct StepTagsApp {
     /// title bar so the user always knows which step they're scoped to.
     pub step_label: String,
     /// Working tag list. Starts as a clone of `step.tags`; mutated locally
-    /// until the user commits via Enter/q (in which case the dispatcher
-    /// writes back) or cancels via Esc (in which case it's dropped).
+    /// until the user commits via Enter (in which case the dispatcher writes
+    /// back) or cancels via q/Esc (in which case it's dropped).
     pub tags: Vec<String>,
     /// 0-based cursor in the tag list.
     pub list_cursor: usize,
@@ -188,12 +188,12 @@ impl StepTagsApp {
             }
 
             // Save the working tag list and pop.
-            KeyCode::Enter | KeyCode::Char('q') => Outcome::SaveAndPop {
+            KeyCode::Enter => Outcome::SaveAndPop {
                 tags: self.tags.clone(),
             },
 
             // Discard and pop.
-            KeyCode::Esc => Outcome::DiscardAndPop,
+            KeyCode::Esc | KeyCode::Char('q') => Outcome::DiscardAndPop,
 
             _ => Outcome::Pending,
         }
@@ -265,7 +265,7 @@ impl StepTagsApp {
 // Rendering
 // ---------------------------------------------------------------------------
 
-const LIST_HINT: &str = " [i] add   [d] remove   [Enter/q] save   [Esc] cancel ";
+const LIST_HINT: &str = " [i] add   [d] remove   [I] inbox   [Enter] save   [q/Esc] cancel ";
 const INPUT_HINT: &str = " [Enter] add   [Esc] cancel ";
 
 /// Draw the tag table over `area`. When the input modal is open, render the
@@ -670,15 +670,10 @@ mod tests {
     }
 
     #[test]
-    fn q_in_list_emits_save_and_pop() {
+    fn q_in_list_discards_and_pops() {
         let mut app = app_with(vec!["FIX"]);
         let outcome = app.handle_key(key(KeyCode::Char('q')));
-        assert_eq!(
-            outcome,
-            Outcome::SaveAndPop {
-                tags: vec!["FIX".to_string()],
-            }
-        );
+        assert_eq!(outcome, Outcome::DiscardAndPop);
     }
 
     #[test]

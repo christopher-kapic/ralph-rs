@@ -38,6 +38,15 @@ pub(crate) fn normalize_tag_inputs(raw: &[String]) -> Result<Vec<String>> {
     Ok(out)
 }
 
+fn ensure_non_negative(value: Option<i32>, label: &str) -> Result<()> {
+    if let Some(n) = value
+        && n < 0
+    {
+        bail!("{label} must be non-negative, got {n}");
+    }
+    Ok(())
+}
+
 /// Render a step's tags for plain-text output (e.g. `[FIX][REGRESSION]`).
 ///
 /// Returns an empty string when the step has no tags so list rendering stays
@@ -88,12 +97,12 @@ pub fn step_list(
 
     if steps.is_empty() {
         if filter_tags.is_empty() {
-            eprintln!("No steps in plan '{}'.", plan_slug);
+            out.status(format!("No steps in plan '{}'.", plan_slug));
         } else {
-            eprintln!(
+            out.status(format!(
                 "No steps in plan '{}' matching tags {:?}.",
                 plan_slug, filter_tags
-            );
+            ));
         }
         return Ok(());
     }
@@ -240,6 +249,10 @@ pub fn step_add(conn: &Connection, args: StepAddArgs<'_>, out: &OutputContext) -
         tags,
         depends_on,
     } = args;
+    if title.trim().is_empty() {
+        bail!("Step title cannot be empty or whitespace-only");
+    }
+    ensure_non_negative(max_retries, "--max-retries")?;
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
 
@@ -367,13 +380,13 @@ pub fn step_add(conn: &Connection, args: StepAddArgs<'_>, out: &OutputContext) -
         Ok((step, pos))
     })?;
 
-    eprintln!(
+    out.status(format!(
         "{} Added step #{} [{}]: {}",
         output::check_icon(out.color),
         pos,
         step.short_id,
         output::bold(&step.title, out.color),
-    );
+    ));
     let placement = if let (Some(a), Some(y)) = (&after_step, &before_step) {
         format!("spliced between {} and {}", a.short_id, y.short_id)
     } else if let Some(a) = &after_step {
@@ -386,7 +399,7 @@ pub fn step_add(conn: &Connection, args: StepAddArgs<'_>, out: &OutputContext) -
     } else {
         "root (no dependencies)".to_string()
     };
-    eprintln!("  Placement: {placement}");
+    out.status(format!("  Placement: {placement}"));
     Ok(())
 }
 
@@ -468,6 +481,7 @@ pub fn step_add_bulk(
         if s.title.trim().is_empty() {
             bail!("Step #{} is missing a non-empty `title`", i + 1);
         }
+        ensure_non_negative(s.max_retries, &format!("step #{} `max_retries`", i + 1))?;
         if let Some(sid) = s.short_id.as_deref() {
             if !storage::is_persistable_short_id(sid) {
                 bail!(
@@ -624,19 +638,20 @@ pub fn step_add_bulk(
         println!("{}", serde_json::to_string(&summaries)?);
     } else {
         for (step, pos) in &inserted {
-            eprintln!(
+            out.status(format!(
                 "{} Added step #{} [{}]: {}",
                 output::check_icon(out.color),
                 pos,
                 step.short_id,
                 output::bold(&step.title, out.color),
-            );
+            ));
         }
     }
 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn step_remove(
     conn: &Connection,
     plan_slug: &str,
@@ -644,6 +659,7 @@ pub fn step_remove(
     step_sel: Option<&str>,
     step_id: Option<&str>,
     force: bool,
+    non_interactive: bool,
     out: &OutputContext,
 ) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
@@ -652,6 +668,13 @@ pub fn step_remove(
     let (step, display_num) = resolve_step(conn, &plan.id, step_sel, step_id)?;
 
     if !force {
+        if non_interactive {
+            bail!(
+                "confirmation required to remove step #{} '{}'; pass --force to confirm",
+                display_num,
+                step.title
+            );
+        }
         let prompt = format!("Remove step #{} '{}'?", display_num, step.title);
         if !output::confirm(&prompt)? {
             eprintln!("Aborted.");
@@ -660,12 +683,12 @@ pub fn step_remove(
     }
 
     storage::delete_step(conn, &step.id)?;
-    eprintln!(
+    out.status(format!(
         "{} Removed step #{}: {}",
         output::check_icon(out.color),
         display_num,
         step.title
-    );
+    ));
     Ok(())
 }
 
@@ -716,6 +739,7 @@ pub fn step_edit(conn: &Connection, args: StepEditArgs<'_>, out: &OutputContext)
         tags,
         clear_tags,
     } = args;
+    ensure_non_negative(max_retries, "--max-retries")?;
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
 
@@ -811,15 +835,16 @@ pub fn step_edit(conn: &Connection, args: StepEditArgs<'_>, out: &OutputContext)
         storage::set_step_review_enabled(conn, &step.id, review_override)?;
     }
 
-    eprintln!(
+    out.status(format!(
         "{} Updated step #{}: {}",
         output::check_icon(out.color),
         display_num,
         title.unwrap_or(&step.title)
-    );
+    ));
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn step_reset(
     conn: &Connection,
     plan_slug: &str,
@@ -827,6 +852,7 @@ pub fn step_reset(
     step_sel: Option<&str>,
     step_id: Option<&str>,
     force: bool,
+    non_interactive: bool,
     out: &OutputContext,
 ) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
@@ -934,6 +960,13 @@ pub fn step_reset(
             );
         }
         if !force {
+            if non_interactive {
+                bail!(
+                    "confirmation required to reset step #{} '{}'; pass --force to confirm",
+                    display_num,
+                    step.title
+                );
+            }
             let plural = if wip_shas.len() == 1 { "" } else { "s" };
             let shorts: Vec<String> = wip_shas
                 .iter()
@@ -1000,12 +1033,12 @@ pub fn step_reset(
 
     let parked = storage::reset_step(conn, &step.id)?;
     crate::runner::discard_parked_worktree_state(workdir, parked)?;
-    eprintln!(
+    out.status(format!(
         "{} Reset step #{} '{}' to pending (0 attempts)",
         output::check_icon(out.color),
         display_num,
         step.title
-    );
+    ));
     Ok(())
 }
 
@@ -1036,7 +1069,7 @@ pub fn step_move(
         );
     }
     if display_num == to {
-        eprintln!("Step is already at position {}.", to);
+        out.status(format!("Step is already at position {}.", to));
         return Ok(());
     }
 
@@ -1058,14 +1091,7 @@ pub fn step_move(
             frac_index::initial_key()
         } else {
             let first = other_keys[0];
-            // Use "0" as a synthetic lower bound; it sorts before any key
-            // starting with a digit > '0' or a letter.
-            if first > "0" {
-                frac_index::key_between("0", first)?
-            } else {
-                // Extremely unlikely: first key is "0". Prepend with shorter key.
-                "00".to_string()
-            }
+            frac_index::key_before(first)?
         }
     } else if target_idx >= other_keys.len() {
         // Move to last position
@@ -1078,12 +1104,12 @@ pub fn step_move(
     };
 
     storage::update_step_sort_key(conn, &step.id, &new_sort_key)?;
-    eprintln!(
+    out.status(format!(
         "{} Moved step '{}' to position {}",
         output::check_icon(out.color),
         step.title,
         to
-    );
+    ));
     Ok(())
 }
 
@@ -1107,7 +1133,7 @@ pub struct StepHookTarget<'a> {
 pub fn cmd_step_set_hook(
     conn: &Connection,
     target: StepHookTarget<'_>,
-    _out: &OutputContext,
+    out: &OutputContext,
 ) -> Result<()> {
     let StepHookTarget {
         plan_slug,
@@ -1131,14 +1157,16 @@ pub fn cmd_step_set_hook(
     let (step, display_num) = resolve_step(conn, &plan.id, step_sel, step_id)?;
 
     storage::attach_hook_to_step(conn, &plan.id, &step.id, lifecycle.as_str(), hook_name)?;
-    println!("Attached hook '{hook_name}' to step {display_num} of '{plan_slug}' at {lifecycle}");
+    out.status(format!(
+        "Attached hook '{hook_name}' to step {display_num} of '{plan_slug}' at {lifecycle}"
+    ));
     Ok(())
 }
 
 pub fn cmd_step_unset_hook(
     conn: &Connection,
     target: StepHookTarget<'_>,
-    _out: &OutputContext,
+    out: &OutputContext,
 ) -> Result<()> {
     let StepHookTarget {
         plan_slug,
@@ -1163,7 +1191,9 @@ pub fn cmd_step_unset_hook(
     if removed == 0 {
         bail!("No hook '{hook_name}' attached to step {display_num} at {lifecycle}");
     }
-    println!("Detached hook '{hook_name}' from step {display_num} of '{plan_slug}'");
+    out.status(format!(
+        "Detached hook '{hook_name}' from step {display_num} of '{plan_slug}'"
+    ));
     Ok(())
 }
 
@@ -1211,12 +1241,12 @@ pub fn step_dependency_add(
     })?;
 
     for dep in &resolved_deps {
-        eprintln!(
+        out.status(format!(
             "{} Added dependency: {} -> {}",
             output::check_icon(out.color),
             step.short_id,
             dep.short_id
-        );
+        ));
     }
 
     Ok(())
@@ -1252,12 +1282,12 @@ pub fn step_dependency_remove(
     })?;
 
     for dep in &resolved_deps {
-        eprintln!(
+        out.status(format!(
             "{} Removed dependency: {} -> {}",
             output::check_icon(out.color),
             step.short_id,
             dep.short_id
-        );
+        ));
     }
 
     Ok(())
@@ -1496,6 +1526,38 @@ mod tests {
             &test_out(),
         );
         assert!(result.is_err());
+
+        let plan = storage::get_plan_by_slug(&conn, "bulk-plan", &project)
+            .unwrap()
+            .unwrap();
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert!(steps.is_empty(), "no steps should have been inserted");
+    }
+
+    #[test]
+    fn test_step_add_bulk_negative_max_retries_fails_atomically() {
+        let (conn, project) = setup_with_plan();
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("bad-retries.json");
+        let json = r#"[
+            {"title": "ok"},
+            {"title": "bad", "max_retries": -1}
+        ]"#;
+        std::fs::write(&file, json).unwrap();
+
+        let err = step_add_bulk(
+            &conn,
+            "bulk-plan",
+            &project,
+            file.to_str().unwrap(),
+            &test_out(),
+        )
+        .expect_err("negative max_retries must fail before insert");
+        assert!(
+            err.to_string().contains("must be non-negative"),
+            "error must cite the invalid retry budget: {err}"
+        );
 
         let plan = storage::get_plan_by_slug(&conn, "bulk-plan", &project)
             .unwrap()
@@ -2167,7 +2229,17 @@ mod tests {
         park_wip(&dir, "[ralph wip] skipped step 1: Wire it", &step_id);
         assert!(dir.join("wip.txt").exists());
 
-        step_reset(&conn, "p", &project, Some("1"), None, true, &test_out()).unwrap();
+        step_reset(
+            &conn,
+            "p",
+            &project,
+            Some("1"),
+            None,
+            true,
+            false,
+            &test_out(),
+        )
+        .unwrap();
 
         // Revert happened (no prompt because force) and the step is pending.
         assert!(!dir.join("wip.txt").exists(), "WIP reverted");
@@ -2280,6 +2352,7 @@ mod tests {
             Some(&s1.short_id),
             None,
             true,
+            false,
             &test_out(),
         )
         .unwrap();
@@ -2312,7 +2385,17 @@ mod tests {
         std::fs::write(dir.join("wip.txt"), "wip").unwrap();
         park_wip(&dir, "[ralph wip] skipped step 1: Wire it", &step_id);
 
-        step_reset(&conn, "p", &project, Some("1"), None, false, &test_out()).unwrap();
+        step_reset(
+            &conn,
+            "p",
+            &project,
+            Some("1"),
+            None,
+            false,
+            false,
+            &test_out(),
+        )
+        .unwrap();
 
         assert!(
             dir.join("wip.txt").exists(),
@@ -2329,13 +2412,58 @@ mod tests {
         );
         // Mark it failed then re-confirm the abort really skipped reset.
         storage::update_step_status(&conn, &steps[0].id, StepStatus::Failed).unwrap();
-        step_reset(&conn, "p", &project, Some("1"), None, false, &test_out()).unwrap();
+        step_reset(
+            &conn,
+            "p",
+            &project,
+            Some("1"),
+            None,
+            false,
+            false,
+            &test_out(),
+        )
+        .unwrap();
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         assert_eq!(
             steps[0].status,
             StepStatus::Failed,
             "aborted reset must not flip status"
         );
+    }
+
+    #[test]
+    fn test_step_reset_non_interactive_requires_force_before_reverting_wip() {
+        let (conn, project, dir, step_id, _branch, _tmp) = reset_fixture();
+        std::fs::write(dir.join("wip.txt"), "wip").unwrap();
+        park_wip(&dir, "[ralph wip] skipped step 1: Wire it", &step_id);
+        let plan = storage::get_plan_by_slug(&conn, "p", &project)
+            .unwrap()
+            .unwrap();
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        storage::update_step_status(&conn, &steps[0].id, StepStatus::Failed).unwrap();
+
+        let err = step_reset(
+            &conn,
+            "p",
+            &project,
+            Some("1"),
+            None,
+            false,
+            true,
+            &test_out(),
+        )
+        .expect_err("non-interactive reset with WIP commits must require --force");
+
+        assert!(
+            err.to_string().contains("pass --force"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            dir.join("wip.txt").exists(),
+            "non-interactive refusal must not revert WIP"
+        );
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(steps[0].status, StepStatus::Failed);
     }
 
     #[test]
@@ -2349,7 +2477,17 @@ mod tests {
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         storage::update_step_status(&conn, &steps[0].id, StepStatus::Failed).unwrap();
 
-        step_reset(&conn, "p", &project, Some("1"), None, false, &test_out()).unwrap();
+        step_reset(
+            &conn,
+            "p",
+            &project,
+            Some("1"),
+            None,
+            false,
+            false,
+            &test_out(),
+        )
+        .unwrap();
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         assert_eq!(steps[0].status, StepStatus::Pending);
@@ -2364,7 +2502,17 @@ mod tests {
         std::fs::write(dir.join("later.txt"), "later").unwrap();
         crate::git::commit_changes(&dir, "step 2 done").unwrap();
 
-        step_reset(&conn, "p", &project, Some("1"), None, true, &test_out()).unwrap();
+        step_reset(
+            &conn,
+            "p",
+            &project,
+            Some("1"),
+            None,
+            true,
+            false,
+            &test_out(),
+        )
+        .unwrap();
 
         assert!(!dir.join("wip.txt").exists(), "WIP reverted");
         assert!(dir.join("later.txt").exists(), "later work preserved");
@@ -2382,7 +2530,17 @@ mod tests {
         }
 
         // step_reset should detect the already-reverted state and not error.
-        step_reset(&conn, "p", &project, Some("1"), None, true, &test_out()).unwrap();
+        step_reset(
+            &conn,
+            "p",
+            &project,
+            Some("1"),
+            None,
+            true,
+            false,
+            &test_out(),
+        )
+        .unwrap();
 
         assert!(!crate::git::has_uncommitted_changes(&dir).unwrap());
         let plan = storage::get_plan_by_slug(&conn, "p", &project)
@@ -2400,7 +2558,17 @@ mod tests {
         std::fs::write(dir.join("f.txt"), "v1\nv2\n").unwrap();
         park_wip(&dir, "[ralph wip] skipped step 1: a again", &step_id);
 
-        step_reset(&conn, "p", &project, Some("1"), None, true, &test_out()).unwrap();
+        step_reset(
+            &conn,
+            "p",
+            &project,
+            Some("1"),
+            None,
+            true,
+            false,
+            &test_out(),
+        )
+        .unwrap();
 
         // Both WIP layers undone (newest-first reverts applied cleanly).
         assert!(!dir.join("f.txt").exists());
@@ -2556,6 +2724,39 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("out of range"));
 
+        let plan = storage::get_plan_by_slug(&conn, "bulk-plan", &project)
+            .unwrap()
+            .unwrap();
+        assert!(storage::list_steps(&conn, &plan.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_step_add_empty_title_fails_atomically() {
+        let (conn, project) = setup_with_plan();
+        let err = step_add(
+            &conn,
+            StepAddArgs {
+                plan_slug: "bulk-plan",
+                project: &project,
+                title: " \t ",
+                description: None,
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
+            &test_out(),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("title cannot be empty"));
         let plan = storage::get_plan_by_slug(&conn, "bulk-plan", &project)
             .unwrap()
             .unwrap();

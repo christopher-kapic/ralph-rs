@@ -1,10 +1,11 @@
 // Plan import: deserialize portable JSON and create new plan + steps
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::Connection;
 use serde::Deserialize;
 use std::path::Path;
 
+use crate::output::OutputContext;
 use crate::storage;
 
 /// Parse the leading numeric segment of a version string as the major version.
@@ -217,6 +218,26 @@ fn classify_bundle(steps: &[ImportedStep]) -> BundleShape {
     } else {
         BundleShape::DagAware
     }
+}
+
+fn validate_non_negative_limits(data: &ImportedPlan) -> Result<()> {
+    if let Some(cap) = data.plan.max_review_corrections
+        && cap < 0
+    {
+        bail!("imported plan `max_review_corrections` must be non-negative, got {cap}");
+    }
+
+    for (idx, step) in data.steps.iter().enumerate() {
+        if let Some(max_retries) = step.max_retries
+            && max_retries < 0
+        {
+            bail!(
+                "imported step #{} `max_retries` must be non-negative, got {max_retries}",
+                idx + 1
+            );
+        }
+    }
+    Ok(())
 }
 
 /// In-memory analogue of [`storage::would_create_step_cycle`] (§6) applied
@@ -480,6 +501,7 @@ fn import_plan_inner(
         anyhow::bail!("invalid plan slug: imported/overridden slug is empty or whitespace-only");
     }
     crate::git::check_ref_format(branch)?;
+    validate_non_negative_limits(data)?;
 
     let shape = classify_bundle(&data.steps);
     let dag_aware = shape == BundleShape::DagAware;
@@ -501,7 +523,7 @@ fn import_plan_inner(
     )
     .with_context(|| format!("Failed to create imported plan '{slug}'"))?;
 
-    storage::update_plan_status(conn, &plan.id, crate::plan::PlanStatus::Ready)?;
+    storage::update_plan_status(conn, &plan.id, crate::plan::PlanStatus::Planning)?;
 
     if data.plan.plan_harness.is_some() {
         storage::set_plan_harness_gen(conn, &plan.id, data.plan.plan_harness.as_deref())?;
@@ -605,18 +627,23 @@ fn import_plan_inner(
 }
 
 /// Import a plan from a JSON file. Full CLI entry point.
-pub fn import_plan(conn: &Connection, file: &Path, options: &ImportOptions<'_>) -> Result<()> {
+pub fn import_plan(
+    conn: &Connection,
+    file: &Path,
+    options: &ImportOptions<'_>,
+    out: &OutputContext,
+) -> Result<()> {
     let data = read_plan_file(file)?;
 
     let effective_slug = options.slug.unwrap_or(&data.plan.slug);
 
     import_plan_from_data(conn, &data, options)?;
 
-    eprintln!(
-        "Imported plan '{}' with {} steps (status: ready)",
+    out.status(format!(
+        "Imported plan '{}' with {} steps (status: planning; approve before running)",
         effective_slug,
         data.steps.len()
-    );
+    ));
 
     Ok(())
 }
@@ -634,6 +661,14 @@ mod tests {
 
     fn setup() -> Connection {
         db::open_memory().expect("open_memory")
+    }
+
+    fn quiet_out() -> OutputContext {
+        OutputContext {
+            format: crate::output::OutputFormat::Plain,
+            quiet: true,
+            color: false,
+        }
     }
 
     #[test]
@@ -696,7 +731,7 @@ mod tests {
         assert_eq!(plan.harness.as_deref(), Some("claude"));
         assert_eq!(plan.agent.as_deref(), Some("opus"));
         assert_eq!(plan.deterministic_tests, vec!["cargo test"]);
-        assert_eq!(plan.status, PlanStatus::Ready);
+        assert_eq!(plan.status, PlanStatus::Planning);
 
         // Verify steps
         let steps = storage::list_steps(&conn, &plan_id).unwrap();
@@ -953,7 +988,7 @@ mod tests {
         let plan = storage::get_plan_by_slug(&conn, "status-test", "/tmp/proj")
             .unwrap()
             .unwrap();
-        assert_eq!(plan.status, PlanStatus::Ready);
+        assert_eq!(plan.status, PlanStatus::Planning);
 
         let steps = storage::list_steps(&conn, &plan_id).unwrap();
         assert_eq!(steps[0].status, StepStatus::Pending);
@@ -1052,7 +1087,7 @@ mod tests {
             imported_plan.deterministic_tests,
             original.deterministic_tests
         );
-        assert_eq!(imported_plan.status, PlanStatus::Ready); // Not original status
+        assert_eq!(imported_plan.status, PlanStatus::Planning); // Not original status
         assert_eq!(imported_plan.project, "/tmp/imported"); // Bound to new project
 
         // Verify steps
@@ -1088,6 +1123,110 @@ mod tests {
     }
 
     #[test]
+    fn test_import_negative_limits_fail_before_writing_plan() {
+        let conn = setup();
+
+        let json = r#"{
+            "ralph_rs_version": "0.1.0",
+            "exported_at": "2025-01-01T00:00:00Z",
+            "plan": {
+                "slug": "negative-limits",
+                "branch_name": "feat/negative-limits",
+                "description": "bad",
+                "harness": null,
+                "agent": null,
+                "deterministic_tests": [],
+                "max_review_corrections": -1
+            },
+            "steps": [
+                {
+                    "title": "Step one",
+                    "description": "First step",
+                    "agent": null,
+                    "harness": null,
+                    "acceptance_criteria": [],
+                    "max_retries": null
+                }
+            ]
+        }"#;
+        let data: ImportedPlan = serde_json::from_str(json).unwrap();
+        let options = ImportOptions {
+            slug: None,
+            branch: None,
+            harness: None,
+            project: "/tmp/proj-negative",
+            strict: false,
+            review_harness_configured: false,
+            global_review_enabled: false,
+        };
+
+        let err = import_plan_from_data(&conn, &data, &options)
+            .expect_err("negative plan cap must reject the import");
+        assert!(
+            err.to_string().contains("must be non-negative"),
+            "error must cite the invalid cap: {err}"
+        );
+        assert!(
+            storage::get_plan_by_slug(&conn, "negative-limits", "/tmp/proj-negative")
+                .unwrap()
+                .is_none(),
+            "invalid import must write no plan row"
+        );
+    }
+
+    #[test]
+    fn test_import_negative_step_max_retries_fails_before_writing_plan() {
+        let conn = setup();
+
+        let json = r#"{
+            "ralph_rs_version": "0.1.0",
+            "exported_at": "2025-01-01T00:00:00Z",
+            "plan": {
+                "slug": "negative-step-retries",
+                "branch_name": "feat/negative-step-retries",
+                "description": "bad",
+                "harness": null,
+                "agent": null,
+                "deterministic_tests": []
+            },
+            "steps": [
+                {
+                    "title": "Step one",
+                    "description": "First step",
+                    "agent": null,
+                    "harness": null,
+                    "acceptance_criteria": [],
+                    "max_retries": -1
+                }
+            ]
+        }"#;
+        let data: ImportedPlan = serde_json::from_str(json).unwrap();
+        let options = ImportOptions {
+            slug: None,
+            branch: None,
+            harness: None,
+            project: "/tmp/proj-negative-step",
+            strict: false,
+            review_harness_configured: false,
+            global_review_enabled: false,
+        };
+
+        let err = import_plan_from_data(&conn, &data, &options)
+            .expect_err("negative step retries must reject the import");
+        assert!(
+            err.to_string().contains("max_retries")
+                && err.to_string().contains("must be non-negative"),
+            "error must cite the invalid step retry budget: {err}"
+        );
+        assert!(
+            storage::get_plan_by_slug(&conn, "negative-step-retries", "/tmp/proj-negative-step")
+                .unwrap()
+                .is_none(),
+            "invalid import must write no plan row"
+        );
+    }
+
+    #[test]
     fn test_import_from_file() {
         let conn = setup();
 
@@ -1120,6 +1259,7 @@ mod tests {
                 review_harness_configured: false,
                 global_review_enabled: false,
             },
+            &quiet_out(),
         )
         .unwrap();
 
@@ -1128,7 +1268,7 @@ mod tests {
             .unwrap();
         assert_eq!(plan.slug, "file-import");
         assert_eq!(plan.description, "From file");
-        assert_eq!(plan.status, PlanStatus::Ready);
+        assert_eq!(plan.status, PlanStatus::Planning);
     }
 
     #[test]
@@ -1146,6 +1286,7 @@ mod tests {
                 review_harness_configured: false,
                 global_review_enabled: false,
             },
+            &quiet_out(),
         );
         assert!(result.is_err());
     }

@@ -7,7 +7,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
@@ -19,29 +19,39 @@ use uuid::Uuid;
 
 use crate::config;
 
-/// Open the user's editor on `initial_text` and return the saved contents.
-///
-/// `Ok(None)` is returned when:
-/// - Neither `$EDITOR` nor `$VISUAL` is set (caller toasts the missing-editor
-///   error).
-/// - The editor exits with a non-zero status (treated as cancel; tempfile is
-///   left in place).
+const EDITOR_TEMPFILE_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditorOutcome {
+    Saved(String),
+    Cancelled,
+    NoEditor,
+}
+
+/// Open the user's editor and preserve the reason for a non-save outcome.
 ///
 /// The tempfile lives at `~/.local/share/ralph-rs/tmp/<scope>-<id>-<rand>.md`
-/// and is deleted only on successful save.
-pub fn edit_in_editor(initial_text: &str) -> Result<Option<String>> {
+/// and is deleted only on successful save. A non-zero editor exit is reported
+/// as [`EditorOutcome::Cancelled`] and leaves the tempfile in place for manual
+/// recovery. Missing `$EDITOR`/`$VISUAL` is [`EditorOutcome::NoEditor`].
+pub fn edit_in_editor_outcome(initial_text: &str) -> Result<EditorOutcome> {
     let Some(editor) = resolve_editor() else {
-        return Ok(None);
+        return Ok(EditorOutcome::NoEditor);
     };
     let tmp_dir = config::data_dir()?.join("tmp");
     fs::create_dir_all(&tmp_dir)
         .with_context(|| format!("create editor tempdir at {}", tmp_dir.display()))?;
+    sweep_editor_tempfiles(&tmp_dir, EDITOR_TEMPFILE_MAX_AGE)?;
     let path = make_temp_path(&tmp_dir, "edit");
 
     suspend_terminal()?;
     let result = edit_at(&editor, &path, initial_text);
-    let _ = restore_terminal();
-    result
+    let restore_result = restore_terminal();
+    restore_result?;
+    Ok(match result? {
+        Some(text) => EditorOutcome::Saved(text),
+        None => EditorOutcome::Cancelled,
+    })
 }
 
 /// Look up the editor command, preferring `$EDITOR` then `$VISUAL`. Empty or
@@ -72,6 +82,41 @@ fn make_temp_path(dir: &Path, scope: &str) -> PathBuf {
     let id = Uuid::new_v4().simple();
     let rand = rand_suffix();
     dir.join(format!("{scope}-{id}-{rand:08x}.md"))
+}
+
+fn sweep_editor_tempfiles(dir: &Path, max_age: Duration) -> Result<()> {
+    let now = SystemTime::now();
+    for entry in
+        fs::read_dir(dir).with_context(|| format!("read editor tempdir {}", dir.display()))?
+    {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("edit-") || !name.ends_with(".md") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
+        if age >= max_age {
+            let _ = fs::remove_file(path);
+        }
+    }
+    Ok(())
 }
 
 /// Cheap entropy without a `rand` dep — combined with the per-call uuid
@@ -194,6 +239,34 @@ mod tests {
         let a = make_temp_path(dir, "step");
         let b = make_temp_path(dir, "step");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn sweep_editor_tempfiles_deletes_only_expired_editor_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let expired = tmp.path().join("edit-old.md");
+        let unrelated = tmp.path().join("other-old.md");
+        fs::write(&expired, "old").unwrap();
+        fs::write(&unrelated, "keep").unwrap();
+
+        sweep_editor_tempfiles(tmp.path(), Duration::ZERO).unwrap();
+
+        assert!(!expired.exists(), "expired editor tempfile should be swept");
+        assert!(unrelated.exists(), "non-editor tempfiles must be ignored");
+    }
+
+    #[test]
+    fn sweep_editor_tempfiles_preserves_recent_editor_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let recent = tmp.path().join("edit-recent.md");
+        fs::write(&recent, "recoverable draft").unwrap();
+
+        sweep_editor_tempfiles(tmp.path(), Duration::from_secs(u64::MAX / 2)).unwrap();
+
+        assert!(
+            recent.exists(),
+            "recent cancelled editor tempfile should remain recoverable"
+        );
     }
 
     // -- edit_at integration (mocked $EDITOR) -----------------------------

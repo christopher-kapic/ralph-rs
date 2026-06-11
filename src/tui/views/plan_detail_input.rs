@@ -20,8 +20,8 @@ pub enum InputAction {
     /// The user requested to delete the listed step IDs (selection-aware,
     /// in selection pick order or the cursor's single-element list).
     Delete(Vec<String>),
-    /// The user requested to reset the step with the given ID.
-    Reset(String),
+    /// The user requested an immediate refresh from storage.
+    Refresh,
     /// The user requested to move the step with the given ID up one slot.
     MoveUp(String),
     /// The user requested to move the step with the given ID down one slot.
@@ -80,12 +80,12 @@ pub fn handle_key(app: &mut PlanDetailApp, key: KeyEvent) -> InputAction {
 // ---------------------------------------------------------------------------
 
 fn handle_normal_mode(app: &mut PlanDetailApp, key: KeyEvent) -> InputAction {
-    // §13.2 lockdown: when an external runner holds the lock, the edit
-    // keybindings (i/a/d/r/s/R/Shift-J/Shift-K) are suppressed. Navigation,
-    // S (cancel via the dispatcher), q/h/← (pop), Esc, and tail scrolling
-    // remain active. We compute this once so each per-key arm only has to
-    // reason about its own edit-vs-non-edit classification.
-    let locked = app.read_only.is_locked();
+    // §13.2 lockdown: when any runner is live for this plan, the edit
+    // keybindings (i/a/d/s/R/D/H/Shift-J/Shift-K) are suppressed. Navigation,
+    // S (cancel via the dispatcher), P (pause), q/h/← (pop), Esc, and tail
+    // scrolling remain active. We compute this once so each per-key arm only
+    // has to reason about its own edit-vs-non-edit classification.
+    let locked = app.read_only.is_locked() || app.is_run_live();
 
     // docs/dag-redesign.md §12.1/§12.2: the dependency outline owns
     // navigation (`j`/`k`), focus/re-root (`z`/`Z`, and `Esc` *only* while
@@ -137,14 +137,8 @@ fn handle_normal_mode(app: &mut PlanDetailApp, key: KeyEvent) -> InputAction {
             }
         }
 
-        // Reset step (edit — suppressed when locked).
-        KeyCode::Char('r') if !locked => {
-            if let Some(id) = app.reset_target() {
-                InputAction::Reset(id)
-            } else {
-                InputAction::None
-            }
-        }
+        // Refresh is deliberately non-destructive and available everywhere.
+        KeyCode::Char('r') => InputAction::Refresh,
 
         // Shift-J: scroll the right-pane tails one line newer when a live
         // subscription is producing output (TUI-plan.md §13); otherwise
@@ -198,10 +192,10 @@ fn handle_normal_mode(app: &mut PlanDetailApp, key: KeyEvent) -> InputAction {
         KeyCode::Char('S') => InputAction::Stop,
 
         // Open the plan-dependencies sub-view (TUI-plan.md §1, step 33).
-        KeyCode::Char('D') => InputAction::OpenDependencies,
+        KeyCode::Char('D') if !locked => InputAction::OpenDependencies,
 
         // Open the plan-hooks sub-view (TUI-plan.md §1).
-        KeyCode::Char('H') => InputAction::OpenHooks,
+        KeyCode::Char('H') if !locked => InputAction::OpenHooks,
 
         // Answer the oldest unanswered question for this plan (TUI-plan.md §17).
         // No-op when there are no open questions — the dispatcher checks the
@@ -312,6 +306,12 @@ fn handle_add_mode(app: &mut PlanDetailApp, key: KeyEvent) -> InputAction {
 
         // Character input
         KeyCode::Char(c) => {
+            if key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            {
+                return InputAction::None;
+            }
             app.input_buffer.push(c);
             InputAction::None
         }
@@ -498,19 +498,19 @@ mod tests {
     }
 
     #[test]
-    fn test_r_returns_reset_for_cursor_step() {
+    fn test_r_returns_refresh() {
         let mut app = make_app(3);
         app.outline.set_cursor(1);
         app.realign_selection_to_outline();
         let action = handle_key(&mut app, key(KeyCode::Char('r')));
-        assert_eq!(action, InputAction::Reset("s1".to_string()));
+        assert_eq!(action, InputAction::Refresh);
     }
 
     #[test]
-    fn test_r_with_no_steps_is_noop() {
+    fn test_r_with_no_steps_still_refreshes() {
         let mut app = make_app(0);
         let action = handle_key(&mut app, key(KeyCode::Char('r')));
-        assert_eq!(action, InputAction::None);
+        assert_eq!(action, InputAction::Refresh);
     }
 
     #[test]
@@ -803,6 +803,23 @@ mod tests {
     }
 
     #[test]
+    fn test_add_mode_ignores_modified_chars() {
+        let mut app = make_app(3);
+        app.enter_add_mode_above();
+
+        handle_key(
+            &mut app,
+            key_with_mod(KeyCode::Char('a'), KeyModifiers::CONTROL),
+        );
+        handle_key(
+            &mut app,
+            key_with_mod(KeyCode::Char('z'), KeyModifiers::ALT),
+        );
+
+        assert_eq!(app.input_buffer, "");
+    }
+
+    #[test]
     fn test_add_mode_backspace() {
         let mut app = make_app(3);
         app.enter_add_mode_above();
@@ -931,11 +948,12 @@ mod tests {
     #[test]
     fn test_shift_j_falls_through_when_subscription_has_no_output_yet() {
         let mut app = make_app(3);
-        // Subscription attached but no chunks delivered: J still moves the step.
+        // Subscription attached but no chunks delivered: live runs are
+        // read-only, so J must not fall through to moving the step.
         app.attach_subscription();
         app.selected_index = 0;
         let action = handle_key(&mut app, key(KeyCode::Char('J')));
-        assert_eq!(action, InputAction::MoveDown("s0".to_string()));
+        assert_eq!(action, InputAction::None);
     }
 
     // -- Read-only attach + edit lockdown (TUI-plan.md §13.2) -----------
@@ -976,11 +994,11 @@ mod tests {
     }
 
     #[test]
-    fn test_locked_suppresses_r_reset() {
+    fn test_locked_still_allows_r_refresh() {
         let mut app = make_app(3);
         lock_app(&mut app);
         let action = handle_key(&mut app, key(KeyCode::Char('r')));
-        assert_eq!(action, InputAction::None);
+        assert_eq!(action, InputAction::Refresh);
     }
 
     #[test]
@@ -1037,6 +1055,70 @@ mod tests {
         // S is the user's escape hatch when locked — must remain enabled.
         let action = handle_key(&mut app, key(KeyCode::Char('S')));
         assert_eq!(action, InputAction::Stop);
+    }
+
+    #[test]
+    fn test_live_run_suppresses_mutating_bindings() {
+        let mut app = make_app(3);
+        app.attach_subscription();
+        app.selected_index = 1;
+
+        assert_eq!(
+            handle_key(&mut app, key(KeyCode::Char('i'))),
+            InputAction::None
+        );
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert_eq!(
+            handle_key(&mut app, key(KeyCode::Char('a'))),
+            InputAction::None
+        );
+        assert_eq!(
+            handle_key(&mut app, key(KeyCode::Char('d'))),
+            InputAction::None
+        );
+        assert_eq!(
+            handle_key(&mut app, key(KeyCode::Char('s'))),
+            InputAction::None
+        );
+        assert_eq!(
+            handle_key(&mut app, key(KeyCode::Char('R'))),
+            InputAction::None
+        );
+        assert_eq!(
+            handle_key(&mut app, key(KeyCode::Char('J'))),
+            InputAction::None
+        );
+        assert_eq!(
+            handle_key(&mut app, key(KeyCode::Char('K'))),
+            InputAction::None
+        );
+        assert_eq!(
+            handle_key(&mut app, key(KeyCode::Char('D'))),
+            InputAction::None
+        );
+        assert_eq!(
+            handle_key(&mut app, key(KeyCode::Char('H'))),
+            InputAction::None
+        );
+    }
+
+    #[test]
+    fn test_live_run_still_allows_controls() {
+        let mut app = make_app(3);
+        app.attach_subscription();
+
+        assert_eq!(
+            handle_key(&mut app, key(KeyCode::Char('r'))),
+            InputAction::Refresh
+        );
+        assert_eq!(
+            handle_key(&mut app, key(KeyCode::Char('S'))),
+            InputAction::Stop
+        );
+        assert_eq!(
+            handle_key(&mut app, key(KeyCode::Char('P'))),
+            InputAction::TogglePauseRequested
+        );
     }
 
     #[test]

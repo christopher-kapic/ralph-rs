@@ -121,6 +121,17 @@ pub enum RunEvent {
         attempt: i32,
         at: DateTime<Utc>,
     },
+    /// Emitted when a queued skip request targeted this step, but the
+    /// attempt had already completed naturally by the time the executor got
+    /// to the cleanup point. The request is cleared and ignored; the step
+    /// continues through tests/commit according to the completed attempt.
+    SkipRequestIgnored {
+        step_id: String,
+        step_num: usize,
+        attempt: i32,
+        reason: String,
+        at: DateTime<Utc>,
+    },
     /// Emitted the moment a read-only reviewer is spawned against a
     /// committed iteration (docs/dag-redesign.md §3.2/§9-inv-2). Lets the
     /// TUI show a "reviewing" badge without polling. The review runs
@@ -381,6 +392,14 @@ impl OutputContext {
             format,
             quiet,
             color,
+        }
+    }
+
+    /// Emit a human-readable status line unless output is quiet or machine
+    /// formatted. Intended for success/progress banners, not warnings/errors.
+    pub fn status(&self, message: impl std::fmt::Display) {
+        if !self.quiet && self.format == OutputFormat::Plain {
+            eprintln!("{message}");
         }
     }
 }
@@ -890,6 +909,41 @@ pub struct LogEntrySummary {
     /// terminating abnormally.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub test_status: Option<TestStatus>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LogRecordSummary {
+    ExecutionLog {
+        #[serde(flatten)]
+        log: LogEntrySummary,
+    },
+    SkippedStep {
+        step_id: String,
+        step_num: usize,
+        title: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    SkipWipCommit {
+        step_num: usize,
+        short_sha: String,
+    },
+    IterationCommits {
+        short_id: String,
+        title: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        review_status: Option<String>,
+        commits: Vec<IterationCommitSummary>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IterationCommitSummary {
+    pub iteration: i32,
+    pub short_sha: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_verdict: Option<String>,
 }
 
 /// Split a total line budget across stdout and stderr.
@@ -2109,6 +2163,29 @@ mod tests {
             }
             other => panic!("expected AttemptCancelled, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_skip_request_ignored_event_json_shape() {
+        let at: DateTime<Utc> = "2026-05-16T10:30:00Z".parse().unwrap();
+        let evt = RunEvent::SkipRequestIgnored {
+            step_id: "abc".to_string(),
+            step_num: 2,
+            attempt: 1,
+            reason: "attempt already completed".to_string(),
+            at,
+        };
+        let json = serde_json::to_string(&evt).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(val["event"], "skip_request_ignored");
+        assert_eq!(val["step_id"], "abc");
+        assert_eq!(val["step_num"], 2);
+        assert_eq!(val["attempt"], 1);
+        assert_eq!(val["reason"], "attempt already completed");
+        assert_eq!(val["at"], "2026-05-16T10:30:00Z");
+
+        let back: RunEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, RunEvent::SkipRequestIgnored { .. }));
     }
 
     #[test]

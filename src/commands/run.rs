@@ -1,7 +1,7 @@
 // Run-related CLI command implementations (status, log, cancel)
 
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
@@ -14,6 +14,8 @@ use crate::run_lock::{self, LiveRun};
 use crate::runner::{self, RunOptions};
 use crate::signal;
 use crate::storage;
+
+const TUI_EVENT_POLL: Duration = Duration::from_millis(250);
 
 // ---------------------------------------------------------------------------
 // Run dispatch
@@ -36,6 +38,8 @@ pub struct RunArgs {
     pub run_harness: Option<String>,
     pub force: bool,
     pub verbose: bool,
+    /// Disable terminal mouse capture while keeping TUI mode enabled.
+    pub no_mouse: bool,
     /// The global `--harness` flag (root `Cli` field). Run-specific
     /// `--harness` takes precedence; both being unset is the default case.
     pub cli_harness: Option<String>,
@@ -68,6 +72,8 @@ pub fn is_default_run_invocation(args: &RunArgs, stdout_is_tty: bool) -> bool {
         && args.to.is_none()
         && !args.dry_run
         && !args.skip_preflight
+        && !args.current_branch
+        && !args.no_auto_stash
         && !args.force
         && !args.verbose
         && args.run_harness.is_none()
@@ -148,7 +154,7 @@ pub fn dispatch_run(
 
             let mut any_errors = false;
             for p in &runnable {
-                eprintln!("Running preflight checks for '{}'...", p.slug);
+                out.status(format!("Running preflight checks for '{}'...", p.slug));
                 let steps = storage::list_steps(conn, &p.id)?;
                 let results = preflight::run_preflight_checks(p, &steps, config, workdir)?;
                 results.print_report(out);
@@ -173,20 +179,23 @@ pub fn dispatch_run(
         let mut succeeded = 0usize;
         let mut failed = 0usize;
         for r in &results {
-            eprintln!(
+            out.status(format!(
                 "  - {}: {} ({}/{} steps succeeded)",
                 r.plan_slug, r.final_status, r.steps_succeeded, r.steps_executed
-            );
+            ));
             if r.final_status == plan::PlanStatus::Complete {
                 succeeded += 1;
             } else {
                 failed += 1;
             }
         }
-        eprintln!(
+        out.status(format!(
             "Ran {} plan(s): {} succeeded, {} failed",
             total, succeeded, failed
-        );
+        ));
+        if failed > 0 {
+            anyhow::bail!("{failed} plan(s) failed");
+        }
         return Ok(());
     }
 
@@ -210,7 +219,7 @@ pub fn dispatch_run(
 
     // Preflight checks
     if !args.skip_preflight && !args.dry_run {
-        eprintln!("Running preflight checks...");
+        out.status("Running preflight checks...");
         let steps = storage::list_steps(conn, &plan.id)?;
         let preflight_results = preflight::run_preflight_checks(&plan, &steps, config, workdir)?;
         preflight_results.print_report(out);
@@ -227,15 +236,16 @@ pub fn dispatch_run(
     })?;
 
     if result.steps_failed > 0 {
-        eprintln!(
+        out.status(format!(
             "Plan '{}' failed: {}/{} steps succeeded",
             slug, result.steps_succeeded, result.steps_executed
-        );
+        ));
+        anyhow::bail!("Plan '{slug}' failed");
     } else {
-        eprintln!(
+        out.status(format!(
             "Plan '{}' complete: {}/{} steps succeeded",
             slug, result.steps_succeeded, result.steps_executed
-        );
+        ));
     }
     Ok(())
 }
@@ -274,6 +284,7 @@ pub fn run_tui_mode(
         config,
         project,
         out,
+        !args.no_mouse,
         Some(InitialPush::PlanDetail {
             slug,
             auto_start: Some(crate::tui::events::StreamMode::Run {
@@ -282,6 +293,77 @@ pub fn run_tui_mode(
             }),
         }),
     )
+}
+
+struct TerminalSessionGuard {
+    active: bool,
+}
+
+impl TerminalSessionGuard {
+    fn active() -> Self {
+        Self { active: true }
+    }
+
+    fn finish(mut self) {
+        self.restore();
+    }
+
+    fn restore(&mut self) {
+        if !self.active {
+            return;
+        }
+        restore_tui_terminal();
+        self.active = false;
+    }
+}
+
+impl Drop for TerminalSessionGuard {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+fn restore_tui_terminal() {
+    let _ = crossterm::terminal::disable_raw_mode();
+    let mut stdout = std::io::stdout();
+    let _ = crossterm::execute!(
+        stdout,
+        crossterm::terminal::LeaveAlternateScreen,
+        crossterm::event::DisableMouseCapture
+    );
+}
+
+type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'static>;
+
+struct TuiPanicHookGuard {
+    previous: std::sync::Arc<std::sync::Mutex<Option<PanicHook>>>,
+}
+
+impl TuiPanicHookGuard {
+    fn install() -> Self {
+        let previous = std::sync::Arc::new(std::sync::Mutex::new(Some(std::panic::take_hook())));
+        let hook_previous = previous.clone();
+        std::panic::set_hook(Box::new(move |info| {
+            restore_tui_terminal();
+            if let Ok(guard) = hook_previous.lock()
+                && let Some(previous) = guard.as_ref()
+            {
+                previous(info);
+            }
+        }));
+        Self { previous }
+    }
+}
+
+impl Drop for TuiPanicHookGuard {
+    fn drop(&mut self) {
+        let _ = std::panic::take_hook();
+        if let Ok(mut guard) = self.previous.lock()
+            && let Some(previous) = guard.take()
+        {
+            std::panic::set_hook(previous);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -295,6 +377,8 @@ pub fn run_tui_mode(
 pub struct ResumeArgs {
     pub plan_slug: Option<String>,
     pub force: bool,
+    /// Disable terminal mouse capture while keeping TUI mode enabled.
+    pub no_mouse: bool,
     /// The global `--non-interactive` flag.
     pub non_interactive: bool,
     /// The global `--json`/`--jsonl` flag.
@@ -349,15 +433,16 @@ pub fn dispatch_resume(
     })?;
 
     if result.steps_failed > 0 {
-        eprintln!(
+        out.status(format!(
             "Plan '{}' failed: {}/{} steps succeeded",
             slug, result.steps_succeeded, result.steps_executed
-        );
+        ));
+        anyhow::bail!("Plan '{slug}' failed");
     } else {
-        eprintln!(
+        out.status(format!(
             "Plan '{}' resumed: {}/{} steps succeeded",
             slug, result.steps_succeeded, result.steps_executed
-        );
+        ));
     }
     Ok(())
 }
@@ -393,6 +478,7 @@ pub fn run_resume_tui_mode(
         config,
         project,
         out,
+        !args.no_mouse,
         Some(InitialPush::PlanDetail {
             slug,
             auto_start: Some(crate::tui::events::StreamMode::Resume),
@@ -438,6 +524,7 @@ pub fn run_plan_list_tui(
     config: &Config,
     project: &str,
     _out: &OutputContext,
+    mouse_capture: bool,
     initial_push: Option<InitialPush>,
 ) -> Result<()> {
     use crate::plan::PlanStatus;
@@ -445,13 +532,9 @@ pub fn run_plan_list_tui(
     use crate::tui::read_only::{self, ReadOnly, ReadOnlyTracker, Transition};
     use crate::tui::toast::ToastKind;
     use crate::tui::views::plan_list::{self, PlanListApp};
-    use crossterm::event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    };
+    use crossterm::event::{self, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers};
     use crossterm::execute;
-    use crossterm::terminal::{
-        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-    };
+    use crossterm::terminal::{EnterAlternateScreen, disable_raw_mode, enable_raw_mode};
     use ratatui::Terminal;
     use ratatui::backend::CrosstermBackend;
     use std::time::Instant;
@@ -474,13 +557,20 @@ pub fn run_plan_list_tui(
 
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = std::io::stdout();
-    // Mouse capture is paired with the alternate screen so per-view
-    // `handle_mouse` routing receives `Event::Mouse`. Bypass with Shift to
-    // fall back to native terminal selection (TUI-plan.md §4).
-    if let Err(e) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
+    // Mouse capture is optional so users can keep native terminal
+    // selection/copy behavior. When enabled, per-view `handle_mouse` routing
+    // receives `Event::Mouse`; most terminals also allow Shift to bypass it.
+    let enter_result = if mouse_capture {
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
+    } else {
+        execute!(stdout, EnterAlternateScreen)
+    };
+    if let Err(e) = enter_result {
         let _ = disable_raw_mode();
         return Err(e).context("enter alternate screen");
     }
+    let terminal_session = TerminalSessionGuard::active();
+    let _panic_hook = TuiPanicHookGuard::install();
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("create terminal")?;
 
@@ -488,9 +578,9 @@ pub fn run_plan_list_tui(
     // root so popping plan-detail (or pushing through to a sub-view)
     // doesn't tear it down — the run keeps streaming in the background
     // and the user can re-attach by re-entering the running plan's
-    // detail. Released when the runner subprocess hangs up, or
-    // implicitly on TUI exit (the parent's `Drop` kills the child via
-    // `kill_on_drop`).
+    // detail. Released when the runner subprocess hangs up, or implicitly on
+    // TUI exit; dropping the subscription detaches from the stream and leaves
+    // the runner alive. Explicit cancel/skip controls stop the run.
     let mut subscription: Option<crate::tui::events::HostedSubscription> = None;
 
     // Auto-push for `ralph run` / `ralph resume`: dispatched on the first
@@ -578,7 +668,7 @@ pub fn run_plan_list_tui(
             // right-pane preview has data on the next draw. The cache is
             // dropped on `refresh_tiles`, so this re-fires after archive,
             // create, or returning from plan-detail.
-            ensure_preview_cached(conn, &mut app)?;
+            ensure_preview_cached_soft(conn, &mut app);
 
             terminal.draw(|f| plan_list::draw(f, &mut app))?;
 
@@ -587,7 +677,7 @@ pub fn run_plan_list_tui(
             // smoothness against polling cost; the actual run-lock query
             // still only fires once per `POLL_INTERVAL` thanks to
             // `tracker.should_poll`.
-            if !event::poll(std::time::Duration::from_millis(250))? {
+            if !event::poll(TUI_EVENT_POLL)? {
                 continue;
             }
             let event = event::read()?;
@@ -636,7 +726,9 @@ pub fn run_plan_list_tui(
                 // (Consumed/Closed/Opened) so view bindings don't fire under
                 // it. Passthrough means the overlay is hidden and we proceed
                 // with the normal match below.
-                if app.help.intercept_key(key) != crate::tui::help::InterceptResult::Passthrough {
+                if app.palette_bar.is_none()
+                    && app.help.intercept_key(key) != crate::tui::help::InterceptResult::Passthrough
+                {
                     continue;
                 }
                 // §9 palette: while open, route every key through the palette
@@ -857,16 +949,39 @@ pub fn run_plan_list_tui(
                 }
             }
             if app.should_quit {
+                if should_confirm_quit_with_live_run(conn, project, &subscription)? {
+                    let confirm = dialog::Confirm {
+                        title: "Quit TUI",
+                        body: "A run is still live. Quit the TUI and leave the run running?",
+                        default: false,
+                    };
+                    if !confirm_with_background(&mut terminal, &mut app, &confirm)? {
+                        app.should_quit = false;
+                        continue;
+                    }
+                }
                 return Ok(());
             }
         }
     })();
 
-    let _ = disable_raw_mode();
-    let mut stdout = std::io::stdout();
-    let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture);
+    terminal_session.finish();
 
     result
+}
+
+fn should_confirm_quit_with_live_run(
+    conn: &Connection,
+    project: &str,
+    subscription: &Option<crate::tui::events::HostedSubscription>,
+) -> Result<bool> {
+    if subscription
+        .as_ref()
+        .is_some_and(|hosted| !hosted.sub.is_disconnected())
+    {
+        return Ok(true);
+    }
+    Ok(storage::get_live_run(conn, project)?.is_some())
 }
 
 /// Render the plan-list view as the dialog's background and block on a
@@ -891,6 +1006,9 @@ where
             let area = f.area();
             dialog::render(f, area, c);
         })?;
+        if !event::poll(TUI_EVENT_POLL)? {
+            continue;
+        }
         if let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {
@@ -961,8 +1079,9 @@ pub(crate) fn plan_list_refresh(
 
 /// `<esc>` precedence in the plan-list view (TUI-plan.md §4): dismiss the
 /// current toast when one is showing and consume the keypress; otherwise
-/// fall through to the view's existing Esc binding (`app.escape()` —
-/// clear-selection-or-quit). Returns `true` when a toast was dismissed.
+/// fall through to the view's existing Esc binding (`app.escape()` — clear
+/// selection, or no-op when there is no selection). Returns `true` when a
+/// toast was dismissed.
 /// Extracted so the precedence is unit testable without driving the full
 /// event loop.
 pub(crate) fn plan_list_handle_esc(app: &mut crate::tui::views::plan_list::PlanListApp) -> bool {
@@ -1003,6 +1122,9 @@ where
             create_plan::render(f, area, &modal);
         })?;
 
+        if !event::poll(TUI_EVENT_POLL)? {
+            continue;
+        }
         let key = match event::read()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => k,
             _ => continue,
@@ -1156,6 +1278,7 @@ pub(crate) enum BranchDecision {
 /// Decide what action to take when aligning cwd with `target_branch`.
 pub(crate) fn classify_branch_target(workdir: &Path, target: &str) -> Result<BranchDecision> {
     use crate::git;
+    git::check_ref_format(target)?;
     let current = git::get_current_branch(workdir)?;
     if current == target {
         return Ok(BranchDecision::AlreadyOnTarget);
@@ -1190,6 +1313,9 @@ where
             let area = f.area();
             run_dialog::render(f, area, &dialog);
         })?;
+        if !event::poll(TUI_EVENT_POLL)? {
+            continue;
+        }
         if let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {
@@ -1223,6 +1349,9 @@ where
             let area = f.area();
             skip_dialog::render(f, area, &dialog);
         })?;
+        if !event::poll(TUI_EVENT_POLL)? {
+            continue;
+        }
         if let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {
@@ -1256,6 +1385,9 @@ where
             let area = f.area();
             dialog::render(f, area, confirm);
         })?;
+        if !event::poll(TUI_EVENT_POLL)? {
+            continue;
+        }
         if let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {
@@ -1441,6 +1573,26 @@ pub(crate) fn flush_palette_run_toasts(
 /// has no focused step) toast a "Open a step first…" hint instead. The
 /// run-dialog actions (`OpenRunDialog`, `RunOnBranch`) are likewise
 /// forwarded so the caller can drive the modal over the live view.
+fn palette_action_mutates_state(action: &crate::tui::palette_dispatch::PaletteAction) -> bool {
+    use crate::tui::palette_dispatch::PaletteAction;
+    matches!(
+        action,
+        PaletteAction::Approve { .. }
+            | PaletteAction::Unarchive { .. }
+            | PaletteAction::Import { .. }
+            | PaletteAction::SpawnPlanHarness { .. }
+            | PaletteAction::AddStep { .. }
+            | PaletteAction::SkipStep { .. }
+            | PaletteAction::MoveStep { .. }
+            | PaletteAction::OpenPlanDependencies { .. }
+            | PaletteAction::OpenPlanHooks { .. }
+            | PaletteAction::OpenStepHooks { .. }
+            | PaletteAction::OpenStepTags { .. }
+            | PaletteAction::OpenConfirmArchive { .. }
+            | PaletteAction::OpenConfirmDelete { .. }
+    )
+}
+
 pub(crate) fn plan_list_apply_palette_action(
     conn: &Connection,
     project: &str,
@@ -1450,6 +1602,15 @@ pub(crate) fn plan_list_apply_palette_action(
     use crate::tui::palette_dispatch::PaletteAction;
     use crate::tui::toast::ToastKind;
     use std::time::Instant;
+
+    if app.read_only.is_locked() && palette_action_mutates_state(&action) {
+        app.toasts.push(
+            "Read-only while a run is live.",
+            ToastKind::Error,
+            Instant::now(),
+        );
+        return Ok(None);
+    }
 
     match action {
         PaletteAction::None => {}
@@ -1848,6 +2009,26 @@ fn ensure_preview_cached(
     Ok(())
 }
 
+fn ensure_preview_cached_soft(
+    conn: &Connection,
+    app: &mut crate::tui::views::plan_list::PlanListApp,
+) {
+    if let Err(e) = ensure_preview_cached(conn, app) {
+        const PREFIX: &str = "Preview delayed:";
+        let already_visible = app
+            .toasts
+            .current()
+            .is_some_and(|toast| toast.text.starts_with(PREFIX));
+        if !already_visible {
+            app.toasts.push(
+                format!("{PREFIX} {e}"),
+                crate::tui::toast::ToastKind::Error,
+                std::time::Instant::now(),
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Archived-list TUI dispatcher (TUI-plan.md §6)
 // ---------------------------------------------------------------------------
@@ -1866,14 +2047,40 @@ where
     <B as ratatui::backend::Backend>::Error: Send + Sync + 'static,
 {
     use crate::tui::dialog;
+    use crate::tui::toast::ToastKind;
     use crate::tui::views::archived_list::{self, ArchivedListApp};
     use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
     let tiles = build_archived_tiles(conn, project)?;
     let mut app = ArchivedListApp::new(tiles, project, display_timezone);
+    let my_pid = std::process::id() as i64;
+    let mut tracker =
+        crate::tui::read_only::ReadOnlyTracker::new(crate::tui::read_only::ReadOnly::Editable);
+    if let Ok(initial) = crate::tui::read_only::detect(conn, project, my_pid, None) {
+        tracker.observe(initial, Instant::now());
+        app.set_read_only(tracker.state());
+    }
 
     loop {
+        let now = Instant::now();
+        if tracker.should_poll(now)
+            && let Ok(observed) = crate::tui::read_only::detect(conn, project, my_pid, None)
+        {
+            let transition = tracker.observe(observed, now);
+            app.set_read_only(tracker.state());
+            if transition == crate::tui::read_only::Transition::Released {
+                app.toasts.push(
+                    crate::tui::read_only::RELEASED_TOAST,
+                    ToastKind::Success,
+                    now,
+                );
+            }
+        }
+
         terminal.draw(|f| archived_list::draw(f, &mut app))?;
+        if !event::poll(TUI_EVENT_POLL)? {
+            continue;
+        }
         let key = match event::read()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => k,
             Event::Mouse(m) => {
@@ -1884,7 +2091,7 @@ where
                 app.handle_mouse(m);
                 // A click on the already-highlighted tile triggers the
                 // same path as `Enter` (unarchive the cursor target).
-                if app.take_pending_enter() {
+                if app.take_pending_enter() && !app.read_only.is_locked() {
                     let targets = app.action_targets();
                     if !targets.is_empty() {
                         archived_list_apply_unarchive(conn, project, &mut app, &targets)?;
@@ -1898,7 +2105,9 @@ where
             _ => continue,
         };
         // §15 help overlay: see plan-list dispatcher for the routing rule.
-        if app.help.intercept_key(key) != crate::tui::help::InterceptResult::Passthrough {
+        if app.palette_bar.is_none()
+            && app.help.intercept_key(key) != crate::tui::help::InterceptResult::Passthrough
+        {
             continue;
         }
         // §9 palette: see plan-list dispatcher for the routing rule. Step 20
@@ -1914,6 +2123,14 @@ where
                 PaletteBarOutcome::Submit(input) => {
                     let action = archived_list_palette_action(&input, default_harness, &app);
                     app.close_palette();
+                    if app.read_only.is_locked() && palette_action_mutates_state(&action) {
+                        app.toasts.push(
+                            "Read-only while a run is active.",
+                            ToastKind::Info,
+                            Instant::now(),
+                        );
+                        continue;
+                    }
                     match archived_list_apply_palette_action(conn, project, &mut app, action)? {
                         Some(PaletteAction::OpenConfirmDelete { plan_id, slug }) => {
                             let body =
@@ -1973,6 +2190,7 @@ where
             }
             continue;
         }
+        let locked = app.read_only.is_locked();
         match key.code {
             KeyCode::Char('/') | KeyCode::Char(':') => {
                 let prefix = match key.code {
@@ -1986,7 +2204,7 @@ where
             KeyCode::Char('g') => app.jump_top(),
             KeyCode::Char('G') => app.jump_bottom(),
             KeyCode::Char(' ') => app.toggle_selection(),
-            KeyCode::Char('d') => {
+            KeyCode::Char('d') if !locked => {
                 let targets = app.action_targets();
                 if targets.is_empty() {
                     continue;
@@ -2004,7 +2222,7 @@ where
                     archived_list_apply_delete(conn, project, &mut app, &targets)?;
                 }
             }
-            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') if !locked => {
                 let targets = app.action_targets();
                 if targets.is_empty() {
                     continue;
@@ -2012,6 +2230,10 @@ where
                 archived_list_apply_unarchive(conn, project, &mut app, &targets)?;
             }
             KeyCode::Char('r') => {
+                archived_list_refresh(conn, project, &mut app)?;
+            }
+            KeyCode::Char('I') => {
+                run_inbox_tui(terminal, conn, project)?;
                 archived_list_refresh(conn, project, &mut app)?;
             }
             KeyCode::Esc => {
@@ -2097,6 +2319,15 @@ pub(crate) fn archived_list_apply_palette_action(
     use crate::tui::palette_dispatch::PaletteAction;
     use crate::tui::toast::ToastKind;
     use std::time::Instant;
+
+    if app.read_only.is_locked() && palette_action_mutates_state(&action) {
+        app.toasts.push(
+            "Read-only while a run is live.",
+            ToastKind::Error,
+            Instant::now(),
+        );
+        return Ok(None);
+    }
 
     match action {
         PaletteAction::None => {}
@@ -2296,6 +2527,9 @@ where
             let area = f.area();
             dialog::render(f, area, c);
         })?;
+        if !event::poll(TUI_EVENT_POLL)? {
+            continue;
+        }
         if let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {
@@ -2508,6 +2742,10 @@ where
                 app.should_pop = true;
             }
         }
+        Some(PaletteAction::CancelRun) => {
+            let slug = app.plan.slug.clone();
+            plan_detail_apply_stop(terminal, conn, app, project, &slug)?;
+        }
         // §9.1 run-choice dialog. The dialog renders over the
         // live plan-detail; on success the caller spawns a
         // non-streaming runner (the streaming `R` keybinding
@@ -2571,7 +2809,7 @@ where
             run_step_hooks_tui(terminal, conn, project, &step_id)?;
         }
         Some(PaletteAction::OpenStepTags { step_id, .. }) => {
-            run_step_tags_tui(terminal, conn, &step_id)?;
+            run_step_tags_tui(terminal, conn, project, &step_id)?;
         }
         // docs/dag-redesign.md §12.3: `/inbox` opens the
         // cross-branch interruptions inbox.
@@ -2695,6 +2933,7 @@ where
                 sel.status,
                 crate::plan::StepStatus::Complete | crate::plan::StepStatus::Failed
             )
+            && !app.execution_logs_cache_covers_attempts(&sel.id, sel.attempts)
             && let Ok(logs) = storage::list_execution_logs_for_step(conn, &sel.id)
         {
             let sel_id = sel.id.clone();
@@ -2703,32 +2942,20 @@ where
 
         // -- §13.2 read-only attach poll -------------------------------
         //
-        // Only relevant when the runner host is NOT us: a TUI-spawned
-        // subscription bound to *this* plan implies the lock holder is
-        // our child, so skip detection and treat the App as editable.
-        // (The user sees the existing right-pane "Running step N"
-        // surface for the active run instead.) When the parent's
-        // subscription is for a *different* plan, the per-project lock
-        // is still effectively ours, so we also stay editable.
+        // Any live runner, including one spawned by this TUI, makes plan /
+        // step structure read-only. The user can still inspect, answer,
+        // pause, skip, and stop, but structural mutations are suppressed by
+        // the input layer and palette gates.
         let now = Instant::now();
-        let host_owns_subscription = subscription.is_some();
-        if !host_owns_subscription {
-            if tracker.should_poll(now)
-                && let Ok(observed) = read_only::detect(conn, project, my_pid, None)
-            {
-                let transition = tracker.observe(observed, now);
-                app.set_read_only(tracker.state());
-                if transition == Transition::Released {
-                    app.toasts
-                        .push(read_only::RELEASED_TOAST, ToastKind::Success, now);
-                }
+        if tracker.should_poll(now)
+            && let Ok(observed) = read_only::detect(conn, project, my_pid, None)
+        {
+            let transition = tracker.observe(observed, now);
+            app.set_read_only(tracker.state());
+            if transition == Transition::Released {
+                app.toasts
+                    .push(read_only::RELEASED_TOAST, ToastKind::Success, now);
             }
-        } else if app.read_only.is_locked() {
-            // We (the same TUI session) own a runner — clear any latched
-            // lockdown so the banner doesn't keep showing while our own
-            // child holds the row.
-            tracker.observe(ReadOnly::Editable, now);
-            app.set_read_only(ReadOnly::Editable);
         }
 
         terminal.draw(|f| plan_detail_ui::draw(f, &mut app))?;
@@ -2745,7 +2972,7 @@ where
         // any newly-arrived NDJSON chunks are drained on the next iteration
         // even when the user isn't pressing keys. 250ms balances UI
         // smoothness against polling cost.
-        if !event::poll(std::time::Duration::from_millis(250))? {
+        if !event::poll(TUI_EVENT_POLL)? {
             continue;
         }
         let key = match event::read()? {
@@ -2760,7 +2987,15 @@ where
                 // step-detail — same effect as the `Enter` keybinding's
                 // `InputAction::OpenStepDetail` arm below.
                 if let Some(step_id) = app.take_pending_open_step() {
-                    run_step_detail_tui(terminal, conn, config, project, &mut app, &step_id)?;
+                    run_step_detail_tui(
+                        terminal,
+                        conn,
+                        config,
+                        project,
+                        &mut app,
+                        &step_id,
+                        subscription,
+                    )?;
                     if app.should_pop {
                         return Ok(());
                     }
@@ -2773,7 +3008,8 @@ where
         // state before the per-view input handler so view bindings don't
         // fire while the overlay is up. Add-mode is exempt — `?` is a valid
         // text-input character there.
-        if matches!(app.input_mode, plan_detail::InputMode::Normal)
+        if app.palette_bar.is_none()
+            && matches!(app.input_mode, plan_detail::InputMode::Normal)
             && app.help.intercept_key(key) != crate::tui::help::InterceptResult::Passthrough
         {
             continue;
@@ -2808,6 +3044,9 @@ where
         let action = plan_detail_input::handle_key(&mut app, key);
         match action {
             InputAction::None | InputAction::Pop => {}
+            InputAction::Refresh => {
+                plan_detail_apply_refresh(conn, &mut app)?;
+            }
             InputAction::AddStep(pos, title) => {
                 plan_detail_apply_add(conn, &mut app, pos, &title)?;
             }
@@ -2816,9 +3055,6 @@ where
             }
             InputAction::Delete(targets) => {
                 plan_detail_apply_delete(terminal, conn, &mut app, &targets)?;
-            }
-            InputAction::Reset(step_id) => {
-                plan_detail_apply_reset(conn, &mut app, &step_id)?;
             }
             InputAction::MoveUp(step_id) => {
                 plan_detail_apply_move(conn, &mut app, &step_id, MoveDir::Up)?;
@@ -2831,7 +3067,7 @@ where
                 plan_detail_apply_run_streaming(conn, &mut app, project, slug, mode, subscription)?;
             }
             InputAction::Stop => {
-                plan_detail_apply_stop(conn, &mut app, project, slug)?;
+                plan_detail_apply_stop(terminal, conn, &mut app, project, slug)?;
             }
             InputAction::OpenDependencies => {
                 let project_path = app.plan.project.clone();
@@ -2846,10 +3082,26 @@ where
                 run_plan_hooks_tui(terminal, conn, &project_path, &plan_id, &plan_slug)?;
             }
             InputAction::OpenQuestion(step_id) => {
-                run_step_detail_tui(terminal, conn, config, project, &mut app, &step_id)?;
+                run_step_detail_tui(
+                    terminal,
+                    conn,
+                    config,
+                    project,
+                    &mut app,
+                    &step_id,
+                    subscription,
+                )?;
             }
             InputAction::OpenStepDetail(step_id) => {
-                run_step_detail_tui(terminal, conn, config, project, &mut app, &step_id)?;
+                run_step_detail_tui(
+                    terminal,
+                    conn,
+                    config,
+                    project,
+                    &mut app,
+                    &step_id,
+                    subscription,
+                )?;
             }
             InputAction::TogglePauseRequested => {
                 plan_detail_apply_toggle_pause(conn, &mut app)?;
@@ -2879,6 +3131,38 @@ where
 pub(crate) enum MoveDir {
     Up,
     Down,
+}
+
+fn refresh_plan_detail_steps_and_outline(
+    conn: &Connection,
+    app: &mut crate::tui::views::plan_detail::PlanDetailApp,
+) -> Result<()> {
+    let plan_id = app.plan.id.clone();
+    app.refresh_steps(storage::list_steps(conn, &plan_id)?);
+    let deps_of = storage::list_step_dependency_edges(conn, &plan_id).unwrap_or_default();
+    let blocked_ids: std::collections::HashSet<String> =
+        storage::list_open_interruptions_for_plan(conn, &plan_id)
+            .map(|v| v.into_iter().map(|i| i.step_id).collect())
+            .unwrap_or_default();
+    app.sync_outline(deps_of, blocked_ids);
+    Ok(())
+}
+
+fn plan_detail_select_step_by_id(
+    app: &mut crate::tui::views::plan_detail::PlanDetailApp,
+    step_id: &str,
+) {
+    if let Some(row_idx) = app
+        .outline
+        .visible_rows()
+        .iter()
+        .position(|row| row.step_id == step_id)
+    {
+        app.outline.set_cursor(row_idx);
+        app.realign_selection_to_outline();
+    } else if let Some(idx) = app.steps.iter().position(|s| s.id == step_id) {
+        app.selected_index = idx;
+    }
 }
 
 /// Persist an `i` (insert above) / `a` (append below) action: compute the
@@ -2912,30 +3196,48 @@ pub(crate) fn plan_detail_apply_add(
     };
 
     let plan_id = app.plan.id.clone();
-    let result = storage::create_step_at(
-        conn,
-        &plan_id,
-        &sort_key,
-        crate::storage::NewStep {
-            title,
-            description: "",
-            agent: None,
-            harness: None,
-            acceptance_criteria: &[],
-            max_retries: None,
-            model: None,
-            change_policy: None,
-            tags: None,
-        },
-    );
+    let selected_id = app.reset_target();
+    let result = crate::db::with_tx(conn, |conn| {
+        let (new_step, position_1based) = storage::create_step_at(
+            conn,
+            &plan_id,
+            &sort_key,
+            crate::storage::NewStep {
+                title,
+                description: "",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )?;
+
+        if let Some(selected_id) = selected_id.as_deref() {
+            match position {
+                AddPosition::Above => {
+                    for parent_id in storage::list_step_dependencies(conn, selected_id)? {
+                        storage::remove_step_dependency(conn, selected_id, &parent_id)?;
+                        storage::add_step_dependency(conn, &new_step.id, &parent_id)?;
+                    }
+                    storage::add_step_dependency(conn, selected_id, &new_step.id)?;
+                }
+                AddPosition::Below => {
+                    storage::add_step_dependency(conn, &new_step.id, selected_id)?;
+                }
+            }
+        }
+
+        Ok((new_step, position_1based))
+    });
 
     match result {
         Ok((new_step, _position_1based)) => {
             let new_id = new_step.id.clone();
-            app.refresh_steps(storage::list_steps(conn, &plan_id)?);
-            if let Some(idx) = app.steps.iter().position(|s| s.id == new_id) {
-                app.selected_index = idx;
-            }
+            refresh_plan_detail_steps_and_outline(conn, app)?;
+            plan_detail_select_step_by_id(app, &new_id);
             app.toasts.push(
                 format!("Added step: {title}"),
                 ToastKind::Success,
@@ -2968,14 +3270,13 @@ pub(crate) fn plan_detail_apply_skip(
         Ok(parked) => {
             runner::discard_parked_worktree_state(Path::new(&app.plan.project), parked)?;
             let dependent_count = storage::list_step_dependents(conn, step_id)?.len();
-            let plan_id = app.plan.id.clone();
-            app.refresh_steps(storage::list_steps(conn, &plan_id)?);
+            refresh_plan_detail_steps_and_outline(conn, app)?;
             app.toasts
                 .push("Step skipped.", ToastKind::Success, Instant::now());
             if dependent_count > 0 {
                 app.toasts.push(
                     format!(
-                        "Skipped step still has {} dependent step(s); that branch will remain blocked until you reset, remove, or rewire them",
+                        "Skipped step has {} dependent step(s); those branches can continue because skipped steps satisfy dependencies",
                         dependent_count
                     ),
                     ToastKind::Info,
@@ -3204,16 +3505,40 @@ pub(crate) fn plan_detail_apply_run_streaming(
     Ok(())
 }
 
-/// Persist an `S` stop action by routing through `cmd_cancel`, which
-/// implements the SIGTERM-with-timeout-then-SIGKILL semantics used by the
-/// `ralph cancel` CLI. The 15s default mirrors the CLI default and is long
-/// enough for a runner mid-phase to write its rollback / finalize records.
-pub(crate) fn plan_detail_apply_stop(
+pub(crate) fn plan_detail_apply_refresh(
+    conn: &Connection,
+    app: &mut crate::tui::views::plan_detail::PlanDetailApp,
+) -> Result<()> {
+    use crate::tui::toast::ToastKind;
+    use std::time::Instant;
+
+    let plan_id = app.plan.id.clone();
+    app.sync_steps_from_db(storage::list_steps(conn, &plan_id)?);
+    let deps_of = storage::list_step_dependency_edges(conn, &plan_id).unwrap_or_default();
+    let blocked_ids: std::collections::HashSet<String> =
+        storage::list_open_interruptions_for_plan(conn, &plan_id)
+            .map(|v| v.into_iter().map(|i| i.step_id).collect())
+            .unwrap_or_default();
+    app.sync_outline(deps_of, blocked_ids);
+    app.toasts
+        .push("Refreshed.", ToastKind::Info, Instant::now());
+    Ok(())
+}
+
+/// Persist an `S` stop action by routing through `cmd_cancel` on a background
+/// connection, preserving the CLI's SIGTERM-with-timeout-then-SIGKILL
+/// semantics without blocking the TUI render/input loop for the timeout.
+pub(crate) fn plan_detail_apply_stop<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
     conn: &Connection,
     app: &mut crate::tui::views::plan_detail::PlanDetailApp,
     project: &str,
     slug: &str,
-) -> Result<()> {
+) -> Result<()>
+where
+    <B as ratatui::backend::Backend>::Error: Send + Sync + 'static,
+{
+    use crate::tui::dialog;
     use crate::tui::toast::ToastKind;
     use std::time::Instant;
 
@@ -3228,22 +3553,22 @@ pub(crate) fn plan_detail_apply_stop(
         return Ok(());
     }
 
-    // Quiet plain-format context so cmd_cancel doesn't print progress dots
-    // through the alternate screen during the brief SIGTERM wait.
-    let cancel_out = OutputContext {
-        format: OutputFormat::Plain,
-        quiet: true,
-        color: false,
+    let body = format!("Stop the live run for `{slug}`?");
+    let confirm = dialog::Confirm {
+        title: "Stop run",
+        body: &body,
+        default: false,
     };
-    match cmd_cancel(
-        conn,
-        project,
-        Some(slug),
-        false,
-        Duration::from_secs(15),
-        &cancel_out,
-    ) {
-        Ok(()) => {
+    if !confirm_with_plan_detail_background(terminal, app, &confirm)? {
+        return Ok(());
+    }
+
+    match spawn_cancel_run_task(conn, project, slug) {
+        Ok(SpawnedCancel::Background) => {
+            app.toasts
+                .push("Cancel requested.", ToastKind::Info, Instant::now());
+        }
+        Ok(SpawnedCancel::Completed) => {
             app.toasts
                 .push("Run cancelled.", ToastKind::Success, Instant::now());
         }
@@ -3256,6 +3581,68 @@ pub(crate) fn plan_detail_apply_stop(
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpawnedCancel {
+    Background,
+    Completed,
+}
+
+fn connection_database_path(conn: &Connection) -> Result<Option<std::path::PathBuf>> {
+    let path: String = conn.query_row("PRAGMA database_list", [], |row| row.get(2))?;
+    if path.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(std::path::PathBuf::from(path)))
+    }
+}
+
+fn spawn_cancel_run_task(conn: &Connection, project: &str, slug: &str) -> Result<SpawnedCancel> {
+    let Some(db_path) = connection_database_path(conn)? else {
+        // In-memory/test connections cannot be reopened from another thread.
+        let cancel_out = OutputContext {
+            format: OutputFormat::Plain,
+            quiet: true,
+            color: false,
+        };
+        cmd_cancel(
+            conn,
+            project,
+            Some(slug),
+            false,
+            Duration::from_secs(15),
+            &cancel_out,
+        )?;
+        return Ok(SpawnedCancel::Completed);
+    };
+
+    let project = project.to_string();
+    let slug = slug.to_string();
+    std::thread::Builder::new()
+        .name("ralph-tui-cancel".to_string())
+        .spawn(move || {
+            let cancel_out = OutputContext {
+                format: OutputFormat::Plain,
+                quiet: true,
+                color: false,
+            };
+            match crate::db::open_at(&db_path).and_then(|bg_conn| {
+                cmd_cancel(
+                    &bg_conn,
+                    &project,
+                    Some(&slug),
+                    false,
+                    Duration::from_secs(15),
+                    &cancel_out,
+                )
+            }) {
+                Ok(()) => {}
+                Err(e) => eprintln!("ralph tui cancel failed: {e:#}"),
+            }
+        })
+        .context("spawning cancel worker")?;
+    Ok(SpawnedCancel::Background)
 }
 
 /// Render the `Delete N step(s)?` confirm dialog over the live plan-detail
@@ -3298,8 +3685,7 @@ where
             );
         }
     }
-    let plan_id = app.plan.id.clone();
-    app.refresh_steps(storage::list_steps(conn, &plan_id)?);
+    refresh_plan_detail_steps_and_outline(conn, app)?;
     if errors == 0 {
         let n = targets.len();
         let msg = if n == 1 {
@@ -3308,34 +3694,6 @@ where
             format!("Deleted {n} steps.")
         };
         app.toasts.push(msg, ToastKind::Success, Instant::now());
-    }
-    Ok(())
-}
-
-/// Persist an `r` reset action via `storage::reset_step` and refresh.
-pub(crate) fn plan_detail_apply_reset(
-    conn: &Connection,
-    app: &mut crate::tui::views::plan_detail::PlanDetailApp,
-    step_id: &str,
-) -> Result<()> {
-    use crate::tui::toast::ToastKind;
-    use std::time::Instant;
-
-    match storage::reset_step(conn, step_id) {
-        Ok(parked) => {
-            runner::discard_parked_worktree_state(Path::new(&app.plan.project), parked)?;
-            let plan_id = app.plan.id.clone();
-            app.refresh_steps(storage::list_steps(conn, &plan_id)?);
-            app.toasts
-                .push("Step reset.", ToastKind::Success, Instant::now());
-        }
-        Err(e) => {
-            app.toasts.push(
-                format!("Failed to reset step: {e}"),
-                ToastKind::Error,
-                Instant::now(),
-            );
-        }
     }
     Ok(())
 }
@@ -3378,11 +3736,8 @@ pub(crate) fn plan_detail_apply_move(
         return Ok(());
     }
 
-    let plan_id = app.plan.id.clone();
-    app.refresh_steps(storage::list_steps(conn, &plan_id)?);
-    if let Some(idx) = app.steps.iter().position(|s| s.id == step_id) {
-        app.selected_index = idx;
-    }
+    refresh_plan_detail_steps_and_outline(conn, app)?;
+    plan_detail_select_step_by_id(app, step_id);
     let label = match dir {
         MoveDir::Up => "Moved step up.",
         MoveDir::Down => "Moved step down.",
@@ -3450,6 +3805,15 @@ pub(crate) fn plan_detail_apply_palette_action(
     use crate::tui::palette_dispatch::PaletteAction;
     use crate::tui::toast::ToastKind;
     use std::time::Instant;
+
+    if (app.read_only.is_locked() || app.is_run_live()) && palette_action_mutates_state(&action) {
+        app.toasts.push(
+            "Read-only while a run is live.",
+            ToastKind::Error,
+            Instant::now(),
+        );
+        return Ok(None);
+    }
 
     match action {
         PaletteAction::None => {}
@@ -3572,11 +3936,7 @@ pub(crate) fn plan_detail_apply_palette_action(
             apply_palette_import(&path, conn, project, &mut app.toasts);
         }
         PaletteAction::CancelRun => {
-            // Mirror `S`: only fire when there's actually a live run for this
-            // plan. `plan_detail_apply_stop` already toasts "No live run for
-            // this plan" when nothing is bound, so let it do the work.
-            let slug = app.plan.slug.clone();
-            plan_detail_apply_stop(conn, app, project, &slug)?;
+            return Ok(Some(PaletteAction::CancelRun));
         }
         PaletteAction::SpawnPlanHarness { harness, .. } => {
             app.toasts.push(
@@ -3792,6 +4152,9 @@ where
             let area = f.area();
             dialog::render(f, area, c);
         })?;
+        if !event::poll(TUI_EVENT_POLL)? {
+            continue;
+        }
         if let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {
@@ -3844,7 +4207,7 @@ where
     loop {
         terminal.draw(|f| render(f, f.area(), &mut app))?;
 
-        if !event::poll(std::time::Duration::from_millis(250))? {
+        if !event::poll(TUI_EVENT_POLL)? {
             continue;
         }
         let key = match event::read()? {
@@ -3855,6 +4218,15 @@ where
             }
             _ => continue,
         };
+        if !app.help.is_visible()
+            && app.mode == Mode::List
+            && matches!(key.code, crossterm::event::KeyCode::Char('I'))
+        {
+            run_inbox_tui(terminal, conn, &project)?;
+            let (deps, candidates) = load_dependencies_view_state(conn, &project, &plan_id)?;
+            app.refresh(deps, candidates);
+            continue;
+        }
         match app.handle_key(key) {
             Outcome::Pending => {}
             Outcome::Pop => return Ok(()),
@@ -3986,7 +4358,7 @@ where
     loop {
         terminal.draw(|f| render(f, f.area(), &mut app))?;
 
-        if !event::poll(std::time::Duration::from_millis(250))? {
+        if !event::poll(TUI_EVENT_POLL)? {
             continue;
         }
         let key = match event::read()? {
@@ -3997,6 +4369,15 @@ where
             }
             _ => continue,
         };
+        if !app.help.is_visible()
+            && app.mode == Mode::List
+            && matches!(key.code, crossterm::event::KeyCode::Char('I'))
+        {
+            run_inbox_tui(terminal, conn, &project)?;
+            let (attachments, candidates) = load_plan_hooks_view_state(conn, &project, &plan_id)?;
+            app.refresh(attachments, candidates);
+            continue;
+        }
         match app.handle_key(key) {
             Outcome::Pending => {}
             Outcome::Pop => return Ok(()),
@@ -4141,7 +4522,7 @@ where
     loop {
         terminal.draw(|f| render(f, f.area(), &mut app))?;
 
-        if !event::poll(std::time::Duration::from_millis(250))? {
+        if !event::poll(TUI_EVENT_POLL)? {
             continue;
         }
         let key = match event::read()? {
@@ -4152,6 +4533,16 @@ where
             }
             _ => continue,
         };
+        if !app.help.is_visible()
+            && app.mode == Mode::List
+            && matches!(key.code, crossterm::event::KeyCode::Char('I'))
+        {
+            run_inbox_tui(terminal, conn, project)?;
+            let (attachments, candidates) =
+                load_step_hooks_view_state(conn, project, &plan_id, step_id)?;
+            app.refresh(attachments, candidates);
+            continue;
+        }
         match app.handle_key(key) {
             Outcome::Pending => {}
             Outcome::Pop => return Ok(()),
@@ -4274,6 +4665,7 @@ fn load_step_hooks_view_state(
 fn run_step_tags_tui<B: ratatui::backend::Backend>(
     terminal: &mut ratatui::Terminal<B>,
     conn: &Connection,
+    project: &str,
     step_id: &str,
 ) -> Result<()>
 where
@@ -4303,7 +4695,7 @@ where
     loop {
         terminal.draw(|f| render(f, f.area(), &mut app))?;
 
-        if !event::poll(std::time::Duration::from_millis(250))? {
+        if !event::poll(TUI_EVENT_POLL)? {
             continue;
         }
         let key = match event::read()? {
@@ -4314,6 +4706,13 @@ where
             }
             _ => continue,
         };
+        if !app.help.is_visible()
+            && matches!(app.mode, crate::tui::views::step_tags::Mode::List)
+            && matches!(key.code, crossterm::event::KeyCode::Char('I'))
+        {
+            run_inbox_tui(terminal, conn, project)?;
+            continue;
+        }
         match app.handle_key(key) {
             Outcome::Pending => {}
             Outcome::DiscardAndPop => return Ok(()),
@@ -4354,7 +4753,7 @@ fn run_inbox_tui<B: ratatui::backend::Backend>(
 where
     <B as ratatui::backend::Backend>::Error: Send + Sync + 'static,
 {
-    use crate::tui::editor::edit_in_editor;
+    use crate::tui::editor::{EditorOutcome, edit_in_editor_outcome};
     use crate::tui::help::InterceptResult;
     use crate::tui::views::inbox::{InboxItem, InboxOutcome, InboxState};
     use crate::tui::views::inbox_ui;
@@ -4387,9 +4786,9 @@ where
             app.sync(items);
         }
 
-        terminal.draw(|f| inbox_ui::draw(f, &app, &project_path))?;
+        terminal.draw(|f| inbox_ui::draw(f, &mut app, &project_path))?;
 
-        if !event::poll(std::time::Duration::from_millis(250))? {
+        if !event::poll(TUI_EVENT_POLL)? {
             continue;
         }
         let key = match event::read()? {
@@ -4419,14 +4818,36 @@ where
                 // (typo fix, or set freeform → comment → back) amends rather
                 // than wipes the captured text.
                 let seed = app.modal().map(|m| m.freeform.clone()).unwrap_or_default();
-                if let Ok(Some(text)) = edit_in_editor(&seed) {
-                    app.set_modal_freeform(text);
+                let edited = edit_in_editor_outcome(&seed);
+                terminal.clear()?;
+                match edited {
+                    Ok(EditorOutcome::Saved(text)) => app.set_modal_freeform(text),
+                    Ok(EditorOutcome::Cancelled) => {}
+                    Ok(EditorOutcome::NoEditor) => app.push_toast(
+                        crate::tui::views::step_detail::NO_EDITOR_TOAST,
+                        crate::tui::toast::ToastKind::Error,
+                    ),
+                    Err(e) => app.push_toast(
+                        format!("Editor failed: {e}"),
+                        crate::tui::toast::ToastKind::Error,
+                    ),
                 }
             }
             InboxOutcome::EditComment => {
                 let seed = app.modal().map(|m| m.comment.clone()).unwrap_or_default();
-                if let Ok(Some(text)) = edit_in_editor(&seed) {
-                    app.set_modal_comment(text);
+                let edited = edit_in_editor_outcome(&seed);
+                terminal.clear()?;
+                match edited {
+                    Ok(EditorOutcome::Saved(text)) => app.set_modal_comment(text),
+                    Ok(EditorOutcome::Cancelled) => {}
+                    Ok(EditorOutcome::NoEditor) => app.push_toast(
+                        crate::tui::views::step_detail::NO_EDITOR_TOAST,
+                        crate::tui::toast::ToastKind::Error,
+                    ),
+                    Err(e) => app.push_toast(
+                        format!("Editor failed: {e}"),
+                        crate::tui::toast::ToastKind::Error,
+                    ),
                 }
             }
             InboxOutcome::Resolve {
@@ -4619,7 +5040,7 @@ where
     loop {
         terminal.draw(|f| render(f, f.area(), &mut app))?;
 
-        if !event::poll(std::time::Duration::from_millis(250))? {
+        if !event::poll(TUI_EVENT_POLL)? {
             continue;
         }
         let key = match event::read()? {
@@ -4634,6 +5055,10 @@ where
             }
             _ => continue,
         };
+        if !app.help.is_visible() && matches!(key.code, crossterm::event::KeyCode::Char('I')) {
+            run_inbox_tui(terminal, conn, project)?;
+            continue;
+        }
         match app.handle_key(key) {
             Outcome::Pending => {}
             Outcome::Pop => return Ok(()),
@@ -4733,7 +5158,7 @@ where
             run_step_hooks_tui(terminal, conn, project, &step_id)?;
         }
         Some(PaletteAction::OpenStepTags { step_id, .. }) => {
-            run_step_tags_tui(terminal, conn, &step_id)?;
+            run_step_tags_tui(terminal, conn, project, &step_id)?;
         }
         _ => {}
     }
@@ -4747,11 +5172,12 @@ fn run_step_detail_tui<B: ratatui::backend::Backend>(
     project: &str,
     plan_app: &mut crate::tui::views::plan_detail::PlanDetailApp,
     target_step_id: &str,
+    subscription: &mut Option<crate::tui::events::HostedSubscription>,
 ) -> Result<()>
 where
     <B as ratatui::backend::Backend>::Error: Send + Sync + 'static,
 {
-    use crate::tui::editor::edit_in_editor;
+    use crate::tui::editor::{EditorOutcome, edit_in_editor_outcome};
     use crate::tui::read_only::{self, ReadOnly, ReadOnlyTracker, Transition};
     use crate::tui::toast::ToastKind;
     use crate::tui::views::answer_modal::ResumeModalAction;
@@ -4793,6 +5219,8 @@ where
     let mut tracker = ReadOnlyTracker::new(ReadOnly::Editable);
 
     loop {
+        drain_subscription_while_in_step_detail(subscription, &mut app);
+
         // §13.2 poll. Cadence is owned by the tracker (see read_only::POLL_INTERVAL).
         let now = Instant::now();
         if tracker.should_poll(now)
@@ -4807,10 +5235,10 @@ where
 
         terminal.draw(|f| step_detail::draw(f, &mut app))?;
 
-        if !event::poll(std::time::Duration::from_millis(250))? {
-            // Re-poll the question state so concurrent answers (CLI or
-            // another TUI) are reflected without input.
-            refresh_step_detail_questions(conn, project, &mut app)?;
+        if !event::poll(TUI_EVENT_POLL)? {
+            // Re-poll step/question state so live runs and concurrent CLI /
+            // TUI answers are reflected without input.
+            refresh_step_detail_state_soft(conn, project, &mut app);
             continue;
         }
         let key = match event::read()? {
@@ -4820,7 +5248,12 @@ where
                 if app.help.is_visible() {
                     continue;
                 }
+                let before = app.current_step().map(|s| s.id.clone());
                 app.handle_mouse(m);
+                let after = app.current_step().map(|s| s.id.clone());
+                if before != after {
+                    refresh_step_detail_state_soft(conn, project, &mut app);
+                }
                 continue;
             }
             _ => continue,
@@ -4840,7 +5273,7 @@ where
                         // DB. Picker is closed unconditionally so the user
                         // returns to the underlying view.
                         if app.can_edit_panes()
-                            && let Err(e) = app.apply_picker_submit(conn, kind, &value)
+                            && let Err(e) = app.apply_picker_submit(conn, kind, value.as_deref())
                         {
                             app.toasts.push(
                                 format!("Failed to apply: {e}"),
@@ -4848,6 +5281,7 @@ where
                                 Instant::now(),
                             );
                         }
+                        refresh_step_detail_state(conn, project, &mut app)?;
                         app.close_picker();
                     }
                 }
@@ -4858,28 +5292,33 @@ where
         // §15 help overlay: `?` toggles, `<esc>`/`q`/Ctrl-C close. Run before
         // the modal handlers so a stuck overlay can always be dismissed; we
         // skip interception while a modal is up so the modal owns the keymap.
-        if app.answer_modal.is_none()
-            && app.resume_modal.is_none()
+        if app.palette_bar.is_none()
+            && !app.modal_is_open()
             && app.help.intercept_key(key) != crate::tui::help::InterceptResult::Passthrough
         {
             continue;
         }
 
-        // Modals are exclusive: the resume modal is only opened when no
-        // answer modal is also open, and vice versa.
-        if app.answer_modal.is_some() {
-            handle_answer_modal_key(conn, project, &mut app, key, edit_in_editor)?;
+        if app.answer_modal().is_some() {
+            handle_answer_modal_key(conn, project, &mut app, key, |seed| {
+                let edited = edit_in_editor_outcome(seed);
+                terminal.clear()?;
+                Ok(match edited? {
+                    EditorOutcome::Saved(text) => Some(text),
+                    EditorOutcome::Cancelled => Some(seed.to_string()),
+                    EditorOutcome::NoEditor => None,
+                })
+            })?;
             if app.should_pop {
                 return Ok(());
             }
             continue;
         }
-        if app.resume_modal.is_some() {
+        if app.resume_modal().is_some() {
             match handle_resume_modal_key(&mut app, key) {
                 ResumeModalAction::Accept => {
                     let modal = app
-                        .resume_modal
-                        .take()
+                        .take_resume_modal()
                         .expect("resume_modal was Some moments ago");
                     spawn_resume_run(&mut app, project, &modal);
                     return Ok(());
@@ -4975,6 +5414,10 @@ where
             KeyCode::Char('z') => {
                 app.toggle_zen();
             }
+            KeyCode::Char('I') => {
+                run_inbox_tui(terminal, conn, project)?;
+                refresh_step_detail_state(conn, project, &mut app)?;
+            }
             KeyCode::Char('q') => app.request_pop(),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.request_pop();
@@ -4985,7 +5428,15 @@ where
             }
             KeyCode::Char('c') if app.can_edit_panes() => {
                 let dir = crate::config::config_dir()?;
-                step_detail_handle_c(&mut app, conn, config, &dir, edit_in_editor)?;
+                step_detail_handle_c(&mut app, conn, config, &dir, |seed| {
+                    let edited = edit_in_editor_outcome(seed);
+                    terminal.clear()?;
+                    Ok(match edited? {
+                        EditorOutcome::Saved(text) => Some(text),
+                        EditorOutcome::Cancelled => Some(seed.to_string()),
+                        EditorOutcome::NoEditor => None,
+                    })
+                })?;
             }
             // Open the step-hooks sub-view (TUI-plan.md §1). Suppressed
             // during read-only attach so an external runner's lock isn't
@@ -5002,7 +5453,7 @@ where
             KeyCode::Char('T') if app.can_edit_panes() => {
                 if let Some(step) = app.current_step() {
                     let step_id = step.id.clone();
-                    run_step_tags_tui(terminal, conn, &step_id)?;
+                    run_step_tags_tui(terminal, conn, project, &step_id)?;
                 }
             }
             KeyCode::Esc => {
@@ -5012,6 +5463,40 @@ where
         }
         if app.should_pop {
             return Ok(());
+        }
+    }
+}
+
+fn drain_subscription_while_in_step_detail(
+    subscription: &mut Option<crate::tui::events::HostedSubscription>,
+    app: &mut crate::tui::views::step_detail::StepDetailApp,
+) {
+    let Some(hosted) = subscription.as_mut() else {
+        return;
+    };
+
+    // Step-detail rebuilds its visible state from SQLite every tick. Drain
+    // and discard NDJSON events here so the parent unbounded channel cannot
+    // accumulate while this sub-view is open; plan-detail will recover tails
+    // and status from the DB/live-run poll when the user returns.
+    let _ = hosted.sub.drain();
+    if !hosted.sub.is_disconnected() {
+        return;
+    }
+
+    match hosted.sub.poll_failure_status() {
+        crate::tui::events::FailureStatus::Pending => {}
+        crate::tui::events::FailureStatus::Clean => {
+            *subscription = None;
+        }
+        crate::tui::events::FailureStatus::Message(msg) => {
+            let slug = hosted.slug.clone();
+            *subscription = None;
+            app.toasts.push(
+                format!("[{slug}] {msg}"),
+                crate::tui::toast::ToastKind::Error,
+                Instant::now(),
+            );
         }
     }
 }
@@ -5030,6 +5515,15 @@ pub(crate) fn step_detail_apply_palette_action(
     use crate::tui::palette_dispatch::PaletteAction;
     use crate::tui::toast::ToastKind;
     use std::time::Instant;
+
+    if !app.can_edit_panes() && palette_action_mutates_state(&action) {
+        app.toasts.push(
+            "Read-only while a run is live.",
+            ToastKind::Error,
+            Instant::now(),
+        );
+        return Ok(None);
+    }
 
     match action {
         PaletteAction::None => {}
@@ -5322,7 +5816,7 @@ where
     use crate::tui::views::answer_modal::InterruptionModalAction;
     use crate::tui::views::step_detail::NO_EDITOR_TOAST;
 
-    let Some(modal) = app.answer_modal.as_mut() else {
+    let Some(modal) = app.answer_modal_mut() else {
         return Ok(());
     };
     let action = modal.handle_key(key);
@@ -5335,16 +5829,14 @@ where
             // Seed the editor with the current freeform so re-opening it
             // amends rather than wipes the captured text (mirrors the inbox).
             let seed = app
-                .answer_modal
-                .as_ref()
+                .answer_modal()
                 .map(|m| m.freeform.clone())
                 .unwrap_or_default();
             match editor_fn(&seed)? {
                 Some(text) => app.set_answer_modal_freeform(text),
-                // `edit_in_editor` collapses "no $EDITOR" and "editor exited
-                // non-zero" into `None`; surface the same missing-editor toast
-                // the prompt-pane editor path does so the keypress isn't a
-                // silent no-op (the legacy AnswerModal also showed an error).
+                // Production maps a missing editor to `None` and a cancelled
+                // editor to the unchanged seed, so this toast is specifically
+                // for the no-editor case.
                 None => {
                     app.toasts
                         .push(NO_EDITOR_TOAST, ToastKind::Error, std::time::Instant::now());
@@ -5353,8 +5845,7 @@ where
         }
         InterruptionModalAction::EditComment => {
             let seed = app
-                .answer_modal
-                .as_ref()
+                .answer_modal()
                 .map(|m| m.comment.clone())
                 .unwrap_or_default();
             match editor_fn(&seed)? {
@@ -5391,7 +5882,7 @@ fn handle_resume_modal_key(
     key: crossterm::event::KeyEvent,
 ) -> crate::tui::views::answer_modal::ResumeModalAction {
     use crate::tui::views::answer_modal::ResumeModalAction;
-    let Some(modal) = app.resume_modal.as_ref() else {
+    let Some(modal) = app.resume_modal() else {
         return ResumeModalAction::Pending;
     };
     modal.handle_key(key)
@@ -5466,6 +5957,64 @@ fn refresh_step_detail_questions(
     Ok(())
 }
 
+fn refresh_step_detail_state(
+    conn: &Connection,
+    project: &str,
+    app: &mut crate::tui::views::step_detail::StepDetailApp,
+) -> Result<()> {
+    let current_id = app.current_step().map(|s| s.id.clone());
+    let was_on_latest_attempt = app
+        .execution_logs
+        .len()
+        .checked_sub(1)
+        .is_none_or(|last| app.appended_attempt_index >= last);
+
+    let steps = storage::list_steps(conn, &app.plan.id)?;
+    app.steps = steps;
+    if let Some(id) = current_id
+        && let Some(idx) = app.steps.iter().position(|s| s.id == id)
+    {
+        app.selected_step_index = idx;
+    } else if app.steps.is_empty() {
+        app.selected_step_index = 0;
+    } else if app.selected_step_index >= app.steps.len() {
+        app.selected_step_index = app.steps.len() - 1;
+    }
+
+    if let Some(step_id) = app.current_step().map(|s| s.id.clone()) {
+        app.execution_logs = storage::list_execution_logs_for_step(conn, &step_id)?;
+        if was_on_latest_attempt || app.appended_attempt_index >= app.execution_logs.len() {
+            app.appended_attempt_index = app.execution_logs.len().saturating_sub(1);
+        }
+    } else {
+        app.execution_logs.clear();
+        app.appended_attempt_index = 0;
+    }
+
+    refresh_step_detail_questions(conn, project, app)
+}
+
+fn refresh_step_detail_state_soft(
+    conn: &Connection,
+    project: &str,
+    app: &mut crate::tui::views::step_detail::StepDetailApp,
+) {
+    if let Err(e) = refresh_step_detail_state(conn, project, app) {
+        const PREFIX: &str = "Refresh delayed:";
+        let already_visible = app
+            .toasts
+            .current()
+            .is_some_and(|toast| toast.text.starts_with(PREFIX));
+        if !already_visible {
+            app.toasts.push(
+                format!("{PREFIX} {e}"),
+                crate::tui::toast::ToastKind::Error,
+                std::time::Instant::now(),
+            );
+        }
+    }
+}
+
 /// Best-effort lookup of the previous run's `--current-branch` flag for
 /// `plan_slug`. Returns `false` (the normal branch flow) when the previous
 /// branch mode can't be recovered — the schema doesn't currently persist
@@ -5531,6 +6080,14 @@ fn spawn_resume_run(
 // Status command
 // ---------------------------------------------------------------------------
 
+fn emit_no_active_plan(out: &OutputContext) {
+    if out.format == OutputFormat::Json {
+        println!("null");
+    } else {
+        eprintln!("{}", super::NO_ACTIVE_PLAN_MESSAGE);
+    }
+}
+
 pub fn cmd_status(
     conn: &Connection,
     project: &str,
@@ -5538,24 +6095,11 @@ pub fn cmd_status(
     verbose: bool,
     out: &OutputContext,
 ) -> Result<()> {
-    let plan = if let Some(slug) = plan_slug {
-        storage::get_plan_by_slug(conn, slug, project)?
-            .with_context(|| format!("Plan not found: {slug}"))?
-    } else {
-        // Find the most recent active plan, including completed plans so that
-        // running `status` right after a plan finishes still shows it.
-        match storage::find_active_plan(conn, project, true)? {
-            Some(p) => p,
-            None => {
-                if out.format == OutputFormat::Json {
-                    println!("null");
-                } else {
-                    eprintln!(
-                        "No active plan found. Specify a plan slug as a positional argument."
-                    );
-                }
-                return Ok(());
-            }
+    let plan = match super::resolve_plan_optional(conn, plan_slug, project, true)? {
+        Some(p) => p,
+        None => {
+            emit_no_active_plan(out);
+            return Ok(());
         }
     };
 
@@ -5802,45 +6346,30 @@ pub fn cmd_log(
     conn: &Connection,
     project: &str,
     plan_slug: Option<&str>,
-    step_num: Option<usize>,
+    step_selector: Option<&str>,
     limit: Option<usize>,
     output_mode: &LogOutputMode,
     out: &OutputContext,
 ) -> Result<()> {
-    // Resolve plan
-    let plan = if let Some(slug) = plan_slug {
-        storage::get_plan_by_slug(conn, slug, project)?
-            .with_context(|| format!("Plan not found: {slug}"))?
-    } else {
-        match storage::find_active_plan(conn, project, true)? {
-            Some(p) => p,
-            None => {
-                if out.format == OutputFormat::Json {
-                    println!("null");
-                } else {
-                    eprintln!("No plan found. Specify a plan slug as a positional argument.");
-                }
-                return Ok(());
-            }
+    let plan = match super::resolve_plan_optional(conn, plan_slug, project, true)? {
+        Some(p) => p,
+        None => {
+            emit_no_active_plan(out);
+            return Ok(());
         }
     };
 
-    if let Some(step_idx) = step_num {
+    if let Some(selector) = step_selector {
         // Show logs for a specific step
-        let steps = storage::list_steps(conn, &plan.id)?;
-        if step_idx == 0 || step_idx > steps.len() {
-            anyhow::bail!(
-                "Step {} is out of range (plan has {} steps)",
-                step_idx,
-                steps.len()
-            );
-        }
-        let step = &steps[step_idx - 1];
+        let (step, step_idx) = crate::commands::resolve_step(conn, &plan.id, Some(selector), None)?;
         let logs = storage::list_execution_logs_for_step(conn, &step.id)?;
 
         if out.format == OutputFormat::Json {
             for log in &logs {
-                output::emit_ndjson(&output::LogEntrySummary::new(log, output_mode))?;
+                emit_log_entry_json(log, output_mode)?;
+            }
+            if step.status == StepStatus::Skipped {
+                emit_skipped_step_json(&step, step_idx)?;
             }
             return Ok(());
         }
@@ -5881,13 +6410,6 @@ pub fn cmd_log(
         // Show all logs for the plan
         let entries = storage::list_execution_logs_for_plan(conn, &plan.id, limit)?;
 
-        if out.format == OutputFormat::Json {
-            for (_, log) in &entries {
-                output::emit_ndjson(&output::LogEntrySummary::new(log, output_mode))?;
-            }
-            return Ok(());
-        }
-
         // Surface skipped steps' reasons alongside execution logs — skips
         // don't produce an execution_log row, so they'd otherwise be invisible
         // in this view.
@@ -5905,6 +6427,23 @@ pub fn cmd_log(
         // step short_id, mapped via the `Ralph-Step`/`Ralph-Iteration`
         // trailers — the same trailer-discovery discipline as skip-WIP.
         let iteration_groups = collect_iteration_commits_by_step(conn, &plan);
+
+        if out.format == OutputFormat::Json {
+            for (_, log) in &entries {
+                emit_log_entry_json(log, output_mode)?;
+            }
+            for (short_id, title, review_status, commits) in &iteration_groups {
+                emit_iteration_group_json(short_id, title, review_status.as_deref(), commits)?;
+            }
+            for (step_num, short_sha) in &wip_skips {
+                emit_skip_wip_json(*step_num, short_sha)?;
+            }
+            for step in &skipped_with_reason {
+                let num = steps.iter().position(|s| s.id == step.id).unwrap_or(0) + 1;
+                emit_skipped_step_json(step, num)?;
+            }
+            return Ok(());
+        }
 
         if entries.is_empty()
             && skipped_with_reason.is_empty()
@@ -5986,6 +6525,51 @@ pub fn cmd_log(
     }
 
     Ok(())
+}
+
+fn emit_log_entry_json(log: &ExecutionLog, output_mode: &LogOutputMode) -> Result<()> {
+    output::emit_ndjson(&output::LogRecordSummary::ExecutionLog {
+        log: output::LogEntrySummary::new(log, output_mode),
+    })
+}
+
+fn emit_skipped_step_json(step: &crate::plan::Step, step_num: usize) -> Result<()> {
+    output::emit_ndjson(&output::LogRecordSummary::SkippedStep {
+        step_id: step.id.clone(),
+        step_num,
+        title: step.title.clone(),
+        reason: step.skipped_reason.clone(),
+    })
+}
+
+fn emit_skip_wip_json(step_num: usize, short_sha: &str) -> Result<()> {
+    output::emit_ndjson(&output::LogRecordSummary::SkipWipCommit {
+        step_num,
+        short_sha: short_sha.to_string(),
+    })
+}
+
+fn emit_iteration_group_json(
+    short_id: &str,
+    title: &str,
+    review_status: Option<&str>,
+    commits: &[(i32, String, Option<String>)],
+) -> Result<()> {
+    output::emit_ndjson(&output::LogRecordSummary::IterationCommits {
+        short_id: short_id.to_string(),
+        title: title.to_string(),
+        review_status: review_status.map(str::to_string),
+        commits: commits
+            .iter()
+            .map(
+                |(iteration, short_sha, review_verdict)| output::IterationCommitSummary {
+                    iteration: *iteration,
+                    short_sha: short_sha.clone(),
+                    review_verdict: review_verdict.clone(),
+                },
+            )
+            .collect(),
+    })
 }
 
 /// Scan the plan branch for `[ralph wip]` skip commits and resolve each one's
@@ -6252,7 +6836,7 @@ pub fn cmd_pause(
     conn: &Connection,
     project: &str,
     plan_slug: Option<&str>,
-    quiet: bool,
+    out: &OutputContext,
 ) -> Result<()> {
     let live = storage::get_live_run(conn, project)?.ok_or_else(|| {
         anyhow::anyhow!(
@@ -6284,12 +6868,10 @@ pub fn cmd_pause(
     };
 
     storage::set_plan_pause_requested(conn, &plan.id, true)?;
-    if !quiet {
-        eprintln!(
-            "Pause requested for plan '{}'. The runner will stop after the current step finishes.",
-            plan.slug,
-        );
-    }
+    out.status(format!(
+        "Pause requested for plan '{}'. The runner will stop after the current step finishes.",
+        plan.slug,
+    ));
     Ok(())
 }
 
@@ -7085,7 +7667,7 @@ mod status_live_view_tests {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 project,
-                12345i64,
+                std::process::id() as i64,
                 "tok",
                 plan_id,
                 "live-plan",
@@ -7109,7 +7691,7 @@ mod status_live_view_tests {
             .live
             .clone()
             .expect("live field should be populated");
-        assert_eq!(live.pid, 12345);
+        assert_eq!(live.pid, std::process::id() as i64);
         assert_eq!(live.phase, Some(Phase::Tests));
         assert_eq!(live.attempt, Some(2));
         assert_eq!(live.max_attempts, Some(4));
@@ -7119,7 +7701,7 @@ mod status_live_view_tests {
 
         let json = serde_json::to_string(&summary).unwrap();
         assert!(json.contains("\"live\":{"));
-        assert!(json.contains("\"pid\":12345"));
+        assert!(json.contains(&format!("\"pid\":{}", std::process::id())));
         assert!(json.contains("\"phase\":\"tests\""));
         assert!(json.contains("\"state\":\"testing\""));
         assert!(json.contains("\"open_interruptions\":0"));
@@ -7235,6 +7817,43 @@ mod status_live_view_tests {
     }
 
     #[test]
+    fn test_cmd_log_json_record_shapes_cover_plain_sections() {
+        let skipped = output::LogRecordSummary::SkippedStep {
+            step_id: "s1".into(),
+            step_num: 2,
+            title: "Skip me".into(),
+            reason: Some("not needed".into()),
+        };
+        let json = serde_json::to_string(&skipped).unwrap();
+        assert!(json.contains("\"kind\":\"skipped_step\""));
+        assert!(json.contains("\"step_num\":2"));
+        assert!(json.contains("\"reason\":\"not needed\""));
+
+        let wip = output::LogRecordSummary::SkipWipCommit {
+            step_num: 3,
+            short_sha: "abc12345".into(),
+        };
+        let json = serde_json::to_string(&wip).unwrap();
+        assert!(json.contains("\"kind\":\"skip_wip_commit\""));
+        assert!(json.contains("\"short_sha\":\"abc12345\""));
+
+        let iterations = output::LogRecordSummary::IterationCommits {
+            short_id: "s1ab".into(),
+            title: "Implement".into(),
+            review_status: Some("passed".into()),
+            commits: vec![output::IterationCommitSummary {
+                iteration: 1,
+                short_sha: "def67890".into(),
+                review_verdict: Some("failed".into()),
+            }],
+        };
+        let json = serde_json::to_string(&iterations).unwrap();
+        assert!(json.contains("\"kind\":\"iteration_commits\""));
+        assert!(json.contains("\"review_status\":\"passed\""));
+        assert!(json.contains("\"review_verdict\":\"failed\""));
+    }
+
+    #[test]
     fn test_render_live_block_formats_current_section() {
         // Exercise the plain-text rendering path so the live block format
         // contract is guarded by a test. Uses a phase_started_at a few
@@ -7309,7 +7928,7 @@ mod status_live_view_tests {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 project,
-                12345i64,
+                std::process::id() as i64,
                 "tok",
                 plan_id,
                 "clear-plan",
@@ -7654,27 +8273,34 @@ mod run_dispatch_tests {
     }
 
     #[test]
-    fn current_branch_does_not_bypass_tui() {
-        // `--current-branch` is a behavior modifier, not an opt-out from
-        // interactivity — the TUI's auto-start path threads it through to
-        // the spawned runner via `StreamMode::Run { current_branch }`.
+    fn no_mouse_still_routes_to_tui() {
+        // `--no-mouse` changes terminal capture only; it is not a request for
+        // the direct CLI runner path.
         let args = RunArgs {
-            current_branch: true,
+            no_mouse: true,
             ..defaults()
         };
         assert!(is_default_run_invocation(&args, true));
     }
 
     #[test]
-    fn no_auto_stash_does_not_bypass_tui() {
-        // `--no-auto-stash` is a behavior modifier, not an opt-out from
-        // interactivity — the TUI's auto-start path threads it through to
-        // the spawned runner via `StreamMode::Run { no_auto_stash }`.
+    fn current_branch_bypasses_tui() {
+        // Any non-default run flag stays on the direct CLI path.
+        let args = RunArgs {
+            current_branch: true,
+            ..defaults()
+        };
+        assert!(!is_default_run_invocation(&args, true));
+    }
+
+    #[test]
+    fn no_auto_stash_bypasses_tui() {
+        // Any non-default run flag stays on the direct CLI path.
         let args = RunArgs {
             no_auto_stash: true,
             ..defaults()
         };
-        assert!(is_default_run_invocation(&args, true));
+        assert!(!is_default_run_invocation(&args, true));
     }
 
     #[test]
@@ -7910,6 +8536,17 @@ mod resume_dispatch_tests {
         // alone is not a "non-default flag".
         let args = ResumeArgs {
             plan_slug: Some("my-plan".to_string()),
+            ..defaults()
+        };
+        assert!(is_default_resume_invocation(&args, true));
+    }
+
+    #[test]
+    fn no_mouse_still_routes_to_tui() {
+        // `--no-mouse` changes terminal capture only; it is not a request for
+        // the direct CLI resume path.
+        let args = ResumeArgs {
+            no_mouse: true,
             ..defaults()
         };
         assert!(is_default_resume_invocation(&args, true));
@@ -8336,8 +8973,8 @@ mod plan_list_action_tests {
 
     #[test]
     fn esc_falls_through_to_clear_selection_when_no_toast() {
-        // Without a toast, Esc retains its original §5 behavior:
-        // clear-selection-or-quit. With a selection present, it clears.
+        // Without a toast, Esc retains its §5 behavior: clear the current
+        // selection if one exists. Quit is reserved for `q`.
         let project = "/tmp/plan-list-esc-no-toast";
         let (_conn, mut app) = seed_app(project);
         app.toggle_selection();
@@ -8352,9 +8989,7 @@ mod plan_list_action_tests {
     }
 
     #[test]
-    fn esc_falls_through_to_quit_when_no_toast_and_no_selection() {
-        // Empty-selection fallthrough still mirrors `app.escape()`'s second
-        // arm (set should_quit), so behavior matches the pre-precedence view.
+    fn esc_is_noop_when_no_toast_and_no_selection() {
         let project = "/tmp/plan-list-esc-quit";
         let (_conn, mut app) = seed_app(project);
         assert!(app.toasts.is_empty());
@@ -8363,7 +8998,7 @@ mod plan_list_action_tests {
         let dismissed = plan_list_handle_esc(&mut app);
 
         assert!(!dismissed);
-        assert!(app.should_quit, "escape on empty selection still quits");
+        assert!(!app.should_quit, "escape on empty selection must not quit");
     }
 }
 
@@ -8500,6 +9135,37 @@ mod archived_list_dispatcher_tests {
         // Toast confirms.
         let toast = app.toasts.current().expect("toast should be present");
         assert_eq!(toast.text, "Unarchived 1 plan.");
+    }
+
+    #[test]
+    fn read_only_archived_palette_blocks_unarchive() {
+        let project = "/tmp/archived-read-only-palette";
+        let (conn, mut app) = seed_archived(project);
+        app.set_read_only(crate::tui::read_only::ReadOnly::Locked { pid: 4242 });
+        let target = app.cursor_plan().unwrap().clone();
+
+        let forwarded = archived_list_apply_palette_action(
+            &conn,
+            project,
+            &mut app,
+            crate::tui::palette_dispatch::PaletteAction::Unarchive {
+                plan_id: target.id.clone(),
+                slug: target.slug.clone(),
+            },
+        )
+        .unwrap();
+
+        assert!(forwarded.is_none());
+        let row = storage::get_plan_by_slug(&conn, &target.slug, project)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, PlanStatus::Archived);
+        assert!(
+            app.toasts
+                .current()
+                .map(|t| t.text.contains("Read-only"))
+                .unwrap_or(false)
+        );
     }
 
     #[test]
@@ -8816,6 +9482,94 @@ mod step_detail_dispatcher_tests {
         assert!(app.should_pop);
     }
 
+    fn seed_step_detail_db(project: &str) -> (Connection, StepDetailApp, String) {
+        let conn = crate::db::open_memory().unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            storage::NewPlan {
+                slug: "test",
+                project,
+                branch_name: "b",
+                description: "d",
+                harness: Some("claude"),
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            storage::NewStep {
+                title: "Step",
+                description: "Desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(3),
+                model: None,
+                change_policy: Some(ChangePolicy::Required),
+                tags: None,
+            },
+        )
+        .unwrap();
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        let app = StepDetailApp::new(
+            plan,
+            steps,
+            0,
+            &Config::default(),
+            storage::ProjectSettings::default(),
+            Vec::new(),
+        );
+        (conn, app, step.id)
+    }
+
+    #[test]
+    fn refresh_step_detail_state_reloads_step_status_and_attempts() {
+        let project = "/tmp/step-detail-refresh-status";
+        let (conn, mut app, step_id) = seed_step_detail_db(project);
+        assert_eq!(app.current_step().unwrap().status, StepStatus::Pending);
+
+        storage::update_step_status(&conn, &step_id, StepStatus::InProgress).unwrap();
+        storage::set_step_attempts(&conn, &step_id, 2).unwrap();
+
+        refresh_step_detail_state(&conn, project, &mut app).unwrap();
+
+        let step = app.current_step().unwrap();
+        assert_eq!(step.status, StepStatus::InProgress);
+        assert_eq!(step.attempts, 2);
+    }
+
+    #[test]
+    fn refresh_step_detail_state_refreshes_execution_logs() {
+        let project = "/tmp/step-detail-refresh-logs";
+        let (conn, mut app, step_id) = seed_step_detail_db(project);
+        storage::create_execution_log(&conn, &step_id, 1, Some("first"), None).unwrap();
+
+        refresh_step_detail_state(&conn, project, &mut app).unwrap();
+        assert_eq!(app.execution_logs.len(), 1);
+        assert_eq!(app.appended_attempt_index, 0);
+
+        storage::create_execution_log(&conn, &step_id, 2, Some("second"), None).unwrap();
+        refresh_step_detail_state(&conn, project, &mut app).unwrap();
+
+        assert_eq!(app.execution_logs.len(), 2);
+        assert_eq!(app.appended_attempt_index, 1);
+        assert_eq!(app.execution_logs[1].attempt, 2);
+    }
+
+    #[test]
+    fn connection_database_path_distinguishes_memory_and_file_backed_dbs() {
+        let memory = crate::db::open_memory().unwrap();
+        assert!(connection_database_path(&memory).unwrap().is_none());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ralph.db");
+        let file = crate::db::open_at(&path).unwrap();
+        assert_eq!(connection_database_path(&file).unwrap(), Some(path));
+    }
+
     // -- step_detail_handle_c (TUI-plan.md §8 "Editing — `c`") -----------
 
     use crate::tui::views::step_detail::{
@@ -9050,6 +9804,31 @@ mod step_detail_dispatcher_tests {
         }
     }
 
+    #[test]
+    fn root_quit_confirms_when_run_lock_is_live() {
+        use rusqlite::params;
+
+        let conn = crate::db::open_memory().unwrap();
+        let project = "/proj-root-quit-live";
+
+        assert!(
+            !should_confirm_quit_with_live_run(&conn, project, &None).unwrap(),
+            "idle TUI quit should not add an extra confirmation"
+        );
+
+        conn.execute(
+            "INSERT INTO run_locks (project, pid, plan_id, plan_slug)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![project, 0x7FFF_FFFD_i64, "p1", "feat"],
+        )
+        .unwrap();
+
+        assert!(
+            should_confirm_quit_with_live_run(&conn, project, &None).unwrap(),
+            "live run lock must require explicit detach acknowledgement"
+        );
+    }
+
     // -- §13.2 read-only attach (external run lock) ---------------------
 
     /// Drive the dispatcher's `step_detail_observe_read_only` helper end to
@@ -9105,7 +9884,7 @@ mod step_detail_dispatcher_tests {
             asked_at: "2026-05-05T00:00:00Z".into(),
         }]);
         assert!(!app.open_answer_modal());
-        assert!(app.answer_modal.is_none());
+        assert!(app.answer_modal().is_none());
 
         // - `c` on BottomRow: the dispatcher's guard (`app.can_edit_panes()`)
         //   must prevent the picker from opening. We simulate that gate
@@ -9161,11 +9940,9 @@ mod step_detail_dispatcher_tests {
 
     /// Regression (codex review of the AnswerModal→InterruptionModal
     /// migration): pressing `f` (freeform) in the step-detail answer modal
-    /// when the editor handoff yields `None` — no `$EDITOR`, or the editor
-    /// exited non-zero — must surface the missing-editor toast rather than
-    /// silently no-op. The legacy AnswerModal showed a visible error here;
-    /// the migrated path must keep parity with that and with the prompt-pane
-    /// editor flow.
+    /// when the editor handoff yields `None` (no `$EDITOR`) must surface the
+    /// missing-editor toast rather than silently no-op. A cancelled editor is
+    /// mapped by the production wrapper to an unchanged buffer instead.
     #[test]
     fn answer_modal_freeform_no_editor_surfaces_toast() {
         use crate::tui::views::step_detail::NO_EDITOR_TOAST;
@@ -9193,15 +9970,123 @@ mod step_detail_dispatcher_tests {
             "modal should open on a focused open question"
         );
 
-        // `f` requests the freeform editor; the fake editor reports "no editor"
-        // (the real `edit_in_editor` returns `Ok(None)` for that case).
+        // `f` requests the freeform editor; the fake editor reports "no editor".
         let key = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE);
         handle_answer_modal_key(&conn, project, &mut app, key, |_| Ok(None)).unwrap();
 
         assert_eq!(
             app.toasts.current().map(|t| t.text.as_str()),
             Some(NO_EDITOR_TOAST),
-            "a missing/aborted editor must surface a toast, not a silent no-op"
+            "a missing editor must surface a toast, not a silent no-op"
+        );
+    }
+}
+
+#[cfg(test)]
+mod palette_help_routing_tests {
+    fn help_routing_blocks_are_palette_gated(src: &str) -> usize {
+        src.match_indices("app.palette_bar.is_none()")
+            .filter(|(idx, _)| {
+                src[*idx..]
+                    .lines()
+                    .take(4)
+                    .any(|line| line.contains("app.help.intercept_key(key)"))
+            })
+            .count()
+    }
+
+    #[test]
+    fn palette_input_gets_question_mark_before_help_overlay() {
+        let src = include_str!("run.rs");
+        assert!(
+            help_routing_blocks_are_palette_gated(src) >= 4,
+            "plan-list, archived-list, plan-detail, and step-detail dispatchers \
+             must gate help interception with palette_bar.is_none() so '?' can \
+             be typed into an open palette"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tui_polling_loop_tests {
+    fn function_body<'a>(src: &'a str, name: &str) -> &'a str {
+        let start = src.find(name).expect("function must exist");
+        let rest = &src[start..];
+        let next_section = rest
+            .find("\n}\n\n///")
+            .or_else(|| rest.find("\n}\n\n//"))
+            .expect("function body terminator");
+        &rest[..next_section]
+    }
+
+    #[test]
+    fn archived_list_loop_polls_before_reading_events() {
+        let src = include_str!("run.rs");
+        let body = function_body(src, "fn run_archived_list_tui");
+        let poll = body.find("event::poll(TUI_EVENT_POLL)").expect("poll call");
+        let read = body.find("event::read()?").expect("read call");
+        assert!(
+            poll < read,
+            "archived-list dispatcher must use the TUI poll cadence before event::read()"
+        );
+    }
+
+    #[test]
+    fn modal_loops_poll_before_reading_events() {
+        let src = include_str!("run.rs");
+        for name in [
+            "fn confirm_with_background",
+            "fn plan_list_create_plan",
+            "fn run_dialog_loop_with_bg",
+            "fn skip_dialog_loop_with_bg",
+            "fn confirm_loop_with_bg",
+            "fn confirm_with_archived_background",
+            "fn confirm_with_plan_detail_background",
+        ] {
+            let body = function_body(src, name);
+            let poll = body
+                .find("event::poll(TUI_EVENT_POLL)")
+                .unwrap_or_else(|| panic!("{name} must poll before reading"));
+            let read = body
+                .find("event::read()?")
+                .unwrap_or_else(|| panic!("{name} must read input"));
+            assert!(poll < read, "{name} must poll before event::read()");
+        }
+    }
+
+    #[test]
+    fn inbox_key_is_available_from_tui_views() {
+        let src = include_str!("run.rs");
+        for name in [
+            "fn run_plan_list_tui",
+            "fn run_archived_list_tui",
+            "fn run_plan_dependencies_tui",
+            "fn run_plan_hooks_tui",
+            "fn run_step_hooks_tui",
+            "fn run_step_tags_tui",
+            "fn run_rendered_prompt_tui",
+            "fn run_step_detail_tui",
+        ] {
+            let body = function_body(src, name);
+            assert!(
+                body.contains("KeyCode::Char('I')"),
+                "{name} must bind Shift-I to the interruptions inbox"
+            );
+            assert!(
+                body.contains("run_inbox_tui"),
+                "{name} must route Shift-I through run_inbox_tui"
+            );
+        }
+        let plan_detail_input = include_str!("../tui/views/plan_detail_input.rs");
+        assert!(
+            plan_detail_input.contains("KeyCode::Char('I') => InputAction::OpenInbox"),
+            "plan-detail input handler must bind Shift-I to OpenInbox"
+        );
+        let plan_detail_body = function_body(src, "fn run_plan_detail_tui");
+        assert!(
+            plan_detail_body.contains("InputAction::OpenInbox")
+                && plan_detail_body.contains("run_inbox_tui"),
+            "plan-detail dispatcher must route OpenInbox through run_inbox_tui"
         );
     }
 }
@@ -9259,6 +10144,50 @@ mod palette_action_tests {
         (conn, app)
     }
 
+    fn seed_detail_app(
+        project: &str,
+    ) -> (Connection, crate::tui::views::plan_detail::PlanDetailApp) {
+        let conn = db::open_memory().unwrap();
+        storage::create_plan(
+            &conn,
+            storage::NewPlan {
+                slug: "alpha",
+                project,
+                branch_name: "b1",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let plan = storage::get_plan_by_slug(&conn, "alpha", project)
+            .unwrap()
+            .unwrap();
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            storage::NewStep {
+                title: "first",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+        let app = crate::tui::views::plan_detail::PlanDetailApp::new(
+            plan,
+            vec![step],
+            &Config::default(),
+        );
+        (conn, app)
+    }
+
     // -- Toast path -----------------------------------------------------
 
     #[test]
@@ -9294,6 +10223,133 @@ mod palette_action_tests {
         let toast = app.toasts.current().expect("toast was pushed");
         assert_eq!(toast.text, "hello there");
         assert_eq!(toast.color, ToastKind::Info.color());
+    }
+
+    #[test]
+    fn read_only_plan_list_blocks_mutating_palette_actions() {
+        let project = "/tmp/palette-read-only-list";
+        let (conn, mut app) = seed_app(project);
+        app.set_read_only(crate::tui::read_only::ReadOnly::Locked { pid: 4242 });
+        let plan = app.cursor_plan().unwrap().clone();
+
+        let forwarded = plan_list_apply_palette_action(
+            &conn,
+            project,
+            &mut app,
+            PaletteAction::OpenConfirmArchive {
+                plan_id: plan.id.clone(),
+                slug: plan.slug.clone(),
+            },
+        )
+        .unwrap();
+
+        assert!(
+            forwarded.is_none(),
+            "read-only palette gate must not forward destructive confirms"
+        );
+        assert_eq!(
+            storage::get_plan_by_slug(&conn, &plan.slug, project)
+                .unwrap()
+                .unwrap()
+                .status,
+            plan.status,
+            "read-only palette action must not mutate storage"
+        );
+        assert!(
+            app.toasts
+                .current()
+                .map(|t| t.text.contains("Read-only"))
+                .unwrap_or(false)
+        );
+    }
+
+    #[test]
+    fn read_only_plan_detail_blocks_mutating_palette_actions() {
+        let project = "/tmp/palette-read-only-detail";
+        let (conn, mut app) = seed_detail_app(project);
+        app.set_read_only(crate::tui::read_only::ReadOnly::Locked { pid: 4242 });
+        let before = storage::list_steps(&conn, &app.plan.id).unwrap().len();
+        let plan_id = app.plan.id.clone();
+        let slug = app.plan.slug.clone();
+
+        let forwarded = plan_detail_apply_palette_action(
+            &conn,
+            project,
+            &mut app,
+            PaletteAction::AddStep {
+                plan_id,
+                slug,
+                title: "blocked".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert!(forwarded.is_none());
+        assert_eq!(
+            storage::list_steps(&conn, &app.plan.id).unwrap().len(),
+            before
+        );
+        assert!(
+            app.toasts
+                .current()
+                .map(|t| t.text.contains("Read-only"))
+                .unwrap_or(false)
+        );
+    }
+
+    #[test]
+    fn read_only_plan_detail_blocks_mutating_palette_subviews() {
+        let project = "/tmp/palette-read-only-detail-subview";
+        let (conn, mut app) = seed_detail_app(project);
+        app.set_read_only(crate::tui::read_only::ReadOnly::Locked { pid: 4242 });
+        let action = PaletteAction::OpenPlanDependencies {
+            plan_id: app.plan.id.clone(),
+            slug: app.plan.slug.clone(),
+        };
+
+        let forwarded = plan_detail_apply_palette_action(&conn, project, &mut app, action).unwrap();
+
+        assert!(forwarded.is_none());
+        assert!(
+            app.toasts
+                .current()
+                .map(|t| t.text.contains("Read-only"))
+                .unwrap_or(false)
+        );
+    }
+
+    #[test]
+    fn live_plan_detail_blocks_mutating_palette_actions() {
+        let project = "/tmp/palette-live-detail";
+        let (conn, mut app) = seed_detail_app(project);
+        app.attach_subscription();
+        let before = storage::list_steps(&conn, &app.plan.id).unwrap().len();
+        let plan_id = app.plan.id.clone();
+        let slug = app.plan.slug.clone();
+
+        let forwarded = plan_detail_apply_palette_action(
+            &conn,
+            project,
+            &mut app,
+            PaletteAction::AddStep {
+                plan_id,
+                slug,
+                title: "blocked".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert!(forwarded.is_none());
+        assert_eq!(
+            storage::list_steps(&conn, &app.plan.id).unwrap().len(),
+            before
+        );
+        assert!(
+            app.toasts
+                .current()
+                .map(|t| t.text.contains("Read-only"))
+                .unwrap_or(false)
+        );
     }
 
     #[test]
@@ -9603,6 +10659,17 @@ mod run_dialog_apply_tests {
         );
     }
 
+    #[test]
+    fn classify_branch_rejects_invalid_name_before_git_state_checks() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let err = classify_branch_target(tmp.path(), "feat/bad..branch")
+            .expect_err("invalid branch name must fail before git inspection");
+        assert!(
+            err.to_string().contains("invalid branch name"),
+            "error should name branch validation failure: {err:#}"
+        );
+    }
+
     // -- spawn_palette_runners toast shape ------------------------------------
 
     #[test]
@@ -9763,6 +10830,54 @@ mod sub_view_routing_tests {
         (conn, app)
     }
 
+    fn seed_plan_detail_with_chain(project: &str) -> (Connection, PlanDetailApp, Step, Step) {
+        let (conn, _) = seed_plan_detail(project);
+        let plan = storage::get_plan_by_slug(&conn, "alpha", project)
+            .unwrap()
+            .unwrap();
+        let (first, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            storage::NewStep {
+                title: "first",
+                description: "",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+        let (second, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            storage::NewStep {
+                title: "second",
+                description: "",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+        storage::add_step_dependency(&conn, &second.id, &first.id).unwrap();
+
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        let mut app = PlanDetailApp::new(plan.clone(), steps, &Config::default());
+        app.sync_outline(
+            storage::list_step_dependency_edges(&conn, &plan.id).unwrap(),
+            std::collections::HashSet::new(),
+        );
+        (conn, app, first, second)
+    }
+
     fn make_step_detail_app(slug: &str, project: &str) -> StepDetailApp {
         let plan = Plan {
             id: format!("plan-{slug}"),
@@ -9816,6 +10931,154 @@ mod sub_view_routing_tests {
             storage::ProjectSettings::default(),
             Vec::new(),
         )
+    }
+
+    #[test]
+    fn plan_detail_insert_above_splices_selected_step_parents() {
+        let project = "/tmp/plan-detail-insert-above";
+        let (conn, mut app, first, second) = seed_plan_detail_with_chain(project);
+        app.outline.set_cursor(1);
+        app.realign_selection_to_outline();
+
+        plan_detail_apply_add(
+            &conn,
+            &mut app,
+            crate::tui::views::plan_detail::AddPosition::Above,
+            "between",
+        )
+        .unwrap();
+
+        let steps = storage::list_steps(&conn, &app.plan.id).unwrap();
+        let inserted = steps.iter().find(|s| s.title == "between").unwrap();
+        assert_eq!(
+            storage::list_step_dependencies(&conn, &inserted.id).unwrap(),
+            vec![first.id.clone()]
+        );
+        assert_eq!(
+            storage::list_step_dependencies(&conn, &second.id).unwrap(),
+            vec![inserted.id.clone()]
+        );
+        assert_eq!(
+            app.outline.selected_step_id().as_deref(),
+            Some(inserted.id.as_str()),
+            "inserted step must be selected in the outline immediately after add"
+        );
+    }
+
+    #[test]
+    fn plan_detail_append_below_depends_on_selected_step() {
+        let project = "/tmp/plan-detail-append-below";
+        let (conn, mut app, first, _second) = seed_plan_detail_with_chain(project);
+        app.outline.set_cursor(0);
+        app.realign_selection_to_outline();
+
+        plan_detail_apply_add(
+            &conn,
+            &mut app,
+            crate::tui::views::plan_detail::AddPosition::Below,
+            "after-first",
+        )
+        .unwrap();
+
+        let steps = storage::list_steps(&conn, &app.plan.id).unwrap();
+        let inserted = steps.iter().find(|s| s.title == "after-first").unwrap();
+        assert_eq!(
+            storage::list_step_dependencies(&conn, &inserted.id).unwrap(),
+            vec![first.id.clone()]
+        );
+        assert_eq!(
+            app.outline.selected_step_id().as_deref(),
+            Some(inserted.id.as_str()),
+            "appended step must be selected in the outline immediately after add"
+        );
+    }
+
+    #[test]
+    fn refresh_plan_detail_steps_and_outline_drops_deleted_rows_immediately() {
+        let project = "/tmp/plan-detail-delete-sync";
+        let (conn, mut app, _first, second) = seed_plan_detail_with_chain(project);
+        app.outline.set_cursor(1);
+        app.realign_selection_to_outline();
+
+        storage::delete_step(&conn, &second.id).unwrap();
+        refresh_plan_detail_steps_and_outline(&conn, &mut app).unwrap();
+
+        assert!(
+            app.outline
+                .visible_rows()
+                .iter()
+                .all(|row| row.step_id != second.id),
+            "deleted step must disappear from outline without waiting for the next tick"
+        );
+        assert_ne!(
+            app.outline.selected_step_id().as_deref(),
+            Some(second.id.as_str()),
+            "outline cursor must not remain on a deleted row"
+        );
+    }
+
+    #[test]
+    fn plan_detail_delete_uses_immediate_outline_refresh_helper() {
+        let src = include_str!("run.rs");
+        let start = src
+            .find("pub(crate) fn plan_detail_apply_delete")
+            .expect("plan_detail_apply_delete exists");
+        let rest = &src[start..];
+        let end = rest
+            .find("/// Persist a `Shift-J` / `Shift-K` move")
+            .expect("next function marker exists");
+        let body = &rest[..end];
+        assert!(
+            body.contains("refresh_plan_detail_steps_and_outline(conn, app)?"),
+            "delete must refresh the flat steps and outline projection before returning"
+        );
+    }
+
+    #[test]
+    fn read_only_step_detail_blocks_mutating_palette_actions() {
+        let project = "/tmp/palette-read-only-step-detail";
+        let conn = db::open_memory().unwrap();
+        let mut app = make_step_detail_app("alpha", project);
+        app.set_read_only(crate::tui::read_only::ReadOnly::Locked { pid: 4242 });
+        let before = app.plan.status;
+        let action = PaletteAction::Approve {
+            plan_id: app.plan.id.clone(),
+            slug: app.plan.slug.clone(),
+        };
+
+        let forwarded = step_detail_apply_palette_action(&conn, project, &mut app, action).unwrap();
+
+        assert!(forwarded.is_none());
+        assert_eq!(app.plan.status, before);
+        assert!(
+            app.toasts
+                .current()
+                .map(|t| t.text.contains("Read-only"))
+                .unwrap_or(false)
+        );
+    }
+
+    #[test]
+    fn read_only_step_detail_blocks_mutating_palette_subviews() {
+        let project = "/tmp/palette-read-only-step-detail-subview";
+        let conn = db::open_memory().unwrap();
+        let mut app = make_step_detail_app("alpha", project);
+        app.set_read_only(crate::tui::read_only::ReadOnly::Locked { pid: 4242 });
+        let action = PaletteAction::OpenStepTags {
+            step_id: app.current_step().unwrap().id.clone(),
+            plan_slug: app.plan.slug.clone(),
+            step_label: "1".to_string(),
+        };
+
+        let forwarded = step_detail_apply_palette_action(&conn, project, &mut app, action).unwrap();
+
+        assert!(forwarded.is_none());
+        assert!(
+            app.toasts
+                .current()
+                .map(|t| t.text.contains("Read-only"))
+                .unwrap_or(false)
+        );
     }
 
     // -- /plan dependency add|remove|list ---------------------------------
@@ -10424,6 +11687,14 @@ mod pause_tests {
     /// bookkeeping.
     const DEAD_PID: i64 = 0x7FFF_FFFE;
 
+    fn test_out() -> OutputContext {
+        OutputContext {
+            format: OutputFormat::Plain,
+            quiet: true,
+            color: false,
+        }
+    }
+
     fn seed_plan(conn: &Connection, slug: &str, project: &str) -> String {
         let plan = storage::create_plan(
             conn,
@@ -10456,7 +11727,7 @@ mod pause_tests {
         let project = "/tmp/pause-no-run";
         let plan_id = seed_plan(&conn, "p", project);
 
-        let err = cmd_pause(&conn, project, None, /*quiet=*/ true).unwrap_err();
+        let err = cmd_pause(&conn, project, None, &test_out()).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("No active run"),
@@ -10476,7 +11747,7 @@ mod pause_tests {
         let plan_id = seed_plan(&conn, "p", project);
         insert_live_lock(&conn, project, &plan_id, "p");
 
-        cmd_pause(&conn, project, None, /*quiet=*/ true).unwrap();
+        cmd_pause(&conn, project, None, &test_out()).unwrap();
 
         assert!(
             storage::get_plan_pause_requested(&conn, &plan_id).unwrap(),
@@ -10491,7 +11762,7 @@ mod pause_tests {
         let plan_id = seed_plan(&conn, "deploy", project);
         insert_live_lock(&conn, project, &plan_id, "deploy");
 
-        cmd_pause(&conn, project, Some("deploy"), /*quiet=*/ true).unwrap();
+        cmd_pause(&conn, project, Some("deploy"), &test_out()).unwrap();
 
         assert!(storage::get_plan_pause_requested(&conn, &plan_id).unwrap());
     }
@@ -10505,7 +11776,7 @@ mod pause_tests {
         // Live run is on plan-a; user asks to pause plan-b.
         insert_live_lock(&conn, project, &plan_a, "plan-a");
 
-        let err = cmd_pause(&conn, project, Some("plan-b"), /*quiet=*/ true).unwrap_err();
+        let err = cmd_pause(&conn, project, Some("plan-b"), &test_out()).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("Refusing to pause"),

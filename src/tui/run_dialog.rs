@@ -28,6 +28,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use super::choice::{Choice, ChoiceItem, ChoiceOutcome};
 use super::theme;
+use crate::tui::chrome::display_width;
 
 // ---------------------------------------------------------------------------
 // State machine
@@ -366,10 +367,10 @@ fn draw_box(frame: &mut Frame, area: Rect, title: &str, body: &str) {
     let body_lines = lines.len().max(1) as u16;
     let max_w = body
         .lines()
-        .map(|l| l.chars().count())
+        .map(display_width)
         .max()
         .unwrap_or(0)
-        .max(title.chars().count())
+        .max(display_width(title))
         .max(20) as u16;
     let height = (body_lines + 2).min(area.height).max(3.min(area.height));
     let width = (max_w + 4).min(area.width).max(20.min(area.width));

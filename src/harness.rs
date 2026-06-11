@@ -378,6 +378,12 @@ pub fn build_harness_env(
 ) -> Vec<(String, String)> {
     let mut env_vars = Vec::new();
 
+    for env_name in &harness_config.auth_env_vars {
+        if let Ok(value) = std::env::var(env_name) {
+            env_vars.push((env_name.clone(), value));
+        }
+    }
+
     // Set agent file env var if the harness uses one (e.g., goose)
     if let (Some(env_name), Some(agent_path)) = (&harness_config.agent_file_env, agent_file)
         && !harness_config.supports_agent_file
@@ -437,6 +443,62 @@ pub async fn spawn_harness_with_delivery(
     cwd: &Path,
     delivery: PromptDelivery,
 ) -> Result<(tokio::process::Child, Option<NamedTempFile>)> {
+    spawn_harness_with_delivery_inner(harness_config, args, env_vars, cwd, delivery, false).await
+}
+
+/// Spawn a reviewer harness with Git repository redirection variables removed.
+///
+/// Reviewers are trusted harnesses running in a detached worktree, not a
+/// filesystem sandbox. Scrubbing these variables prevents an inherited shell
+/// environment from accidentally or intentionally redirecting Git commands out
+/// of that worktree.
+pub async fn spawn_reviewer_harness_with_delivery(
+    harness_config: &HarnessConfig,
+    args: &[String],
+    env_vars: &[(String, String)],
+    cwd: &Path,
+    delivery: PromptDelivery,
+) -> Result<(tokio::process::Child, Option<NamedTempFile>)> {
+    spawn_harness_with_delivery_inner(harness_config, args, env_vars, cwd, delivery, true).await
+}
+
+fn apply_reviewer_base_env(cmd: &mut Command) {
+    cmd.env_clear();
+    for key in [
+        "PATH",
+        "HOME",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "SHELL",
+        "USER",
+        "USERNAME",
+        "LOGNAME",
+        "LANG",
+        "LC_ALL",
+        "TERM",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CACHE_HOME",
+        "CODEX_HOME",
+        "CLAUDE_CONFIG_DIR",
+        "ANTHROPIC_CONFIG_DIR",
+        "OPENAI_CONFIG_DIR",
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            cmd.env(key, value);
+        }
+    }
+}
+
+async fn spawn_harness_with_delivery_inner(
+    harness_config: &HarnessConfig,
+    args: &[String],
+    env_vars: &[(String, String)],
+    cwd: &Path,
+    delivery: PromptDelivery,
+    scrub_git_env: bool,
+) -> Result<(tokio::process::Child, Option<NamedTempFile>)> {
     let mut cmd = Command::new(&harness_config.command);
     cmd.args(args)
         .current_dir(cwd)
@@ -463,8 +525,24 @@ pub async fn spawn_harness_with_delivery(
         }
     }
 
+    if scrub_git_env {
+        apply_reviewer_base_env(&mut cmd);
+    }
     for (key, value) in env_vars {
         cmd.env(key, value);
+    }
+    if scrub_git_env {
+        for key in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_COMMON_DIR",
+            "GIT_NAMESPACE",
+        ] {
+            cmd.env_remove(key);
+        }
     }
 
     // Put the child into its own process group so we can fan signals out to
@@ -1052,6 +1130,74 @@ mod tests {
     }
 
     #[test]
+    fn test_build_harness_env_includes_configured_auth_vars() {
+        let var = "RALPH_TEST_AUTH_ENV_EXPLICIT";
+        unsafe {
+            std::env::set_var(var, "secret-token");
+        }
+        let hc = HarnessConfig {
+            command: "reviewer".to_string(),
+            args: vec![],
+            plan_args: vec![],
+            supports_agent_file: false,
+            supports_json_output: false,
+            json_output_args: vec![],
+            agent_file_env: None,
+            agent_file_args: vec![],
+            model_args: vec![],
+            default_model: None,
+            auth_env_vars: vec![var.to_string(), "RALPH_TEST_AUTH_ENV_MISSING".to_string()],
+            auth_probe_args: vec![],
+            prompt_input: crate::config::PromptInputMode::Stdin,
+            argv_overflow: ArgvOverflowBehavior::SpillToTempFile,
+            color: None,
+        };
+
+        let env = build_harness_env(&hc, None);
+
+        unsafe {
+            std::env::remove_var(var);
+        }
+        assert_eq!(env, vec![(var.to_string(), "secret-token".to_string())]);
+    }
+
+    #[test]
+    fn reviewer_spawn_uses_curated_environment() {
+        let src = include_str!("harness.rs");
+        let helper_start = src
+            .find("fn apply_reviewer_base_env")
+            .expect("reviewer env helper exists");
+        let helper_body = &src[helper_start
+            ..src[helper_start..]
+                .find("async fn spawn_harness_with_delivery_inner")
+                .expect("next function marker")
+                + helper_start];
+        assert!(
+            helper_body.contains("cmd.env_clear()"),
+            "reviewer spawn must clear inherited environment before re-adding allowlisted vars"
+        );
+        assert!(
+            helper_body.contains("\"PATH\"") && helper_body.contains("\"HOME\""),
+            "reviewer allowlist should preserve basic process lookup/home config"
+        );
+
+        let spawn_start = src
+            .find("async fn spawn_harness_with_delivery_inner")
+            .expect("spawn helper exists");
+        let spawn_body = &src[spawn_start
+            ..src[spawn_start..]
+                .find("let mut child = cmd")
+                .expect("spawn call marker")
+                + spawn_start];
+        assert!(
+            spawn_body.contains("if scrub_git_env")
+                && spawn_body.contains("apply_reviewer_base_env(&mut cmd)")
+                && spawn_body.contains("cmd.env_remove(key)"),
+            "reviewer spawn must use curated env and still scrub Git redirection vars"
+        );
+    }
+
+    #[test]
     fn test_build_harness_env_claude_uses_flag_not_env() {
         let config = Config::default();
         let hc = &config.harnesses["claude"];
@@ -1429,15 +1575,15 @@ mod tests {
     fn test_spawn_harness_sets_kill_on_drop() {
         let src = include_str!("harness.rs");
 
-        let sig = "pub async fn spawn_harness_with_delivery(";
+        let sig = "async fn spawn_harness_with_delivery_inner(";
         let start = src
             .find(sig)
-            .expect("spawn_harness_with_delivery must exist");
+            .expect("spawn_harness_with_delivery_inner must exist");
         let after = &src[start..];
-        // Bound at the next `pub async fn` (the interactive variant).
+        // Bound at the next async spawn helper.
         let end_rel = after[sig.len()..]
             .find("\npub async fn ")
-            .expect("expected a sibling pub async fn after spawn_harness_with_delivery");
+            .expect("expected a sibling pub async fn after spawn_harness_with_delivery_inner");
         let body = &after[..sig.len() + end_rel];
         assert!(
             body.contains(".kill_on_drop(true)"),

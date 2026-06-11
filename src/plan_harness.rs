@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
+use tempfile::NamedTempFile;
 
-use crate::config::Config;
+use crate::config::{ArgvOverflowBehavior, Config, PromptInputMode};
 use crate::harness;
 use crate::hook_library::{self, Hook, Scope};
 use crate::storage;
@@ -522,7 +523,7 @@ pub fn render_plan_agent(applicable_hooks: &[Hook]) -> String {
         out.push_str(
             "_No hooks are currently available for this project. \
             The user can add hooks with `ralph hooks add`, or import a bundle from a \
-            teammate with `ralph hooks import <file>`._\n",
+            teammate with `ralph hooks import <file> --trust` after reviewing its commands._\n",
         );
         return out;
     }
@@ -578,6 +579,20 @@ fn build_initial_prompt(
     }
 }
 
+#[derive(Debug)]
+struct PlanHarnessInvocation {
+    args: Vec<String>,
+    _prompt_file: Option<NamedTempFile>,
+}
+
+impl std::ops::Deref for PlanHarnessInvocation {
+    type Target = [String];
+
+    fn deref(&self) -> &Self::Target {
+        &self.args
+    }
+}
+
 /// Build harness arguments for interactive plan-harness mode.
 ///
 /// The argv is built from the per-harness `plan_args` template in
@@ -601,7 +616,7 @@ fn build_plan_harness_args(
     agent_file_path: Option<&Path>,
     agent_content: &str,
     prompt: &str,
-) -> Result<Vec<String>> {
+) -> Result<PlanHarnessInvocation> {
     let harness_config = config.harnesses.get(harness_name).with_context(|| {
         format!(
             "Unknown harness '{harness_name}'. Available: {:?}",
@@ -631,8 +646,8 @@ fn build_plan_harness_args(
             args.push("--system-prompt-file".to_string());
             args.push(path.to_string_lossy().to_string());
         }
-        args.push(effective_prompt);
-        return Ok(args);
+        args.push(effective_prompt.clone());
+        return protect_plan_harness_argv(harness_name, harness_config, args, &effective_prompt);
     }
 
     // Template path: substitute {prompt} and {agent_file} in place using
@@ -663,7 +678,70 @@ fn build_plan_harness_args(
         *arg = arg.replace("{prompt}", &effective_prompt);
     }
 
-    Ok(args)
+    protect_plan_harness_argv(harness_name, harness_config, args, &effective_prompt)
+}
+
+fn protect_plan_harness_argv(
+    harness_name: &str,
+    harness_config: &crate::config::HarnessConfig,
+    mut args: Vec<String>,
+    prompt: &str,
+) -> Result<PlanHarnessInvocation> {
+    let largest_arg = args.iter().map(|a| a.len()).max().unwrap_or(0);
+    if largest_arg <= harness::ARGV_SPILL_THRESHOLD_BYTES {
+        return Ok(PlanHarnessInvocation {
+            args,
+            _prompt_file: None,
+        });
+    }
+
+    let prompt_arg_indexes: Vec<usize> = args
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, arg)| (arg == prompt).then_some(idx))
+        .collect();
+    if prompt_arg_indexes.is_empty() {
+        bail!(
+            "plan-harness '{harness_name}' produced an argv element of {largest_arg} bytes, \
+             past the {} KB safety threshold for the 128 KB Linux argv ceiling; \
+             refusing to spawn to avoid E2BIG",
+            harness::ARGV_SPILL_THRESHOLD_BYTES / 1024,
+        );
+    }
+
+    let can_spill_to_file = harness_config.prompt_input == PromptInputMode::TempFile
+        || (harness_config.prompt_input == PromptInputMode::Argv
+            && harness_config.argv_overflow == ArgvOverflowBehavior::SpillToTempFile);
+    if !can_spill_to_file {
+        bail!(
+            "plan-harness '{harness_name}' prompt is {} bytes, past the {} KB argv safety \
+             threshold; this interactive planner cannot spill the seed prompt to stdin, \
+             and this harness is not configured for tempfile prompt delivery",
+            prompt.len(),
+            harness::ARGV_SPILL_THRESHOLD_BYTES / 1024,
+        );
+    }
+
+    eprintln!(
+        "ralph: warning: plan-harness prompt is {} bytes (>{} KB threshold); \
+         spilling to temp file to avoid E2BIG on argv-mode harness '{}'.",
+        prompt.len(),
+        harness::ARGV_SPILL_THRESHOLD_BYTES / 1024,
+        harness_name,
+    );
+    let mut tmp = NamedTempFile::new().context("failed to create plan-harness prompt temp file")?;
+    tmp.write_all(prompt.as_bytes())
+        .context("failed to write plan-harness prompt to temp file")?;
+    tmp.flush()
+        .context("failed to flush plan-harness prompt temp file")?;
+    let path = tmp.path().to_string_lossy().to_string();
+    for idx in prompt_arg_indexes {
+        args[idx] = path.clone();
+    }
+    Ok(PlanHarnessInvocation {
+        args,
+        _prompt_file: Some(tmp),
+    })
 }
 
 /// Build environment variables for the plan-harness session.
@@ -822,7 +900,7 @@ pub async fn run_plan_harness(
     let agent_file_path = agent_temp_file.path();
 
     // Build per-harness args and env
-    let args = build_plan_harness_args(
+    let invocation = build_plan_harness_args(
         harness_name,
         config,
         Some(agent_file_path),
@@ -833,9 +911,10 @@ pub async fn run_plan_harness(
 
     // Spawn the harness interactively
     let cwd = std::path::Path::new(project);
-    let mut child = harness::spawn_harness_interactive(harness_config, &args, &env_vars, cwd)
-        .await
-        .with_context(|| format!("Failed to spawn plan-harness '{harness_name}'"))?;
+    let mut child =
+        harness::spawn_harness_interactive(harness_config, &invocation.args, &env_vars, cwd)
+            .await
+            .with_context(|| format!("Failed to spawn plan-harness '{harness_name}'"))?;
 
     // Wait for the harness to exit
     let status = child
@@ -843,8 +922,24 @@ pub async fn run_plan_harness(
         .await
         .context("Failed to wait for plan-harness process")?;
 
-    // The temp file is cleaned up when agent_temp_file is dropped
-    Ok(status.code().unwrap_or(1))
+    // Temp files are cleaned up when agent_temp_file / invocation drop.
+    Ok(plan_harness_exit_code(status))
+}
+
+fn plan_harness_exit_code(status: std::process::ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return 128 + signal;
+        }
+    }
+
+    1
 }
 
 /// A temporary file that is cleaned up on drop.
@@ -1380,6 +1475,49 @@ mod tests {
             "literal {{agent_file}} leaked into argv: {args:?}"
         );
         assert_eq!(args[1], "Create a plan");
+    }
+
+    #[test]
+    fn test_plan_harness_large_prompt_spills_to_tempfile_when_configured() {
+        let mut config =
+            synthetic_harness(vec!["--prompt".to_string(), "{prompt}".to_string()], false);
+        let hc = config.harnesses.get_mut("synth").unwrap();
+        hc.prompt_input = crate::config::PromptInputMode::Argv;
+        hc.argv_overflow = crate::config::ArgvOverflowBehavior::SpillToTempFile;
+        let prompt = "x".repeat(crate::harness::ARGV_SPILL_THRESHOLD_BYTES + 1024);
+        let args =
+            build_plan_harness_args("synth", &config, None, "", &prompt).expect("spill succeeds");
+
+        assert_eq!(args[0], "--prompt");
+        assert_ne!(args[1], prompt);
+        assert!(
+            args[1].len() < crate::harness::ARGV_SPILL_THRESHOLD_BYTES,
+            "tempfile path should replace oversized prompt arg"
+        );
+        let contents = std::fs::read_to_string(&args[1]).expect("prompt tempfile readable");
+        assert_eq!(contents, prompt);
+    }
+
+    #[test]
+    fn test_plan_harness_large_prompt_errors_without_tempfile_delivery() {
+        let mut config = synthetic_harness(vec!["{prompt}".to_string()], false);
+        let hc = config.harnesses.get_mut("synth").unwrap();
+        hc.prompt_input = crate::config::PromptInputMode::Argv;
+        hc.argv_overflow = crate::config::ArgvOverflowBehavior::Error;
+        let prompt = "x".repeat(crate::harness::ARGV_SPILL_THRESHOLD_BYTES + 1024);
+        let err = build_plan_harness_args("synth", &config, None, "", &prompt).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("argv safety threshold"), "got: {msg}");
+        assert!(msg.contains("tempfile"), "got: {msg}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_plan_harness_exit_code_preserves_signal_death() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let status = std::process::ExitStatus::from_raw(9);
+        assert_eq!(plan_harness_exit_code(status), 137);
     }
 
     // -- preflight_no_live_run tests --
