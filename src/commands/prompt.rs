@@ -473,10 +473,11 @@ mod tests {
         assert_eq!(cfg.prompt.as_deref(), Some("from universal alias"));
     }
 
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::MutexGuard;
 
     /// Serialize tests that mutate `$XDG_CONFIG_HOME` (process-wide env).
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// Shared crate-wide so it serializes across test modules.
+    use crate::config::XDG_ENV_LOCK as ENV_LOCK;
 
     struct XdgGuard {
         _lock: MutexGuard<'static, ()>,

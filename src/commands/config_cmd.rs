@@ -179,12 +179,13 @@ pub fn config_review_set(
 mod tests {
     use super::*;
     use crate::config::{self, Config};
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::MutexGuard;
 
     /// Serialize tests that mutate `$XDG_CONFIG_HOME`. Parallel mutation of a
-    /// process-wide env var would race; a mutex keeps these tests honest
-    /// without forcing the entire test binary to run single-threaded.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// process-wide env var would race; a single crate-wide mutex keeps these
+    /// tests honest across modules without forcing the test binary to run
+    /// single-threaded.
+    use crate::config::XDG_ENV_LOCK as ENV_LOCK;
 
     /// Point the config loader at `path` for the duration of the returned guard
     /// and restore the previous `XDG_CONFIG_HOME` on drop.

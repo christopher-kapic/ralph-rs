@@ -333,12 +333,10 @@ fn restore_tui_terminal() {
     );
 }
 
+type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'static>;
+
 struct TuiPanicHookGuard {
-    previous: std::sync::Arc<
-        std::sync::Mutex<
-            Option<Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'static>>,
-        >,
-    >,
+    previous: std::sync::Arc<std::sync::Mutex<Option<PanicHook>>>,
 }
 
 impl TuiPanicHookGuard {
@@ -5985,9 +5983,7 @@ fn refresh_step_detail_state(
 
     if let Some(step_id) = app.current_step().map(|s| s.id.clone()) {
         app.execution_logs = storage::list_execution_logs_for_step(conn, &step_id)?;
-        if was_on_latest_attempt {
-            app.appended_attempt_index = app.execution_logs.len().saturating_sub(1);
-        } else if app.appended_attempt_index >= app.execution_logs.len() {
+        if was_on_latest_attempt || app.appended_attempt_index >= app.execution_logs.len() {
             app.appended_attempt_index = app.execution_logs.len().saturating_sub(1);
         }
     } else {

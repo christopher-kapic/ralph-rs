@@ -511,7 +511,7 @@ fn centered_rect(area: Rect, picker: &PickerState) -> Rect {
     let label_w = picker
         .items
         .iter()
-        .map(|i| display_width(&i.label()))
+        .map(|i| display_width(i.label()))
         .max()
         .unwrap_or(0);
     let title_w = display_width(picker.kind.title()) + 2;

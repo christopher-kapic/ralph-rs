@@ -77,7 +77,7 @@ pub fn resolve_plan_optional(
     include_complete: bool,
 ) -> Result<Option<Plan>> {
     match slug {
-        Some(s) if s.is_empty() => {
+        Some("") => {
             bail!(
                 "Plan slug cannot be empty. Specify a non-empty slug or omit the argument to use the active plan."
             )
@@ -736,11 +736,12 @@ mod tests {
 
     // -- global-prompt seeding (`ralph init`) -----------------------------
 
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::MutexGuard;
 
     /// Serialize tests that mutate `$XDG_CONFIG_HOME`. Same pattern as the
-    /// config_cmd test module — a process-wide env var can't be raced.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// config_cmd test module — a process-wide env var can't be raced. Shared
+    /// crate-wide so it serializes across test modules.
+    use crate::config::XDG_ENV_LOCK as ENV_LOCK;
 
     struct XdgGuard {
         _lock: MutexGuard<'static, ()>,

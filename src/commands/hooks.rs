@@ -242,7 +242,7 @@ mod tests {
     use crate::hook_library::{Hook, HookBundle, Lifecycle, Scope};
     use crate::output::{OutputContext, OutputFormat};
     use std::path::Path;
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::MutexGuard;
 
     fn quiet_out() -> OutputContext {
         OutputContext {
@@ -252,7 +252,9 @@ mod tests {
         }
     }
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// Shared crate-wide so it serializes `$XDG_CONFIG_HOME` mutation across
+    /// test modules, not just within this one.
+    use crate::config::XDG_ENV_LOCK as ENV_LOCK;
 
     struct XdgGuard {
         _lock: MutexGuard<'static, ()>,

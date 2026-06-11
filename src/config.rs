@@ -1201,6 +1201,15 @@ pub fn agents_dir() -> Result<PathBuf> {
     Ok(config_dir()?.join("agents"))
 }
 
+/// Shared process-wide lock serializing every test that mutates the global
+/// `$XDG_CONFIG_HOME`. It lives at crate scope so test guards in different
+/// modules contend on the *same* mutex — per-module locks don't serialize
+/// across modules, and the racing writes to the process-global env var made
+/// `load_or_create_config` intermittently observe a redirected/missing config
+/// dir ("Failed to publish …").
+#[cfg(test)]
+pub(crate) static XDG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Loads configuration from disk, or creates a default config file if none exists.
 pub fn load_or_create_config() -> Result<Config> {
     let dir = config_dir()?;

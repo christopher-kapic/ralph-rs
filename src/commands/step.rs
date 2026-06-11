@@ -651,6 +651,7 @@ pub fn step_add_bulk(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn step_remove(
     conn: &Connection,
     plan_slug: &str,
@@ -843,6 +844,7 @@ pub fn step_edit(conn: &Connection, args: StepEditArgs<'_>, out: &OutputContext)
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn step_reset(
     conn: &Connection,
     plan_slug: &str,
