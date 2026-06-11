@@ -23,7 +23,7 @@ use rusqlite::Connection;
 use crate::config::Config;
 use crate::plan::{ChangePolicy, ExecutionLog, Plan, Step, StepStatus};
 use crate::storage::{self, ProjectPromptSource, ProjectSettings};
-use crate::tui::chrome::{self, Chrome};
+use crate::tui::chrome::{self, Chrome, display_width};
 use crate::tui::help::{self, HelpState};
 use crate::tui::read_only::{self, ReadOnly};
 use crate::tui::theme;
@@ -64,7 +64,7 @@ pub const SIDEBAR_FULL_WIDTH: u16 = 25;
 pub const SIDEBAR_ZEN_WIDTH: u16 = 4;
 
 /// Toast text shown when `c` is pressed but neither `$EDITOR` nor `$VISUAL`
-/// is set — the editor handoff returns `Ok(None)` per TUI-plan §8 + §14.
+/// is set.
 /// Pushed as an error-styled toast so the red color signals "this didn't
 /// work" rather than the green "Saved." confirmation.
 pub const NO_EDITOR_TOAST: &str =
@@ -123,10 +123,19 @@ pub enum Pane {
     BottomRow,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActiveStepModal {
+    None,
+    Answer(crate::tui::views::answer_modal::InterruptionModal),
+    Resume(crate::tui::views::answer_modal::ResumeModal),
+}
+
 impl Pane {
+    pub const COUNT: usize = 8;
+
     /// Display order — index into the pane stack from top to bottom. Drives
     /// the wrapping nav arithmetic below.
-    pub const ORDER: [Pane; 8] = [
+    pub const ORDER: [Pane; Self::COUNT] = [
         Pane::GlobalPrompt,
         Pane::ProjectPrompt,
         Pane::PlanPrompt,
@@ -169,8 +178,8 @@ impl Pane {
 /// Drives which toast the dispatcher pushes after the handoff returns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditOutcome {
-    /// `$EDITOR`/`$VISUAL` not set, OR the editor exited non-zero — nothing
-    /// was persisted. Maps to the [`NO_EDITOR_TOAST`] message in red.
+    /// `$EDITOR`/`$VISUAL` not set. Maps to the [`NO_EDITOR_TOAST`] message
+    /// in red.
     NoEditor,
     /// Editor exited zero with a value different from the initial buffer.
     /// The new value has already been written back to the source of truth.
@@ -555,15 +564,9 @@ pub struct StepDetailApp {
     /// last open question for the plan, the dispatcher pops the modal.
     pub plan_open_questions_count: usize,
 
-    /// Active answer modal, or `None` when no question is being answered.
-    /// Set by [`Self::open_answer_modal`]; cleared by either a Cancel or a
-    /// successful Submit.
-    pub answer_modal: Option<crate::tui::views::answer_modal::InterruptionModal>,
-
-    /// Active resume-implementation modal, or `None`. Spawned by
-    /// [`Self::note_answer_persisted`] when the just-applied answer was the
-    /// plan's last open question; cleared by either Accept or Decline.
-    pub resume_modal: Option<crate::tui::views::answer_modal::ResumeModal>,
+    /// Active answer/resume modal. A single enum keeps the two modal flows
+    /// mutually exclusive by construction.
+    active_modal: ActiveStepModal,
     /// Help-overlay state. `?` toggles visibility; while visible the
     /// dispatcher routes input through [`HelpState::intercept_key`] before
     /// touching pane navigation or modal handlers (TUI-plan.md §15).
@@ -591,6 +594,14 @@ pub struct StepDetailApp {
     /// [`Self::handle_mouse`]. Zero before the first frame.
     pub last_sidebar_w: u16,
 
+    /// Sidebar content top row recorded during the most recent `draw()`.
+    /// Used to map mouse clicks on visible sidebar rows back to step indexes.
+    pub last_sidebar_inner_y: u16,
+
+    /// Sidebar content height recorded during the most recent `draw()`.
+    /// Zero before first draw or when the sidebar has no usable inner area.
+    pub last_sidebar_inner_h: u16,
+
     /// True while a left-mouse drag started on the divider column is
     /// active. Cleared on `MouseEventKind::Up(Left)`.
     pub dragging_sidebar: bool,
@@ -598,16 +609,20 @@ pub struct StepDetailApp {
     /// Per-pane vertical scroll offsets, indexed by [`Pane::index`]. The
     /// focused pane reads/writes its own offset via `J`/`K`, paging keys,
     /// and the mouse wheel so long prompt bodies remain readable.
-    pane_scroll: [u16; 8],
+    pane_scroll: [u16; Pane::COUNT],
 
     /// Per-pane body heights from the most recent render, paired with
     /// [`Self::pane_line_counts`] so scroll offsets clamp to the visible
     /// content instead of drifting past the end.
-    pane_body_heights: [u16; 8],
+    pane_body_heights: [u16; Pane::COUNT],
 
     /// Per-pane wrapped line counts from the most recent render. Used only
     /// for scroll clamping.
-    pane_line_counts: [u16; 8],
+    pane_line_counts: [u16; Pane::COUNT],
+
+    /// Per-pane outer rectangles from the most recent render. Mouse hit-tests
+    /// use these to route wheel/click events to the pane under the pointer.
+    pane_areas: [Rect; Pane::COUNT],
 }
 
 impl StepDetailApp {
@@ -657,17 +672,19 @@ impl StepDetailApp {
             open_questions_for_step: Vec::new(),
             selected_question_index: 0,
             plan_open_questions_count: 0,
-            answer_modal: None,
-            resume_modal: None,
+            active_modal: ActiveStepModal::None,
             help: HelpState::new(),
             palette_bar: None,
             sidebar_w_override: None,
             last_body_width: 0,
             last_sidebar_w: 0,
+            last_sidebar_inner_y: 0,
+            last_sidebar_inner_h: 0,
             dragging_sidebar: false,
-            pane_scroll: [0; 8],
-            pane_body_heights: [0; 8],
-            pane_line_counts: [0; 8],
+            pane_scroll: [0; Pane::COUNT],
+            pane_body_heights: [0; Pane::COUNT],
+            pane_line_counts: [0; Pane::COUNT],
+            pane_areas: [Rect::default(); Pane::COUNT],
         }
     }
 
@@ -699,11 +716,17 @@ impl StepDetailApp {
 
         match event.kind {
             MouseEventKind::ScrollDown => {
-                self.scroll_focused_pane_down();
+                if let Some(pane) = self.pane_at(event.column, event.row) {
+                    self.focused_pane = pane;
+                    self.scroll_pane_down(pane);
+                }
                 return;
             }
             MouseEventKind::ScrollUp => {
-                self.scroll_focused_pane_up();
+                if let Some(pane) = self.pane_at(event.column, event.row) {
+                    self.focused_pane = pane;
+                    self.scroll_pane_up(pane);
+                }
                 return;
             }
             _ => {}
@@ -723,6 +746,25 @@ impl StepDetailApp {
                     // win regardless of zen toggle state. `auto_zen` is
                     // recomputed each frame so we leave it alone.
                     self.user_zen = false;
+                    return;
+                }
+                if event.column < self.last_sidebar_w
+                    && self.last_sidebar_inner_h > 0
+                    && event.row >= self.last_sidebar_inner_y
+                    && event.row < self.last_sidebar_inner_y + self.last_sidebar_inner_h
+                {
+                    let visible = self.last_sidebar_inner_h as usize;
+                    let start =
+                        sidebar_window_start(self.steps.len(), visible, self.selected_step_index);
+                    let offset = (event.row - self.last_sidebar_inner_y) as usize;
+                    let idx = start + offset;
+                    if idx < self.steps.len() {
+                        self.selected_step_index = idx;
+                    }
+                    return;
+                }
+                if let Some(pane) = self.pane_at(event.column, event.row) {
+                    self.focused_pane = pane;
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) if self.dragging_sidebar => {
@@ -753,6 +795,43 @@ impl StepDetailApp {
         !self.read_only.is_locked()
     }
 
+    pub fn answer_modal(&self) -> Option<&crate::tui::views::answer_modal::InterruptionModal> {
+        match &self.active_modal {
+            ActiveStepModal::Answer(modal) => Some(modal),
+            ActiveStepModal::None | ActiveStepModal::Resume(_) => None,
+        }
+    }
+
+    pub fn answer_modal_mut(
+        &mut self,
+    ) -> Option<&mut crate::tui::views::answer_modal::InterruptionModal> {
+        match &mut self.active_modal {
+            ActiveStepModal::Answer(modal) => Some(modal),
+            ActiveStepModal::None | ActiveStepModal::Resume(_) => None,
+        }
+    }
+
+    pub fn resume_modal(&self) -> Option<&crate::tui::views::answer_modal::ResumeModal> {
+        match &self.active_modal {
+            ActiveStepModal::Resume(modal) => Some(modal),
+            ActiveStepModal::None | ActiveStepModal::Answer(_) => None,
+        }
+    }
+
+    pub fn take_resume_modal(&mut self) -> Option<crate::tui::views::answer_modal::ResumeModal> {
+        match std::mem::replace(&mut self.active_modal, ActiveStepModal::None) {
+            ActiveStepModal::Resume(modal) => Some(modal),
+            other => {
+                self.active_modal = other;
+                None
+            }
+        }
+    }
+
+    pub fn modal_is_open(&self) -> bool {
+        !matches!(self.active_modal, ActiveStepModal::None)
+    }
+
     fn pane_scroll(&self, pane: Pane) -> u16 {
         self.pane_scroll[pane.index()]
     }
@@ -777,21 +856,39 @@ impl StepDetailApp {
         pane != Pane::BottomRow
     }
 
-    pub fn scroll_focused_pane_down(&mut self) {
-        if !Self::pane_is_scrollable(self.focused_pane) {
+    fn pane_at(&self, column: u16, row: u16) -> Option<Pane> {
+        Pane::ORDER.iter().copied().find(|pane| {
+            let area = self.pane_areas[pane.index()];
+            column >= area.x
+                && column < area.x.saturating_add(area.width)
+                && row >= area.y
+                && row < area.y.saturating_add(area.height)
+        })
+    }
+
+    fn scroll_pane_down(&mut self, pane: Pane) {
+        if !Self::pane_is_scrollable(pane) {
             return;
         }
-        let idx = self.focused_pane.index();
-        let max = self.max_pane_scroll(self.focused_pane);
+        let idx = pane.index();
+        let max = self.max_pane_scroll(pane);
         self.pane_scroll[idx] = self.pane_scroll[idx].saturating_add(1).min(max);
     }
 
-    pub fn scroll_focused_pane_up(&mut self) {
-        if !Self::pane_is_scrollable(self.focused_pane) {
+    fn scroll_pane_up(&mut self, pane: Pane) {
+        if !Self::pane_is_scrollable(pane) {
             return;
         }
-        let idx = self.focused_pane.index();
+        let idx = pane.index();
         self.pane_scroll[idx] = self.pane_scroll[idx].saturating_sub(1);
+    }
+
+    pub fn scroll_focused_pane_down(&mut self) {
+        self.scroll_pane_down(self.focused_pane);
+    }
+
+    pub fn scroll_focused_pane_up(&mut self) {
+        self.scroll_pane_up(self.focused_pane);
     }
 
     pub fn page_focused_pane_down(&mut self) {
@@ -968,7 +1065,7 @@ impl StepDetailApp {
     /// when the pane isn't focused, when read-only attach is active, or
     /// when a modal is already open.
     pub fn open_answer_modal(&mut self) -> bool {
-        if !self.can_edit_panes() || self.answer_modal.is_some() {
+        if !self.can_edit_panes() || self.modal_is_open() {
             return false;
         }
         if self.focused_pane != Pane::OpenQuestions {
@@ -977,28 +1074,31 @@ impl StepDetailApp {
         let Some(q) = self.focused_open_question() else {
             return false;
         };
-        self.answer_modal =
-            Some(crate::tui::views::answer_modal::InterruptionModal::from_open_question(q));
+        self.active_modal = ActiveStepModal::Answer(
+            crate::tui::views::answer_modal::InterruptionModal::from_open_question(q),
+        );
         true
     }
 
     /// Close the answer modal (Cancel path). Idempotent.
     pub fn close_answer_modal(&mut self) {
-        self.answer_modal = None;
+        if matches!(self.active_modal, ActiveStepModal::Answer(_)) {
+            self.active_modal = ActiveStepModal::None;
+        }
     }
 
     /// Apply editor-captured freeform text to the active answer modal (the
     /// dispatcher calls this after the `$EDITOR` round-trip — mirrors the
     /// inbox's `set_modal_freeform`).
     pub fn set_answer_modal_freeform(&mut self, text: String) {
-        if let Some(m) = self.answer_modal.as_mut() {
+        if let Some(m) = self.answer_modal_mut() {
             m.freeform = text;
         }
     }
 
     /// Apply editor-captured comment text to the active answer modal.
     pub fn set_answer_modal_comment(&mut self, text: String) {
-        if let Some(m) = self.answer_modal.as_mut() {
+        if let Some(m) = self.answer_modal_mut() {
             m.comment = text;
         }
     }
@@ -1014,18 +1114,24 @@ impl StepDetailApp {
     /// plan (i.e. `plan_open_questions_count` is now zero), this opens the
     /// resume modal. Otherwise the modal stays closed.
     pub fn note_answer_persisted(&mut self, previous_run_current_branch: bool) {
-        self.answer_modal = None;
-        if self.plan_open_questions_count == 0 && self.resume_modal.is_none() {
-            self.resume_modal = Some(crate::tui::views::answer_modal::ResumeModal::new(
-                self.plan.slug.clone(),
-                previous_run_current_branch,
-            ));
+        if matches!(self.active_modal, ActiveStepModal::Resume(_)) {
+            return;
+        }
+        self.active_modal = ActiveStepModal::None;
+        if self.plan_open_questions_count == 0 {
+            self.active_modal =
+                ActiveStepModal::Resume(crate::tui::views::answer_modal::ResumeModal::new(
+                    self.plan.slug.clone(),
+                    previous_run_current_branch,
+                ));
         }
     }
 
     /// Close the resume modal without spawning a runner (Decline path).
     pub fn close_resume_modal(&mut self) {
-        self.resume_modal = None;
+        if matches!(self.active_modal, ActiveStepModal::Resume(_)) {
+            self.active_modal = ActiveStepModal::None;
+        }
     }
 
     // -- Appended pane pagination (TUI-plan.md §8 "Appended-prompt navigation")
@@ -1171,7 +1277,7 @@ impl StepDetailApp {
         &mut self,
         conn: &Connection,
         kind: PickerKind,
-        value: &str,
+        value: Option<&str>,
     ) -> anyhow::Result<()> {
         let Some(step) = self.steps.get(self.selected_step_index).cloned() else {
             // Empty plan — the picker shouldn't have opened, but be defensive.
@@ -1183,12 +1289,12 @@ impl StepDetailApp {
                     conn,
                     &step.id,
                     crate::storage::StepFieldUpdates {
-                        harness_update: Some(Some(value)),
+                        harness_update: Some(value),
                         ..Default::default()
                     },
                 )?;
                 if let Some(s) = self.steps.get_mut(self.selected_step_index) {
-                    s.harness = Some(value.to_string());
+                    s.harness = value.map(str::to_string);
                 }
             }
             PickerKind::Model => {
@@ -1196,12 +1302,12 @@ impl StepDetailApp {
                     conn,
                     &step.id,
                     crate::storage::StepFieldUpdates {
-                        model_update: Some(Some(value)),
+                        model_update: Some(value),
                         ..Default::default()
                     },
                 )?;
                 if let Some(s) = self.steps.get_mut(self.selected_step_index) {
-                    s.model = Some(value.to_string());
+                    s.model = value.map(str::to_string);
                 }
             }
             PickerKind::Agent => {
@@ -1209,15 +1315,18 @@ impl StepDetailApp {
                     conn,
                     &step.id,
                     crate::storage::StepFieldUpdates {
-                        agent_update: Some(Some(value)),
+                        agent_update: Some(value),
                         ..Default::default()
                     },
                 )?;
                 if let Some(s) = self.steps.get_mut(self.selected_step_index) {
-                    s.agent = Some(value.to_string());
+                    s.agent = value.map(str::to_string);
                 }
             }
             PickerKind::ChangePolicy => {
+                let Some(value) = value else {
+                    anyhow::bail!("Change policy cannot inherit");
+                };
                 let policy: ChangePolicy = value
                     .parse()
                     .map_err(|_| anyhow::anyhow!("Unrecognized change policy: {value}"))?;
@@ -1534,7 +1643,7 @@ pub fn draw(frame: &mut Frame, app: &mut StepDetailApp) {
 
     let step_segment = app.breadcrumb_step_segment();
     let crumbs: [&str; 3] = ["ralph", app.plan.slug.as_str(), step_segment.as_str()];
-    let normal_hint = "[j/k] pane  [J/K] scroll  [h/←] back  [z] zen  [/:] cmd  [q] back";
+    let normal_hint = "[j/k] pane  [J/K] scroll  [c] edit  [I] inbox  [/:] cmd  [q] back";
     let palette_hint = "[tab] complete  [enter] submit  [esc] cancel";
     let hint = if app.palette_active() {
         palette_hint
@@ -1575,6 +1684,8 @@ pub fn draw(frame: &mut Frame, app: &mut StepDetailApp) {
     // Cache the dimensions for `handle_mouse` — see `Self::handle_mouse`.
     app.last_body_width = body.width;
     app.last_sidebar_w = sidebar_w;
+    app.last_sidebar_inner_y = 0;
+    app.last_sidebar_inner_h = 0;
 
     let main = Layout::default()
         .direction(Direction::Horizontal)
@@ -1589,9 +1700,9 @@ pub fn draw(frame: &mut Frame, app: &mut StepDetailApp) {
     }
 
     // §17 modals are last so they composite over everything else.
-    if let Some(modal) = &app.answer_modal {
+    if let Some(modal) = app.answer_modal() {
         super::inbox_ui::render_interruption_modal(frame, frame.area(), modal);
-    } else if let Some(modal) = &app.resume_modal {
+    } else if let Some(modal) = app.resume_modal() {
         render_resume_modal(frame, frame.area(), modal);
     }
 
@@ -1660,12 +1771,12 @@ fn centered_modal_rect(area: Rect, body: &[Line], title: &str) -> Rect {
         .map(|l| {
             l.spans
                 .iter()
-                .map(|s| s.content.chars().count())
+                .map(|s| display_width(s.content.as_ref()))
                 .sum::<usize>()
         })
         .max()
         .unwrap_or(0);
-    let title_w = title.chars().count();
+    let title_w = display_width(title);
     let desired_w = body_w.max(title_w) as u16 + 4;
     let width = desired_w.min(area.width).max(20.min(area.width));
     let desired_h = (body.len() as u16) + 2; // borders top + bottom
@@ -1682,7 +1793,7 @@ fn centered_modal_rect(area: Rect, body: &[Line], title: &str) -> Rect {
 
 fn render_toast_overlay(frame: &mut Frame, area: Rect, text: &str, color: ratatui::style::Color) {
     let max_toast = area.width.saturating_sub(1).max(1);
-    let desired = text.chars().count().min(max_toast as usize) as u16;
+    let desired = display_width(text).min(max_toast as usize) as u16;
     if desired == 0 {
         return;
     }
@@ -1702,7 +1813,7 @@ fn render_toast_overlay(frame: &mut Frame, area: Rect, text: &str, color: ratatu
     frame.render_widget(para, toast_area);
 }
 
-fn draw_sidebar(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
+fn draw_sidebar(frame: &mut Frame, app: &mut StepDetailApp, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -1713,22 +1824,22 @@ fn draw_sidebar(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
     }
 }
 
-fn draw_full_sidebar(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
+fn draw_full_sidebar(frame: &mut Frame, app: &mut StepDetailApp, area: Rect) {
     let block = Block::default()
         .title(format!(" {} ", app.plan.slug))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    app.last_sidebar_inner_y = inner.y;
+    app.last_sidebar_inner_h = inner.height;
 
     if inner.height == 0 {
         return;
     }
     let visible = inner.height as usize;
     let total = app.steps.len();
-    let start = app
-        .selected_step_index
-        .saturating_sub(visible.saturating_sub(1) / 2);
+    let start = sidebar_window_start(total, visible, app.selected_step_index);
     let end = (start + visible).min(total);
 
     for (slot, idx) in (start..end).enumerate() {
@@ -1755,7 +1866,7 @@ fn draw_full_sidebar(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
     }
 }
 
-fn draw_zen_gutter(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
+fn draw_zen_gutter(frame: &mut Frame, app: &mut StepDetailApp, area: Rect) {
     // Bordered gutter so the view's two halves are still visually separated;
     // contents are just `<glyph> <num>` per row.
     let block = Block::default()
@@ -1763,14 +1874,14 @@ fn draw_zen_gutter(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    app.last_sidebar_inner_y = inner.y;
+    app.last_sidebar_inner_h = inner.height;
     if inner.height == 0 || inner.width == 0 {
         return;
     }
     let visible = inner.height as usize;
     let total = app.steps.len();
-    let start = app
-        .selected_step_index
-        .saturating_sub(visible.saturating_sub(1) / 2);
+    let start = sidebar_window_start(total, visible, app.selected_step_index);
     let end = (start + visible).min(total);
 
     for (slot, idx) in (start..end).enumerate() {
@@ -1797,8 +1908,18 @@ fn draw_zen_gutter(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
     }
 }
 
+fn sidebar_window_start(total: usize, visible: usize, selected: usize) -> usize {
+    if total <= visible || visible == 0 {
+        return 0;
+    }
+    selected
+        .saturating_sub(visible.saturating_sub(1) / 2)
+        .min(total - visible)
+}
+
 fn draw_pane_stack(frame: &mut Frame, app: &mut StepDetailApp, area: Rect) {
     if area.width == 0 || area.height == 0 {
+        app.pane_areas = [Rect::default(); Pane::COUNT];
         return;
     }
     // Equal-share layout for the seven multi-line panes plus a fixed-height
@@ -1825,6 +1946,7 @@ fn draw_pane_stack(frame: &mut Frame, app: &mut StepDetailApp, area: Rect) {
         .split(area);
 
     for (i, pane) in Pane::ORDER.iter().enumerate() {
+        app.pane_areas[pane.index()] = chunks[i];
         draw_pane(frame, app, *pane, chunks[i]);
     }
 }
@@ -1883,11 +2005,48 @@ fn draw_pane(frame: &mut Frame, app: &mut StepDetailApp, pane: Pane, area: Rect)
     }
 }
 
-fn wrapped_visual_line_count(chars: usize, width: u16) -> u16 {
+fn hard_wrapped_visual_line_count(chars: usize, width: u16) -> u16 {
     if width == 0 {
         return 0;
     }
     chars.max(1).div_ceil(width as usize).min(u16::MAX as usize) as u16
+}
+
+fn word_wrapped_visual_line_count(line: &str, width: u16) -> u16 {
+    if width == 0 {
+        return 0;
+    }
+    if line.is_empty() {
+        return 1;
+    }
+
+    let width = width as usize;
+    let mut rows = 1usize;
+    let mut current = 0usize;
+
+    for word in line.split_whitespace() {
+        let word_w = display_width(word);
+        if current == 0 {
+            rows += word_w.saturating_sub(1) / width;
+            current = if word_w == 0 {
+                0
+            } else {
+                ((word_w - 1) % width) + 1
+            };
+        } else if current + 1 + word_w <= width {
+            current += 1 + word_w;
+        } else {
+            rows += 1;
+            rows += word_w.saturating_sub(1) / width;
+            current = if word_w == 0 {
+                0
+            } else {
+                ((word_w - 1) % width) + 1
+            };
+        }
+    }
+
+    rows.min(u16::MAX as usize) as u16
 }
 
 fn text_visual_line_count(text: &str, width: u16) -> u16 {
@@ -1895,19 +2054,20 @@ fn text_visual_line_count(text: &str, width: u16) -> u16 {
         return 0;
     }
     text.split('\n')
-        .map(|line| wrapped_visual_line_count(line.chars().count(), width) as usize)
+        .map(|line| word_wrapped_visual_line_count(line, width) as usize)
         .sum::<usize>()
         .min(u16::MAX as usize) as u16
 }
 
 fn line_visual_line_count(line: &Line, width: u16) -> u16 {
-    wrapped_visual_line_count(
-        line.spans
-            .iter()
-            .map(|span| span.content.chars().count())
-            .sum(),
-        width,
-    )
+    let text = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    let word_wrapped = word_wrapped_visual_line_count(&text, width);
+    let hard_wrapped = hard_wrapped_visual_line_count(display_width(&text), width);
+    word_wrapped.max(hard_wrapped)
 }
 
 fn lines_visual_line_count(lines: &[Line], width: u16) -> u16 {
@@ -2529,6 +2689,58 @@ mod tests {
     }
 
     #[test]
+    fn mouse_click_focuses_pane_under_pointer() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = make_app(3, 0);
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+
+        assert_eq!(app.focused_pane, Pane::StepPrompt);
+        let area = app.pane_areas[Pane::Tests.index()];
+        app.handle_mouse(mouse_event(
+            area.x + 3,
+            area.y + 1,
+            MouseEventKind::Down(MouseButton::Left),
+        ));
+
+        assert_eq!(app.focused_pane, Pane::Tests);
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_pane_under_pointer_and_focuses_it() {
+        use crossterm::event::MouseEventKind;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = make_app(3, 0);
+        app.config_prompt = Some(
+            (0..40)
+                .map(|i| format!("global {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        app.focused_pane = Pane::StepPrompt;
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+
+        let area = app.pane_areas[Pane::GlobalPrompt.index()];
+        app.handle_mouse(mouse_event(
+            area.x + 1,
+            area.y + 1,
+            MouseEventKind::ScrollDown,
+        ));
+
+        assert_eq!(app.focused_pane, Pane::GlobalPrompt);
+        assert_eq!(app.pane_scroll[Pane::GlobalPrompt.index()], 1);
+        assert_eq!(app.pane_scroll[Pane::StepPrompt.index()], 0);
+    }
+
+    #[test]
     fn focused_pane_scroll_clamps_to_last_rendered_metrics() {
         let mut app = make_app(3, 0);
         app.focused_pane = Pane::StepPrompt;
@@ -2558,6 +2770,31 @@ mod tests {
         app.scroll_focused_pane_to_bottom();
 
         assert_eq!(app.pane_scroll(Pane::BottomRow), 0);
+    }
+
+    #[test]
+    fn visual_line_count_counts_display_columns() {
+        assert_eq!(text_visual_line_count("界界界", 4), 2);
+        assert_eq!(
+            lines_visual_line_count(&[Line::from(vec![Span::raw("ab"), Span::raw("界界")])], 4,),
+            2
+        );
+    }
+
+    #[test]
+    fn visual_line_count_is_word_wrap_aware() {
+        assert_eq!(text_visual_line_count("abcdef ghijkl mnopqr", 10), 3);
+        assert_eq!(
+            lines_visual_line_count(
+                &[Line::from(vec![
+                    Span::raw("abcdef"),
+                    Span::raw(" ghijkl"),
+                    Span::raw(" mnopqr"),
+                ])],
+                10,
+            ),
+            3
+        );
     }
 
     // -- Open-question pane (TUI-plan.md §17) -------------------------------
@@ -2654,7 +2891,7 @@ mod tests {
         let mut app = make_app(3, 0);
         // No questions → no-op.
         assert!(!app.open_answer_modal());
-        assert!(app.answer_modal.is_none());
+        assert!(app.answer_modal().is_none());
 
         // Questions present but pane not focused → no-op.
         app.set_open_questions_for_step(vec![make_question(
@@ -2664,13 +2901,13 @@ mod tests {
         )]);
         app.focused_pane = Pane::StepPrompt;
         assert!(!app.open_answer_modal());
-        assert!(app.answer_modal.is_none());
+        assert!(app.answer_modal().is_none());
 
         // Pane focused → modal opens with the focused question's data,
         // mapped into the §12.4 InterruptionModal (body + priority options).
         app.focused_pane = Pane::OpenQuestions;
         assert!(app.open_answer_modal());
-        let modal = app.answer_modal.as_ref().expect("modal opened");
+        let modal = app.answer_modal().expect("modal opened");
         assert_eq!(modal.body, "Pick crate");
         assert_eq!(
             modal
@@ -2705,7 +2942,7 @@ mod tests {
         app.set_open_questions_for_step(vec![make_question("s0", "Q", &["a"])]);
         app.set_read_only(ReadOnly::Locked { pid: 4242 });
         assert!(!app.open_answer_modal());
-        assert!(app.answer_modal.is_none());
+        assert!(app.answer_modal().is_none());
     }
 
     #[test]
@@ -2715,7 +2952,7 @@ mod tests {
         app.set_open_questions_for_step(vec![make_question("s0", "Q", &["a"])]);
         app.open_answer_modal();
         app.close_answer_modal();
-        assert!(app.answer_modal.is_none());
+        assert!(app.answer_modal().is_none());
     }
 
     // -- Resume modal logic (TUI-plan.md §17) -------------------------------
@@ -2725,7 +2962,7 @@ mod tests {
         let mut app = make_app(3, 0);
         app.set_plan_open_questions_count(0);
         app.note_answer_persisted(true);
-        let modal = app.resume_modal.as_ref().expect("resume modal opened");
+        let modal = app.resume_modal().expect("resume modal opened");
         assert_eq!(modal.plan_slug, "tui-v1");
         assert!(modal.current_branch);
     }
@@ -2735,7 +2972,7 @@ mod tests {
         let mut app = make_app(3, 0);
         app.set_plan_open_questions_count(2);
         app.note_answer_persisted(false);
-        assert!(app.resume_modal.is_none());
+        assert!(app.resume_modal().is_none());
     }
 
     #[test]
@@ -2748,8 +2985,8 @@ mod tests {
         // Answer-modal state must clear regardless of whether the plan-wide
         // count drops to zero.
         app.note_answer_persisted(false);
-        assert!(app.answer_modal.is_none());
-        assert!(app.resume_modal.is_none());
+        assert!(app.answer_modal().is_none());
+        assert!(app.resume_modal().is_none());
     }
 
     #[test]
@@ -2759,11 +2996,11 @@ mod tests {
         let mut app = make_app(3, 0);
         app.set_plan_open_questions_count(0);
         app.note_answer_persisted(false);
-        let first = app.resume_modal.clone();
+        let first = app.resume_modal().cloned();
         app.note_answer_persisted(true);
         // The second call is a no-op while the modal stays open — the
         // current_branch flag from the first call is preserved.
-        assert_eq!(app.resume_modal, first);
+        assert_eq!(app.resume_modal().cloned(), first);
     }
 
     #[test]
@@ -2771,9 +3008,9 @@ mod tests {
         let mut app = make_app(3, 0);
         app.set_plan_open_questions_count(0);
         app.note_answer_persisted(false);
-        assert!(app.resume_modal.is_some());
+        assert!(app.resume_modal().is_some());
         app.close_resume_modal();
-        assert!(app.resume_modal.is_none());
+        assert!(app.resume_modal().is_none());
     }
 
     // -- Zen toggle ---------------------------------------------------------
@@ -3745,7 +3982,7 @@ mod tests {
     /// Helper: closure-based fake editor that returns a fixed result without
     /// shelling out. The closure receives the initial buffer (so tests can
     /// assert on what the editor would have seen) and returns the value the
-    /// editor "saved" — `None` simulates the no-editor / non-zero-exit path.
+    /// editor "saved" — `None` simulates the no-editor path.
     fn fake_editor(returning: Option<String>) -> impl FnOnce(&str) -> Result<Option<String>> {
         move |_initial| Ok(returning)
     }
@@ -4727,7 +4964,7 @@ cargo clippy
         app.open_picker_for_focused_cell(&["alpha".into(), "beta".into()]);
         let picker = app.picker.as_ref().expect("picker open");
         assert_eq!(picker.kind, PickerKind::Agent);
-        assert_eq!(picker.items.len(), 2);
+        assert_eq!(picker.items.len(), 3);
     }
 
     #[test]
@@ -4782,7 +5019,7 @@ cargo clippy
         match outcome {
             PickerOutcome::Submit { kind, value } => {
                 assert_eq!(kind, PickerKind::ChangePolicy);
-                assert_eq!(value, "optional");
+                assert_eq!(value.as_deref(), Some("optional"));
             }
             other => panic!("expected Submit, got {other:?}"),
         }
@@ -4814,7 +5051,7 @@ cargo clippy
     fn apply_picker_submit_harness_writes_through_update_step_fields_ext() {
         let conn = crate::db::open_memory().unwrap();
         let mut app = setup_picker_app(&conn);
-        app.apply_picker_submit(&conn, PickerKind::Harness, "codex")
+        app.apply_picker_submit(&conn, PickerKind::Harness, Some("codex"))
             .unwrap();
         // In-memory step refreshed.
         assert_eq!(app.steps[0].harness.as_deref(), Some("codex"));
@@ -4827,7 +5064,7 @@ cargo clippy
     fn apply_picker_submit_model_writes_through_update_step_fields_ext() {
         let conn = crate::db::open_memory().unwrap();
         let mut app = setup_picker_app(&conn);
-        app.apply_picker_submit(&conn, PickerKind::Model, "claude-opus-4-7")
+        app.apply_picker_submit(&conn, PickerKind::Model, Some("claude-opus-4-7"))
             .unwrap();
         assert_eq!(app.steps[0].model.as_deref(), Some("claude-opus-4-7"));
         let reloaded = crate::storage::list_steps(&conn, &app.plan.id).unwrap();
@@ -4838,7 +5075,7 @@ cargo clippy
     fn apply_picker_submit_agent_writes_through_update_step_fields_ext() {
         let conn = crate::db::open_memory().unwrap();
         let mut app = setup_picker_app(&conn);
-        app.apply_picker_submit(&conn, PickerKind::Agent, "rust-impl")
+        app.apply_picker_submit(&conn, PickerKind::Agent, Some("rust-impl"))
             .unwrap();
         assert_eq!(app.steps[0].agent.as_deref(), Some("rust-impl"));
         let reloaded = crate::storage::list_steps(&conn, &app.plan.id).unwrap();
@@ -4851,7 +5088,7 @@ cargo clippy
         let mut app = setup_picker_app(&conn);
         // Default policy is required — switch to optional.
         assert_eq!(app.steps[0].change_policy, ChangePolicy::Required);
-        app.apply_picker_submit(&conn, PickerKind::ChangePolicy, "optional")
+        app.apply_picker_submit(&conn, PickerKind::ChangePolicy, Some("optional"))
             .unwrap();
         assert_eq!(app.steps[0].change_policy, ChangePolicy::Optional);
         let reloaded = crate::storage::list_steps(&conn, &app.plan.id).unwrap();
@@ -4865,7 +5102,7 @@ cargo clippy
         // a PickerOutcome::Submit by hand.
         let conn = crate::db::open_memory().unwrap();
         let mut app = setup_picker_app(&conn);
-        let res = app.apply_picker_submit(&conn, PickerKind::ChangePolicy, "garbage");
+        let res = app.apply_picker_submit(&conn, PickerKind::ChangePolicy, Some("garbage"));
         assert!(res.is_err());
         // Step row untouched — change_policy stays at the default.
         let reloaded = crate::storage::list_steps(&conn, &app.plan.id).unwrap();
@@ -4898,8 +5135,44 @@ cargo clippy
             ProjectSettings::default(),
             Vec::new(),
         );
-        let res = app.apply_picker_submit(&conn, PickerKind::Harness, "codex");
+        let res = app.apply_picker_submit(&conn, PickerKind::Harness, Some("codex"));
         assert!(res.is_ok());
+    }
+
+    #[test]
+    fn apply_picker_submit_harness_inherit_clears_override() {
+        let conn = crate::db::open_memory().unwrap();
+        let mut app = setup_picker_app(&conn);
+        app.apply_picker_submit(&conn, PickerKind::Harness, Some("codex"))
+            .unwrap();
+
+        app.apply_picker_submit(&conn, PickerKind::Harness, None)
+            .unwrap();
+
+        assert_eq!(app.steps[0].harness, None);
+        let reloaded = crate::storage::list_steps(&conn, &app.plan.id).unwrap();
+        assert_eq!(reloaded[0].harness, None);
+    }
+
+    #[test]
+    fn apply_picker_submit_model_and_agent_inherit_clear_overrides() {
+        let conn = crate::db::open_memory().unwrap();
+        let mut app = setup_picker_app(&conn);
+        app.apply_picker_submit(&conn, PickerKind::Model, Some("claude-opus-4-7"))
+            .unwrap();
+        app.apply_picker_submit(&conn, PickerKind::Agent, Some("rust-impl"))
+            .unwrap();
+
+        app.apply_picker_submit(&conn, PickerKind::Model, None)
+            .unwrap();
+        app.apply_picker_submit(&conn, PickerKind::Agent, None)
+            .unwrap();
+
+        assert_eq!(app.steps[0].model, None);
+        assert_eq!(app.steps[0].agent, None);
+        let reloaded = crate::storage::list_steps(&conn, &app.plan.id).unwrap();
+        assert_eq!(reloaded[0].model, None);
+        assert_eq!(reloaded[0].agent, None);
     }
 
     // -- End-to-end flows: open → confirm → apply / open → cancel ---------
@@ -4918,7 +5191,8 @@ cargo clippy
         let outcome = app.picker_handle_key(k(KeyCode::Enter)).unwrap();
         match outcome {
             PickerOutcome::Submit { kind, value } => {
-                app.apply_picker_submit(&conn, kind, &value).unwrap();
+                app.apply_picker_submit(&conn, kind, value.as_deref())
+                    .unwrap();
                 app.close_picker();
             }
             other => panic!("expected Submit, got {other:?}"),
@@ -4968,7 +5242,8 @@ cargo clippy
         match outcome {
             PickerOutcome::Submit { kind, value } => {
                 assert_eq!(kind, PickerKind::Model);
-                app.apply_picker_submit(&conn, kind, &value).unwrap();
+                app.apply_picker_submit(&conn, kind, value.as_deref())
+                    .unwrap();
             }
             other => panic!("expected Submit, got {other:?}"),
         }
@@ -5193,6 +5468,46 @@ cargo clippy
             app.sidebar_w_override.is_none(),
             "drag without arming must not set override"
         );
+    }
+
+    #[test]
+    fn sidebar_click_selects_visible_step_row() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = make_app(8, 0);
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+
+        let row = app.last_sidebar_inner_y + 3;
+        app.handle_mouse(mouse_event(2, row, MouseEventKind::Down(MouseButton::Left)));
+
+        assert_eq!(app.selected_step_index, 3);
+        assert!(!app.dragging_sidebar);
+    }
+
+    #[test]
+    fn sidebar_click_on_blank_row_does_not_select_invisible_step() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = make_app(3, 1);
+        app.last_body_width = 120;
+        app.last_sidebar_w = 25;
+        app.last_sidebar_inner_y = 2;
+        app.last_sidebar_inner_h = 20;
+
+        app.handle_mouse(mouse_event(2, 10, MouseEventKind::Down(MouseButton::Left)));
+
+        assert_eq!(app.selected_step_index, 1);
+        assert!(!app.dragging_sidebar);
+    }
+
+    #[test]
+    fn sidebar_window_start_pulls_back_near_list_end() {
+        assert_eq!(sidebar_window_start(20, 5, 19), 15);
+        assert_eq!(sidebar_window_start(20, 5, 18), 15);
+        assert_eq!(sidebar_window_start(20, 5, 2), 0);
     }
 
     #[test]

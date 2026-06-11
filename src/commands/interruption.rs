@@ -510,7 +510,7 @@ pub fn cmd_interruption_show(
     Ok(())
 }
 
-/// `ralph interruption resolve [PLAN] <id|index> [--option K] [--answer T]
+/// `ralph interruption resolve [PLAN] <id> [--option K] [--answer T]
 /// [--comment T]`.
 ///
 /// `--option K` picks the K-th proposed option (1-based, priority order, as
@@ -520,8 +520,10 @@ pub fn cmd_interruption_show(
 /// an always-injectable note. Resolving flips state→resolved and un-shadows
 /// the step (its `Blocked` overlay clears — docs/dag-redesign.md §3.4).
 ///
-/// When PLAN is supplied, the selector is resolved (and any index is
-/// interpreted) against only the open interruptions for that plan.
+/// Mutating resolution requires a stable interruption id. Numeric list indexes
+/// are accepted by `list`/`show` for inspection only; using them for writes can
+/// resolve the wrong row if another interruption is raised or resolved between
+/// the operator's `list` and `resolve`.
 /// The selection + resolution payload for [`cmd_interruption_resolve`]: which
 /// interruption (`plan_slug` scope + `selector`), the chosen `option` /
 /// freeform `answer` / `comment`, and the `require_question` guard for the
@@ -550,6 +552,13 @@ pub fn cmd_interruption_resolve(
         comment,
         require_question,
     } = args;
+    if selector.parse::<usize>().is_ok() {
+        bail!(
+            "Resolving by numeric index is unsafe because interruption lists can change; \
+             run `ralph interruption show {selector}` to copy the interruption id, then \
+             resolve by id."
+        );
+    }
     let opens = storage::list_open_interruptions_enriched(conn, project, plan_slug)?;
     let q = match resolve_selector(&opens, selector) {
         Some(q) => q.clone(),
@@ -879,6 +888,47 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("No open interruption matched"));
+    }
+
+    #[test]
+    fn resolve_numeric_index_is_rejected_without_writing() {
+        let conn = db::open_memory().unwrap();
+        let project = "/proj-index-resolve";
+        let (_p, step_id) = seed_plan_and_step(&conn, "p", project);
+        storage::insert_interruption(
+            &conn,
+            &step_id,
+            1,
+            InterruptionKind::Question,
+            "?",
+            &[InterruptionOption {
+                text: "yes".into(),
+                priority: 1,
+            }],
+        )
+        .unwrap();
+
+        let err = cmd_interruption_resolve(
+            &conn,
+            project,
+            ResolveArgs {
+                plan_slug: None,
+                selector: "1",
+                option: Some(1),
+                answer: None,
+                comment: None,
+                require_question: false,
+            },
+            &quiet_out(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Resolving by numeric index is unsafe"),
+            "error should explain why resolve requires ids: {err:#}"
+        );
+        let still = storage::list_open_interruptions_enriched(&conn, project, None).unwrap();
+        assert_eq!(still.len(), 1);
     }
 
     /// Bug fix: the legacy `ralph question answer` alias (require_question =

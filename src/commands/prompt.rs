@@ -148,15 +148,13 @@ pub fn cmd_prompt_set(
         },
     }
 
-    if !out.quiet {
-        let icon = output::check_icon(out.color);
-        let verb = if value.is_some() {
-            "Updated"
-        } else {
-            "Cleared"
-        };
-        eprintln!("{icon} {verb} {} prompt", scope_name(scope));
-    }
+    let icon = output::check_icon(out.color);
+    let verb = if value.is_some() {
+        "Updated"
+    } else {
+        "Cleared"
+    };
+    out.status(format!("{icon} {verb} {} prompt", scope_name(scope)));
     Ok(())
 }
 
@@ -177,10 +175,8 @@ pub fn cmd_prompt_clear(
         PromptScope::Project => clear_project_layer(conn, project)?,
     }
 
-    if !out.quiet {
-        let icon = output::check_icon(out.color);
-        eprintln!("{icon} Cleared {} prompt", scope_name(scope));
-    }
+    let icon = output::check_icon(out.color);
+    out.status(format!("{icon} Cleared {} prompt", scope_name(scope)));
     Ok(())
 }
 

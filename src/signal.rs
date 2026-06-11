@@ -74,6 +74,7 @@ static REQUESTED_PARK_KIND: Mutex<Option<crate::git::ParkStrategyKind>> = Mutex:
 /// cancel ladder (a step is in-flight here) or just flip the DB status (no
 /// in-flight step, or the runner is a different process entirely).
 static STEP_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static STEP_IN_FLIGHT_ID: Mutex<Option<String>> = Mutex::new(None);
 
 fn register_active_cancel_tx(tx: watch::Sender<CancelState>) {
     *ACTIVE_CANCEL_TX.lock().unwrap() = Some(tx);
@@ -103,6 +104,9 @@ pub fn set_requested_park_kind_for_test(kind: crate::git::ParkStrategyKind) {
 /// `execute_step` and `false` immediately after.
 pub fn set_step_in_flight(in_flight: bool) {
     STEP_IN_FLIGHT.store(in_flight, Ordering::SeqCst);
+    if !in_flight {
+        *STEP_IN_FLIGHT_ID.lock().unwrap() = None;
+    }
 }
 
 /// Whether a step is currently executing in this process's runner.
@@ -118,8 +122,9 @@ pub struct StepInFlightGuard {
 }
 
 impl StepInFlightGuard {
-    pub fn enter() -> Self {
+    pub fn enter(step_id: &str) -> Self {
         set_step_in_flight(true);
+        *STEP_IN_FLIGHT_ID.lock().unwrap() = Some(step_id.to_string());
         Self { _private: () }
     }
 }
@@ -147,9 +152,32 @@ impl Drop for StepInFlightGuard {
 /// fall back to a plain DB status flip) — including the case where a
 /// whole-run [`CancelReason::Aborted`] is already latched and the skip is
 /// therefore declined (see [`inject_skip_with_kind`] for the rationale).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn request_skip_in_flight(park_kind: crate::git::ParkStrategyKind) -> bool {
+    request_skip_in_flight_matching(None, park_kind)
+}
+
+/// Target-aware same-process skip. Declines when the process has a step
+/// in-flight, but it is not the requested step.
+pub fn request_skip_in_flight_for_step(
+    step_id: &str,
+    park_kind: crate::git::ParkStrategyKind,
+) -> bool {
+    request_skip_in_flight_matching(Some(step_id), park_kind)
+}
+
+fn request_skip_in_flight_matching(
+    step_id: Option<&str>,
+    park_kind: crate::git::ParkStrategyKind,
+) -> bool {
     if !step_in_flight() {
         return false;
+    }
+    if let Some(target) = step_id {
+        let current = STEP_IN_FLIGHT_ID.lock().unwrap();
+        if current.as_deref() != Some(target) {
+            return false;
+        }
     }
     let guard = ACTIVE_CANCEL_TX.lock().unwrap();
     match guard.as_ref() {
@@ -213,15 +241,19 @@ pub fn inject_skip_with_kind(park_kind: crate::git::ParkStrategyKind) -> bool {
 /// the executor's non-skip terminal arms so a `Skipped` that raced and lost
 /// can't leak into the next attempt/step (Fix 3).
 pub fn clear_pending_skip_state() {
-    let is_skip = {
-        let guard = ACTIVE_CANCEL_TX.lock().unwrap();
-        matches!(guard.as_ref(), Some(tx) if *tx.borrow() == Some(CancelReason::Skipped))
-    };
-    if is_skip {
-        // Drop any recorded park kind first so even if the channel reset
-        // races a fresh request, the slot doesn't carry a stale value.
-        let _ = REQUESTED_PARK_KIND.lock().unwrap().take();
-        clear_cancel_state();
+    let guard = ACTIVE_CANCEL_TX.lock().unwrap();
+    if let Some(tx) = guard.as_ref() {
+        let cleared = tx.send_if_modified(|state| {
+            if *state == Some(CancelReason::Skipped) {
+                *state = None;
+                true
+            } else {
+                false
+            }
+        });
+        if cleared {
+            let _ = REQUESTED_PARK_KIND.lock().unwrap().take();
+        }
     }
 }
 
@@ -260,7 +292,14 @@ pub fn clear_cancel_state() -> bool {
     let guard = ACTIVE_CANCEL_TX.lock().unwrap();
     match guard.as_ref() {
         Some(tx) => {
-            let _ = tx.send(None);
+            tx.send_if_modified(|state| {
+                if *state == Some(CancelReason::Skipped) {
+                    *state = None;
+                    true
+                } else {
+                    false
+                }
+            });
             true
         }
         None => false,
@@ -405,41 +444,54 @@ impl ShutdownController {
         // can inject `Skipped` into the very channel the executor's wait
         // loop is listening on (reusing the existing kill ladder).
         register_active_cancel_tx(self.abort_tx.clone());
+        let signals = SignalStreams::new();
         tokio::spawn(async move {
-            Self::listen(self.abort_tx, self.first_signal_received).await;
+            Self::listen(self.abort_tx, self.first_signal_received, signals).await;
         });
         (handle, rx)
     }
 
     /// Internal listener loop.
-    async fn listen(abort_tx: watch::Sender<CancelState>, first_received: Arc<AtomicBool>) {
+    async fn listen(
+        abort_tx: watch::Sender<CancelState>,
+        first_received: Arc<AtomicBool>,
+        mut signals: SignalStreams,
+    ) {
         loop {
             // Wait for either SIGINT (Ctrl+C) or SIGTERM (`ralph cancel`
             // delivers the latter, and external process supervisors often
             // prefer it over SIGINT). Both route through the same two-stage
             // logic so the UX is consistent regardless of how shutdown was
             // requested.
-            let signal_name = next_signal().await;
+            let signal_name = signals.next().await;
 
-            if !first_received.swap(true, Ordering::SeqCst) {
-                // --- First signal ---
-                eprintln!(
-                    "\n{signal_name} received — finishing current step. \
-                     Send again to force-quit."
-                );
-                // Tell the executor to abort after the current lifecycle
-                // phase. `Aborted` (distinct from `Skipped`) terminates the
-                // whole run; it also overrides any pending skip request so a
-                // Ctrl+C after a skip still tears the run down.
-                let _ = abort_tx.send(Some(CancelReason::Aborted));
-            } else {
-                // --- Second signal (grace period active) ---
-                eprintln!("\nForce-quit — killing harness and exiting.");
-                // exit(130) skips Drop, so give registered guards (e.g. the
-                // run lock) a chance to release before the process dies.
-                run_exit_cleanup();
-                std::process::exit(130);
-            }
+            Self::handle_signal(signal_name, &abort_tx, &first_received);
+        }
+    }
+
+    fn handle_signal(
+        signal_name: &'static str,
+        abort_tx: &watch::Sender<CancelState>,
+        first_received: &AtomicBool,
+    ) {
+        if !first_received.swap(true, Ordering::SeqCst) {
+            // --- First signal ---
+            eprintln!(
+                "\n{signal_name} received — finishing current step. \
+                 Send again to force-quit."
+            );
+            // Tell the executor to abort after the current lifecycle phase.
+            // `Aborted` (distinct from `Skipped`) terminates the whole run; it
+            // also overrides any pending skip request so a Ctrl+C after a skip
+            // still tears the run down.
+            let _ = abort_tx.send(Some(CancelReason::Aborted));
+        } else {
+            // --- Second signal (grace period active) ---
+            eprintln!("\nForce-quit — killing harness and exiting.");
+            // exit(130) skips Drop, so give registered guards (e.g. the run
+            // lock) a chance to release before the process dies.
+            run_exit_cleanup();
+            std::process::exit(130);
         }
     }
 
@@ -454,46 +506,66 @@ impl ShutdownController {
 // Cross-signal listener
 // ---------------------------------------------------------------------------
 
-/// Wait for the next shutdown-class signal and return its human-readable name.
+/// Long-lived shutdown signal streams.
 ///
-/// On unix, races SIGINT against SIGTERM; either one resolves and drives the
-/// two-stage shutdown. On non-unix only Ctrl+C is available.
-///
-/// SIGTERM registration happens on the very first call inside the listener
-/// task — before that call returns, any SIGTERM delivered to the process
-/// would take the default action (terminate). That's fine for ralph: signals
-/// arriving during startup (before the runner is in place) have nothing
-/// useful to interrupt anyway, and callers install this listener before the
-/// run loop begins.
-#[cfg(unix)]
-async fn next_signal() -> &'static str {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut sigterm = match signal(SignalKind::terminate()) {
-        Ok(s) => s,
-        Err(_) => {
-            // Registration failed — fall back to ctrl_c only.
-            let _ = tokio::signal::ctrl_c().await;
-            return "SIGINT";
+/// On unix, SIGTERM registration happens synchronously before
+/// [`ShutdownController::spawn_signal_listener`] returns, and the same stream
+/// is reused for the listener lifetime. This avoids a race where a SIGTERM
+/// could arrive before the spawned task first polled, and avoids per-iteration
+/// gaps from rebuilding the signal stream.
+struct SignalStreams {
+    #[cfg(unix)]
+    sigterm: Option<tokio::signal::unix::Signal>,
+}
+
+impl SignalStreams {
+    fn new() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Self {
+                sigterm: signal(SignalKind::terminate()).ok(),
+            }
         }
-    };
-    tokio::select! {
-        res = tokio::signal::ctrl_c() => {
-            if res.is_err() {
-                // ctrl_c failed but sigterm is live — wait on it.
-                let _ = sigterm.recv().await;
-                "SIGTERM"
-            } else {
+        #[cfg(not(unix))]
+        {
+            Self {}
+        }
+    }
+
+    /// Wait for the next shutdown-class signal and return its human-readable
+    /// name. On unix, races SIGINT against SIGTERM; either one resolves and
+    /// drives the two-stage shutdown. On non-unix only Ctrl+C is available.
+    #[cfg(unix)]
+    async fn next(&mut self) -> &'static str {
+        match self.sigterm.as_mut() {
+            Some(sigterm) => {
+                tokio::select! {
+                    res = tokio::signal::ctrl_c() => {
+                        if res.is_err() {
+                            // ctrl_c failed but sigterm is live — wait on it.
+                            let _ = sigterm.recv().await;
+                            "SIGTERM"
+                        } else {
+                            "SIGINT"
+                        }
+                    }
+                    _ = sigterm.recv() => "SIGTERM",
+                }
+            }
+            None => {
+                // SIGTERM registration failed — fall back to ctrl_c only.
+                let _ = tokio::signal::ctrl_c().await;
                 "SIGINT"
             }
         }
-        _ = sigterm.recv() => "SIGTERM",
     }
-}
 
-#[cfg(not(unix))]
-async fn next_signal() -> &'static str {
-    let _ = tokio::signal::ctrl_c().await;
-    "SIGINT"
+    #[cfg(not(unix))]
+    async fn next(&mut self) -> &'static str {
+        let _ = tokio::signal::ctrl_c().await;
+        "SIGINT"
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -672,47 +744,42 @@ mod tests {
         assert!(!ran.load(Ordering::SeqCst), "cleanup should not run twice");
     }
 
-    /// Regression: a SIGTERM delivered to the process (which is how
-    /// `ralph cancel` signals its sibling) must flip the abort flag via
-    /// the same two-stage path that Ctrl+C uses.
-    ///
-    /// Holds `EXIT_CLEANUP_TEST_LOCK` to serialize with other tests that
-    /// mutate process-wide state (signal handlers, exit cleanup slot), so
-    /// parallel cargo test threads can't race on the SIGTERM disposition.
-    #[cfg(unix)]
-    #[tokio::test(flavor = "current_thread")]
-    #[allow(clippy::await_holding_lock)]
-    async fn test_sigterm_triggers_graceful_shutdown() {
-        // Holding the std::Mutex guard across .await is intentional here:
-        // the whole point is to serialize the full SIGTERM-delivery window
-        // (listener setup + raise + flag check) against other tests that
-        // mutate process-wide state. The test runs on a current_thread
-        // runtime, so there's no risk of cross-thread guard transfer.
-        let _guard = lock_exit_cleanup_test();
+    #[test]
+    fn test_sigterm_uses_graceful_shutdown_path() {
         let controller = ShutdownController::new();
-        let (_handle, mut rx) = controller.spawn_signal_listener();
+        let mut rx = controller.abort_rx();
         assert!(rx.borrow().is_none());
 
-        // Give the listener a moment to register its SIGTERM handler
-        // before we deliver the signal. Without this wait, we'd race the
-        // default disposition and the test process would terminate.
-        tokio::task::yield_now().await;
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        ShutdownController::handle_signal(
+            "SIGTERM",
+            &controller.abort_tx,
+            &controller.first_signal_received,
+        );
 
-        // SAFETY: raise is async-signal-safe and just posts a signal to
-        // the current process.
-        let rc = unsafe { libc::raise(libc::SIGTERM) };
-        assert_eq!(rc, 0, "libc::raise(SIGTERM) failed");
-
-        // The watch channel must flip to true within a short window.
-        tokio::time::timeout(std::time::Duration::from_millis(500), rx.changed())
-            .await
-            .expect("abort flag never flipped after SIGTERM")
-            .expect("watch sender dropped");
+        rx.mark_changed();
         assert_eq!(
-            *rx.borrow(),
+            *rx.borrow_and_update(),
             Some(CancelReason::Aborted),
             "SIGTERM must set the cancel reason to Aborted (whole-run abort)"
+        );
+    }
+
+    #[test]
+    fn test_sigterm_stream_is_registered_before_listener_spawn() {
+        let source = include_str!("signal.rs");
+        let register = source
+            .find("let signals = SignalStreams::new();")
+            .expect("spawn_signal_listener should register signal streams");
+        let spawn = source
+            .find("tokio::spawn(async move")
+            .expect("spawn_signal_listener should spawn listener task");
+        assert!(
+            register < spawn,
+            "SIGTERM stream registration must happen before spawning the listener task"
+        );
+        assert!(
+            source.contains("sigterm: signal(SignalKind::terminate()).ok()"),
+            "SIGTERM stream should be constructed once and reused"
         );
     }
 

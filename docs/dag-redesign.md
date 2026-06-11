@@ -124,9 +124,11 @@ Key points:
 - **Deterministic test failure** feeds the (already line-truncated) test
   output into the next iteration's retry context — exactly today's
   mechanism, just now after a per-iteration commit.
-- **Review is read-only** with respect to the working tree (hard
-  invariant — §9). Its only side effect is *requesting a corrective
-  step* via the orchestrator.
+- **Review is read-only by contract** and runs from a throwaway detached
+  worktree pinned at the reviewed commit. This is defense-in-depth, not a
+  filesystem sandbox; reviewer harnesses are trusted processes. The
+  reviewer's only intended side effect is *requesting a corrective step*
+  via the orchestrator.
 
 ### 3.3 Step state machine
 
@@ -241,6 +243,13 @@ losing the per-step audit trail.
   without open interruption` mid-write — the §9 "single DAG writer"
   invariant holds across the auto-blocker path the same way it does for
   corrective-step insertion.
+- **Shared-worktree caveat.** Rollback/discard/cancel paths can preserve
+  pre-existing untracked files, but they cannot attribute tracked-file edits
+  in a single shared worktree. If a user edits tracked files while a run is
+  live, a later discard/cancel rollback may restore those files to `HEAD`, and
+  a crashed-runner residue commit may sweep them into a WIP commit. Stop or
+  detach the run, or use a separate worktree, before making manual tracked
+  edits.
 
 ### 3.5 Scheduler
 
@@ -515,10 +524,14 @@ problems the design avoids):
 1. **One implementation slot.** A semaphore of 1 guards the
    implement+test+commit phase. This *is* "implementation steps don't run
    in parallel."
-2. **Reviews are strictly read-only** w.r.t. the working tree. A review
-   runs `git show <sha>` against a fixed commit, never checks out, never
-   edits. This is the *entire reason* a review can run concurrently with
-   the next unrelated implementation.
+2. **Reviews are read-only by contract, not by filesystem confinement.** A
+   review runs in a throwaway detached worktree pinned at the reviewed
+   commit, and the reviewer prompt forbids edits. Git repository
+   redirection environment variables are scrubbed before spawning the
+   reviewer, but reviewer harnesses are trusted processes rather than
+   sandboxed ones. The concurrency guarantee relies on ordinary reviewers
+   not mutating the live implementation tree; the orchestrator still keeps
+   review verdict/DAG writes centralized.
 3. **Single DAG writer.** Only the orchestrator mutates the DAG
    (insert/re-parent steps, status). A review subprocess *requests* a
    corrective step via a structured channel (NDJSON event + a DB bridge

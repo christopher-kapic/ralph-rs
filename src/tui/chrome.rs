@@ -224,12 +224,15 @@ pub fn left_truncate(s: &str, max: usize) -> String {
         return ELLIPSIS.to_string();
     }
     let target = max - 1;
+    let mut used = 0;
     let mut start_byte = s.len();
-    for (i, _) in s.char_indices() {
-        if display_width(&s[i..]) <= target {
-            start_byte = i;
+    for (i, ch) in s.char_indices().rev() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w > target {
             break;
         }
+        used += w;
+        start_byte = i;
     }
     let mut out = String::with_capacity(s.len() - start_byte + ELLIPSIS.len_utf8());
     out.push(ELLIPSIS);
@@ -250,12 +253,14 @@ pub fn right_truncate(s: &str, max: usize) -> String {
     }
     let target = max - 1;
     let mut end_byte = 0;
-    for (i, _) in s.char_indices() {
-        if display_width(&s[..i]) <= target {
-            end_byte = i;
-        } else {
+    let mut used = 0;
+    for (i, ch) in s.char_indices() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w > target {
             break;
         }
+        used += w;
+        end_byte = i + ch.len_utf8();
     }
     let mut out = String::with_capacity(end_byte + ELLIPSIS.len_utf8());
     out.push_str(&s[..end_byte]);
@@ -263,8 +268,8 @@ pub fn right_truncate(s: &str, max: usize) -> String {
     out
 }
 
-fn display_width(s: &str) -> usize {
-    s.chars().count()
+pub fn display_width(s: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(s)
 }
 
 #[cfg(test)]
@@ -310,6 +315,13 @@ mod tests {
     }
 
     #[test]
+    fn left_truncate_respects_wide_glyph_columns() {
+        let out = left_truncate("abc界界", 5);
+        assert_eq!(display_width(&out), 5);
+        assert_eq!(out, "…界界");
+    }
+
+    #[test]
     fn left_truncate_zero_and_one_max() {
         assert_eq!(left_truncate("abcdef", 0), "");
         assert_eq!(left_truncate("abcdef", 1), "…");
@@ -327,6 +339,13 @@ mod tests {
     fn right_truncate_replaces_right_with_ellipsis() {
         assert_eq!(right_truncate("abcdef", 4), "abc…");
         assert_eq!(right_truncate("ralph › slug › step", 10), "ralph › s…");
+    }
+
+    #[test]
+    fn right_truncate_respects_wide_glyph_columns() {
+        let out = right_truncate("界界abc", 5);
+        assert_eq!(display_width(&out), 5);
+        assert_eq!(out, "界界…");
     }
 
     #[test]
@@ -489,7 +508,7 @@ mod tests {
                 breadcrumbs: &["ralph", "tui-v1"],
                 hint: "[j/k] nav  [q] quit",
                 cwd: Path::new("/tmp/proj"),
-                banner: Some("🔒 Read-only — run in progress (PID 4242). [S] cancel  [q] quit"),
+                banner: Some("🔒 Read-only — run in progress (PID 4242). [q] quit"),
                 running_indicator: None,
             },
         );

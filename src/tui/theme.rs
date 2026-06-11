@@ -1,8 +1,8 @@
 // Centralized color palette for the TUI (TUI-plan.md §12).
 //
-// All colors live as truecolor `Color::Rgb` constants. Terminals that don't
-// advertise truecolor degrade to the nearest 256-color match via ratatui's
-// default rendering path; we don't do explicit fallback here.
+// Most accent colors are truecolor `Color::Rgb` constants. Neutral/status
+// tokens that must remain visible on both light and dark terminal themes use
+// named ANSI colors instead of near-white RGB values.
 
 use ratatui::style::Color;
 
@@ -11,6 +11,9 @@ pub const CURSOR: Color = Color::Rgb(0xf7, 0xd1, 0x35);
 
 /// Multi-select border.
 pub const SELECTION: Color = Color::Rgb(0x56, 0xd0, 0xd9);
+
+/// Active list/pane border accent.
+pub const BORDER_ACTIVE: Color = SELECTION;
 
 /// Plan dot + step glyph when complete (docs/dag-redesign.md §12.5 —
 /// **unchanged**: complete stays green so the remap is small + additive).
@@ -30,11 +33,10 @@ pub const STATUS_IN_PROGRESS: Color = Color::Rgb(0xf7, 0xd1, 0x35);
 pub const STATUS_REVIEWING: Color = Color::Rgb(0x3b, 0x82, 0xf6);
 
 /// Plan dot + step glyph when waiting-for-turn / pending / never-run
-/// (docs/dag-redesign.md §12.5). A deliberately *bright* white —
-/// distinct from default body text so a waiting row still stands out on
-/// the dark theme (the old pending blue was reused as
-/// [`STATUS_REVIEWING`]).
-pub const STATUS_WAITING: Color = Color::Rgb(0xf5, 0xf7, 0xfa);
+/// (docs/dag-redesign.md §12.5). Dark gray is deliberately neutral and
+/// visible on light terminal themes; the old pending blue was reused as
+/// [`STATUS_REVIEWING`].
+pub const STATUS_WAITING: Color = Color::DarkGray;
 
 /// Plan dot + archived tile border; failed / review-failed
 /// (docs/dag-redesign.md §12.5 — **unchanged** red).
@@ -82,8 +84,8 @@ use crate::plan::{PlanStatus, StepStatus};
 /// `Blocked` overlay already applied via
 /// [`crate::plan::effective_step_status`]); `Blocked` maps to the new
 /// orange [`STATUS_BLOCKED`] (questions and blockers read identically).
-/// Pending/waiting-for-turn is the deliberately-bright [`STATUS_WAITING`]
-/// white. `Skipped` stays dim gray ([`CHROME_DIM`]) per §12.5.
+/// Pending/waiting-for-turn is the neutral [`STATUS_WAITING`]. `Skipped`
+/// stays dim gray ([`CHROME_DIM`]) per §12.5.
 pub fn step_status_color(status: StepStatus) -> Color {
     match status {
         StepStatus::Complete => STATUS_COMPLETE,
@@ -100,7 +102,7 @@ pub fn step_status_color(status: StepStatus) -> Color {
 /// `Interrupted` is the derived plan-level overlay (an open interruption
 /// — question *or* blocker — exists for some step); per §12.5 it goes
 /// orange ([`STATUS_BLOCKED`]) so it reads identically to a blocked step
-/// glyph. `Planning`/`Ready` (not-yet-run) is waiting-for-turn white;
+/// glyph. `Planning`/`Ready` (not-yet-run) is waiting-for-turn neutral;
 /// `Archived` joins failed/aborted on red (an archived tile border, as
 /// before). There is no plan-level "reviewing" status, so
 /// [`STATUS_REVIEWING`] is only reachable via [`step_status_color`].
@@ -119,17 +121,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn truecolor_constants_match_palette() {
+    fn palette_constants_match_contract() {
         // docs/dag-redesign.md §12.5 status-color table. Three tokens are
         // UNCHANGED (complete/in-progress/failed); the old pending-blue is
         // reused verbatim as STATUS_REVIEWING; STATUS_WAITING + STATUS_BLOCKED
         // are new; the purple STATUS_QUESTION is retired.
         assert_eq!(CURSOR, Color::Rgb(0xf7, 0xd1, 0x35));
         assert_eq!(SELECTION, Color::Rgb(0x56, 0xd0, 0xd9));
+        assert_eq!(BORDER_ACTIVE, SELECTION);
         assert_eq!(STATUS_COMPLETE, Color::Rgb(0x34, 0xd0, 0x58));
         assert_eq!(STATUS_IN_PROGRESS, Color::Rgb(0xf7, 0xd1, 0x35));
         assert_eq!(STATUS_REVIEWING, Color::Rgb(0x3b, 0x82, 0xf6));
-        assert_eq!(STATUS_WAITING, Color::Rgb(0xf5, 0xf7, 0xfa));
+        assert_eq!(STATUS_WAITING, Color::DarkGray);
         assert_eq!(STATUS_FAILED, Color::Rgb(0xef, 0x44, 0x44));
         assert_eq!(STATUS_BLOCKED, Color::Rgb(0xdb, 0x6d, 0x28));
         assert_eq!(TOAST_ERROR, Color::Rgb(0xef, 0x44, 0x44));
@@ -167,9 +170,9 @@ mod tests {
         // docs/dag-redesign.md §12.5: one state, one color. Every *status*
         // token must be visually distinguishable from every other status
         // token (CURSOR is deliberately excluded — it is a highlight, not a
-        // status; see `cursor_is_a_highlight_not_a_status_recolor`). White
-        // (STATUS_WAITING) in particular must differ from the others so a
-        // waiting row stands out on the dark theme.
+        // status; see `cursor_is_a_highlight_not_a_status_recolor`).
+        // STATUS_WAITING in particular must differ from the others so a
+        // waiting row stays legible without inheriting a semantic color.
         let tokens = [
             ("complete", STATUS_COMPLETE),
             ("in_progress", STATUS_IN_PROGRESS),
@@ -186,6 +189,14 @@ mod tests {
     }
 
     #[test]
+    fn waiting_color_is_light_theme_safe() {
+        assert_eq!(STATUS_WAITING, Color::DarkGray);
+        assert_ne!(STATUS_WAITING, Color::White);
+        assert_ne!(STATUS_WAITING, Color::Rgb(0xf5, 0xf7, 0xfa));
+        assert_ne!(STATUS_WAITING, CHROME_DIM);
+    }
+
+    #[test]
     fn step_status_color_maps_to_exact_125_hex() {
         // docs/dag-redesign.md §12.5 status-color table, step side.
         assert_eq!(
@@ -196,10 +207,7 @@ mod tests {
             step_status_color(StepStatus::InProgress),
             Color::Rgb(0xf7, 0xd1, 0x35)
         );
-        assert_eq!(
-            step_status_color(StepStatus::Pending),
-            Color::Rgb(0xf5, 0xf7, 0xfa)
-        );
+        assert_eq!(step_status_color(StepStatus::Pending), STATUS_WAITING);
         assert_eq!(
             step_status_color(StepStatus::Failed),
             Color::Rgb(0xef, 0x44, 0x44)
@@ -227,14 +235,8 @@ mod tests {
             plan_status_color(PlanStatus::InProgress),
             Color::Rgb(0xf7, 0xd1, 0x35)
         );
-        assert_eq!(
-            plan_status_color(PlanStatus::Planning),
-            Color::Rgb(0xf5, 0xf7, 0xfa)
-        );
-        assert_eq!(
-            plan_status_color(PlanStatus::Ready),
-            Color::Rgb(0xf5, 0xf7, 0xfa)
-        );
+        assert_eq!(plan_status_color(PlanStatus::Planning), STATUS_WAITING);
+        assert_eq!(plan_status_color(PlanStatus::Ready), STATUS_WAITING);
         assert_eq!(
             plan_status_color(PlanStatus::Failed),
             Color::Rgb(0xef, 0x44, 0x44)

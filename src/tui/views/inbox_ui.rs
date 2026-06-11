@@ -7,6 +7,7 @@
 // §12.4 ranked-answer / blocker modal on top.
 
 use std::path::Path;
+use std::time::Instant;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
@@ -15,18 +16,21 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::plan::{InterruptionKind, PlanStatus};
-use crate::tui::chrome::{self, Chrome};
+use crate::tui::chrome::{self, Chrome, display_width, right_truncate};
 use crate::tui::help;
 use crate::tui::theme;
 use crate::tui::views::answer_modal::{InterruptionFocus, InterruptionModal};
 use crate::tui::views::inbox::{InboxMode, InboxState};
 
+const LIST_BODY_PREVIEW_COLS: usize = 96;
+
 /// Render the whole inbox view.
-pub fn draw(frame: &mut Frame, app: &InboxState, project: &Path) {
+pub fn draw(frame: &mut Frame, app: &mut InboxState, project: &Path) {
+    app.toasts.prune(Instant::now());
     let badge = format!("inbox ({})", app.open_count());
     let crumbs: [&str; 2] = ["ralph", badge.as_str()];
     let hint = match app.mode() {
-        InboxMode::List => "[j/k] nav  [enter/a] answer all  [?] help  [q] back",
+        InboxMode::List => "[j/k/g/G] nav  [enter/a] answer all  [?] help  [q] back",
         InboxMode::RunThrough => {
             "[j/k] options  [tab] field  [f] freeform  [m] comment  [enter] resolve  [esc] list"
         }
@@ -39,9 +43,30 @@ pub fn draw(frame: &mut Frame, app: &InboxState, project: &Path) {
         render_interruption_modal(frame, frame.area(), modal);
     }
 
+    if let Some(toast) = app.toasts.current() {
+        render_toast_overlay(frame, frame.area(), &toast.text, toast.color);
+    }
+
     if app.help.is_visible() {
         help::render(frame, frame.area(), &help::for_inbox());
     }
+}
+
+fn render_toast_overlay(frame: &mut Frame, area: Rect, text: &str, color: ratatui::style::Color) {
+    let max_toast = area.width.saturating_sub(1).max(1);
+    let clipped = right_truncate(text, max_toast as usize);
+    let desired = display_width(&clipped).min(max_toast as usize) as u16;
+    if desired == 0 || area.height == 0 {
+        return;
+    }
+    let toast_area = Rect {
+        x: area.x,
+        y: area.y + area.height - 1,
+        width: desired,
+        height: 1,
+    };
+    let para = Paragraph::new(clipped).style(Style::default().fg(color));
+    frame.render_widget(para, toast_area);
 }
 
 fn draw_list(frame: &mut Frame, app: &InboxState, area: Rect) {
@@ -70,7 +95,9 @@ fn draw_list(frame: &mut Frame, app: &InboxState, area: Rect) {
             };
             let label = format!(
                 "{kind_glyph} [{}/{}] {}",
-                it.plan_slug, it.step_short_id, it.interruption.body
+                it.plan_slug,
+                it.step_short_id,
+                inbox_body_preview(&it.interruption.body)
             );
             let style = if it.is_open() {
                 // §12.5: an open interruption is the orange
@@ -99,6 +126,20 @@ fn draw_list(frame: &mut Frame, app: &InboxState, area: Rect) {
         )
         .highlight_symbol("> ");
     frame.render_stateful_widget(list, area, &mut ls);
+}
+
+fn inbox_body_preview(body: &str) -> String {
+    let multiline = body.lines().count() > 1;
+    let collapsed = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    let truncated = display_width(&collapsed) > LIST_BODY_PREVIEW_COLS;
+    let mut preview = right_truncate(&collapsed, LIST_BODY_PREVIEW_COLS);
+    if preview.is_empty() {
+        preview.push_str("(empty)");
+    }
+    if multiline || truncated {
+        preview = format!("[more: enter/a] {preview}");
+    }
+    preview
 }
 
 /// The §12.4 ranked-answer / blocker modal. Shared with step-detail's inline
@@ -266,7 +307,7 @@ mod tests {
         }
     }
 
-    fn render_to_string(app: &InboxState) -> String {
+    fn render_to_string(app: &mut InboxState) -> String {
         let backend = TestBackend::new(90, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, app, Path::new("/tmp"))).unwrap();
@@ -283,11 +324,11 @@ mod tests {
 
     #[test]
     fn renders_open_count_badge_and_items() {
-        let app = InboxState::new(vec![
+        let mut app = InboxState::new(vec![
             item("1", true, InterruptionKind::Question),
             item("2", false, InterruptionKind::Blocker),
         ]);
-        let out = render_to_string(&app);
+        let out = render_to_string(&mut app);
         assert!(out.contains("inbox (1)"), "badge missing:\n{out}");
         assert!(out.contains("Body 1"), "open item missing:\n{out}");
         assert!(
@@ -297,10 +338,55 @@ mod tests {
     }
 
     #[test]
+    fn list_row_marks_multiline_body_as_readable_in_modal() {
+        let mut it = item("1", true, InterruptionKind::Question);
+        it.interruption.body = "first line\nsecond line".to_string();
+        let mut app = InboxState::new(vec![it]);
+
+        let out = render_to_string(&mut app);
+
+        assert!(
+            out.contains("first line second line"),
+            "body collapsed:\n{out}"
+        );
+        assert!(
+            out.contains("[more: enter/a]"),
+            "multiline affordance missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn list_row_marks_long_body_as_truncated() {
+        let mut it = item("1", true, InterruptionKind::Question);
+        it.interruption.body = "x".repeat(LIST_BODY_PREVIEW_COLS + 20);
+        let mut app = InboxState::new(vec![it]);
+
+        let out = render_to_string(&mut app);
+
+        assert!(
+            out.contains("[more: enter/a]"),
+            "long-body affordance missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn body_preview_truncates_by_display_width() {
+        let preview = inbox_body_preview(&"界".repeat(LIST_BODY_PREVIEW_COLS));
+        assert!(
+            display_width(&preview) <= LIST_BODY_PREVIEW_COLS + display_width("[more: enter/a] "),
+            "wide-glyph preview must be display-width bounded: {preview:?}"
+        );
+        assert!(
+            preview.contains('…'),
+            "wide-glyph truncation should use the normal ellipsis marker: {preview:?}"
+        );
+    }
+
+    #[test]
     fn run_through_renders_modal_with_priority_options() {
         let mut app = InboxState::new(vec![item("1", true, InterruptionKind::Question)]);
         app.start_run_through();
-        let out = render_to_string(&app);
+        let out = render_to_string(&mut app);
         assert!(
             out.contains("Proposed answers"),
             "modal options header missing:\n{out}"
@@ -316,7 +402,7 @@ mod tests {
             it
         }]);
         app.start_run_through();
-        let out = render_to_string(&app);
+        let out = render_to_string(&mut app);
         assert!(
             out.contains("no options"),
             "blocker modal should say no options:\n{out}"
@@ -325,11 +411,21 @@ mod tests {
 
     #[test]
     fn empty_inbox_renders_placeholder() {
-        let app = InboxState::new(vec![]);
-        let out = render_to_string(&app);
+        let mut app = InboxState::new(vec![]);
+        let out = render_to_string(&mut app);
         assert!(
             out.contains("No interruptions"),
             "empty placeholder missing:\n{out}"
         );
+    }
+
+    #[test]
+    fn renders_toast_overlay() {
+        let mut app = InboxState::new(vec![item("1", true, InterruptionKind::Question)]);
+        app.push_toast("No $EDITOR set", crate::tui::toast::ToastKind::Error);
+
+        let out = render_to_string(&mut app);
+
+        assert!(out.contains("No $EDITOR set"), "toast missing:\n{out}");
     }
 }

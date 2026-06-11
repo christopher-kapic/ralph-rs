@@ -17,8 +17,11 @@ pub fn cmd_agents_list(out: &OutputContext) -> Result<()> {
         if out.format == OutputFormat::Json {
             println!("[]");
         } else {
-            eprintln!("Agents directory not found: {}", agents_dir.display());
-            eprintln!("Run `ralph init` to create it.");
+            out.status(format!(
+                "Agents directory not found: {}",
+                agents_dir.display()
+            ));
+            out.status("Run `ralph init` to create it.");
         }
         return Ok(());
     }
@@ -64,7 +67,7 @@ pub fn cmd_agents_list(out: &OutputContext) -> Result<()> {
     }
 
     if !found {
-        eprintln!("No agent files found in {}", agents_dir.display());
+        out.status(format!("No agent files found in {}", agents_dir.display()));
     }
 
     Ok(())
@@ -88,7 +91,7 @@ pub fn cmd_agents_show(name: &str, _out: &OutputContext) -> Result<()> {
 pub fn cmd_agents_create(
     name: &str,
     file: Option<&std::path::Path>,
-    _out: &OutputContext,
+    out: &OutputContext,
 ) -> Result<()> {
     validate_name(name)?;
     let agents_dir = config::agents_dir()?;
@@ -107,7 +110,7 @@ pub fn cmd_agents_create(
 
     std::fs::write(&path, &contents)
         .with_context(|| format!("Failed to write {}", path.display()))?;
-    eprintln!("Created agent file: {}", path.display());
+    out.status(format!("Created agent file: {}", path.display()));
     Ok(())
 }
 
@@ -142,7 +145,7 @@ Free-form context, links, or reminders for future runs.
     )
 }
 
-pub fn cmd_agents_delete(name: &str, _out: &OutputContext) -> Result<()> {
+pub fn cmd_agents_delete(name: &str, out: &OutputContext) -> Result<()> {
     validate_name(name)?;
     let agents_dir = config::agents_dir()?;
     let path = agents_dir.join(format!("{name}.md"));
@@ -152,7 +155,7 @@ pub fn cmd_agents_delete(name: &str, _out: &OutputContext) -> Result<()> {
     }
 
     std::fs::remove_file(&path).with_context(|| format!("Failed to delete {}", path.display()))?;
-    eprintln!("Deleted agent file: {name}");
+    out.status(format!("Deleted agent file: {name}"));
     Ok(())
 }
 

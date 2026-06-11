@@ -18,6 +18,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 
+use crate::tui::chrome::display_width;
 use crate::tui::theme;
 
 /// Maximum number of suggestion rows rendered above the bar. Caller-side
@@ -317,7 +318,7 @@ fn render_bar_row(frame: &mut Frame, area: Rect, state: &PaletteBarState) {
         return;
     }
     let prefix_str = format!("{} ", state.prefix);
-    let prefix_width = prefix_str.chars().count();
+    let prefix_width = display_width(&prefix_str);
 
     let before = &state.input[..state.cursor];
     let after_full = &state.input[state.cursor..];
@@ -348,7 +349,7 @@ fn render_bar_row(frame: &mut Frame, area: Rect, state: &PaletteBarState) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 
     // Also report the hardware cursor so well-behaved terminals draw it.
-    let cursor_col = area.x + prefix_width as u16 + before.chars().count() as u16;
+    let cursor_col = area.x + prefix_width as u16 + display_width(before) as u16;
     if cursor_col < area.x + area.width {
         frame.set_cursor_position((cursor_col, area.y));
     }

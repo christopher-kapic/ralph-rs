@@ -3,22 +3,88 @@
 // Every public function accepts a `workdir` parameter so callers can target any
 // working directory without mutating global state.
 
+use std::collections::HashSet;
+use std::io::Write;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+
+#[cfg(not(test))]
+use crate::config;
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Run a git command in `workdir` and return its stdout on success.
-fn git(workdir: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
+const GIT_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn git_output(workdir: &Path, args: &[&str]) -> Result<Output> {
+    git_output_from_command(workdir, args, Command::new("git"))
+}
+
+fn git_output_from_command(workdir: &Path, args: &[&str], mut command: Command) -> Result<Output> {
+    command
         .args(args)
         .current_dir(workdir)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    wait_git_output(command, args)
+}
+
+fn git_output_with_stdin(workdir: &Path, args: &[&str], stdin_bytes: &[u8]) -> Result<Output> {
+    let mut child = Command::new("git")
+        .args(args)
+        .current_dir(workdir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to spawn git {}", args.join(" ")))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(stdin_bytes)
+            .with_context(|| format!("failed to write stdin to git {}", args.join(" ")))?;
+    }
+
+    wait_git_child_output(child, args)
+}
+
+fn wait_git_output(mut command: Command, args: &[&str]) -> Result<Output> {
+    let child = command
+        .spawn()
         .with_context(|| format!("failed to execute git {}", args.join(" ")))?;
+    wait_git_child_output(child, args)
+}
+
+fn wait_git_child_output(mut child: std::process::Child, args: &[&str]) -> Result<Output> {
+    let started = Instant::now();
+    loop {
+        if child
+            .try_wait()
+            .with_context(|| format!("failed while waiting for git {}", args.join(" ")))?
+            .is_some()
+        {
+            return child
+                .wait_with_output()
+                .with_context(|| format!("git {} failed to run", args.join(" ")));
+        }
+        if started.elapsed() >= GIT_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait_with_output();
+            bail!("git {} timed out after {:?}", args.join(" "), GIT_TIMEOUT);
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Run a git command in `workdir` and return its stdout on success.
+fn git(workdir: &Path, args: &[&str]) -> Result<String> {
+    let output = git_output(workdir, args)?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -47,11 +113,7 @@ fn git(workdir: &Path, args: &[&str]) -> Result<String> {
 /// paths as `String` — truly non-UTF8 paths are still best-effort, but they
 /// are no longer silently merged or mis-split.
 fn git_bytes(workdir: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(workdir)
-        .output()
-        .with_context(|| format!("failed to execute git {}", args.join(" ")))?;
+    let output = git_output(workdir, args)?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -109,6 +171,16 @@ pub fn check_ref_format(branch_name: &str) -> Result<()> {
 
     if let Err(rule) = validate_refname(&format!("refs/heads/{branch_name}")) {
         bail!("invalid branch name '{branch_name}': {rule}");
+    }
+    Ok(())
+}
+
+fn check_revision_arg(arg: &str, label: &str) -> Result<()> {
+    if arg.trim().is_empty() {
+        bail!("invalid {label}: value is empty or whitespace-only");
+    }
+    if arg.starts_with('-') {
+        bail!("invalid {label} '{arg}': must not start with '-'");
     }
     Ok(())
 }
@@ -176,6 +248,7 @@ fn validate_refname(refname: &str) -> Result<(), &'static str> {
 
 /// Create a new branch and switch to it.
 pub fn create_and_checkout_branch(workdir: &Path, branch_name: &str) -> Result<()> {
+    check_ref_format(branch_name)?;
     git(workdir, &["checkout", "-b", branch_name])
         .with_context(|| format!("could not create and checkout branch '{branch_name}'"))?;
     Ok(())
@@ -183,6 +256,7 @@ pub fn create_and_checkout_branch(workdir: &Path, branch_name: &str) -> Result<(
 
 /// Check out an existing branch. Fails if the branch doesn't exist.
 pub fn checkout_branch(workdir: &Path, branch_name: &str) -> Result<()> {
+    check_ref_format(branch_name)?;
     git(workdir, &["checkout", branch_name])
         .with_context(|| format!("could not checkout branch '{branch_name}'"))?;
     Ok(())
@@ -190,15 +264,8 @@ pub fn checkout_branch(workdir: &Path, branch_name: &str) -> Result<()> {
 
 /// Return `true` if a local branch with the given name exists.
 pub fn branch_exists(workdir: &Path, branch_name: &str) -> Result<bool> {
-    let output = Command::new("git")
-        .args([
-            "show-ref",
-            "--verify",
-            "--quiet",
-            &format!("refs/heads/{branch_name}"),
-        ])
-        .current_dir(workdir)
-        .output()
+    let ref_name = format!("refs/heads/{branch_name}");
+    let output = git_output(workdir, &["show-ref", "--verify", "--quiet", &ref_name])
         .with_context(|| format!("failed to execute git show-ref for '{branch_name}'"))?;
     Ok(output.status.success())
 }
@@ -413,9 +480,16 @@ pub fn get_untracked_files(workdir: &Path) -> Result<Vec<String>> {
 /// untracked files that the user had in their working directory.
 pub fn stage_except(workdir: &Path, exclude: &[String]) -> Result<()> {
     git(workdir, &["add", "-A"]).context("git add -A failed")?;
-    for file in exclude {
-        git(workdir, &["reset", "HEAD", "--", file])
-            .with_context(|| format!("git reset HEAD -- '{file}' failed"))?;
+    if !exclude.is_empty() {
+        let mut args = Vec::with_capacity(3 + exclude.len());
+        args.extend(["reset", "HEAD", "--"]);
+        args.extend(exclude.iter().map(String::as_str));
+        git(workdir, &args).with_context(|| {
+            format!(
+                "git reset HEAD -- <{} excluded path(s)> failed",
+                exclude.len()
+            )
+        })?;
     }
     Ok(())
 }
@@ -435,7 +509,8 @@ pub fn commit_staged(workdir: &Path, message: &str) -> Result<()> {
 /// the agent's work forward as uncommitted changes. A later successful attempt
 /// then produces exactly one coherent `ralph:` step commit.
 pub fn reset_mixed_to(workdir: &Path, sha: &str) -> Result<()> {
-    git(workdir, &["reset", "--mixed", sha])
+    check_revision_arg(sha, "revision")?;
+    git(workdir, &["reset", "--mixed", sha, "--"])
         .with_context(|| format!("git reset --mixed {sha} failed"))?;
     Ok(())
 }
@@ -445,6 +520,12 @@ pub fn reset_mixed_to(workdir: &Path, sha: &str) -> Result<()> {
 /// Unstages the index back to HEAD, restores tracked files via
 /// `git restore .`, then selectively removes only untracked files that are
 /// NOT in the `preserve` list. Requires git >= 2.23.
+///
+/// Single-worktree warning: this cannot distinguish tracked-file edits made
+/// by the harness from tracked-file edits a user makes concurrently while the
+/// run is live. Any discard/cancel path that reaches this helper restores all
+/// tracked files to HEAD. Operators who need to edit tracked files during a
+/// run should stop/detach first or work in a separate worktree.
 pub fn rollback_except(workdir: &Path, preserve: &[String]) -> Result<()> {
     // Unstage everything first (index → HEAD; the working tree is left
     // alone by `git reset`). Without this, a file the harness *created and
@@ -476,8 +557,9 @@ fn remove_untracked_except(
     preserve: &[String],
     untracked: &[String],
 ) -> Result<()> {
+    let preserve: HashSet<&str> = preserve.iter().map(String::as_str).collect();
     for file in untracked {
-        if preserve.contains(file) {
+        if preserve.contains(file.as_str()) {
             continue;
         }
         let path = workdir.join(file);
@@ -525,11 +607,11 @@ pub fn list_stash_untracked_files(workdir: &Path, stash_sha: &str) -> Result<Vec
     // non-zero (and silent) when the revision doesn't resolve, which is the
     // legitimate "stash captured no untracked files" case on git versions
     // that omit the parent entirely.
-    let probe = Command::new("git")
-        .args(["rev-parse", "--verify", "--quiet", &untracked_ref])
-        .current_dir(workdir)
-        .output()
-        .with_context(|| format!("failed to execute git rev-parse {untracked_ref}"))?;
+    let probe = git_output(
+        workdir,
+        &["rev-parse", "--verify", "--quiet", &untracked_ref],
+    )
+    .with_context(|| format!("failed to execute git rev-parse {untracked_ref}"))?;
     if !probe.status.success() {
         return Ok(Vec::new());
     }
@@ -590,10 +672,8 @@ pub fn short_sha(workdir: &Path, sha: &str) -> String {
 /// forward commit.) `Ok(false)` if `sha` does not resolve at all (a
 /// reviewer GC'd / rewrote it away).
 pub fn is_ancestor_of_head(workdir: &Path, sha: &str) -> Result<bool> {
-    let status = Command::new("git")
-        .args(["merge-base", "--is-ancestor", sha, "HEAD"])
-        .current_dir(workdir)
-        .output()
+    check_revision_arg(sha, "revision")?;
+    let status = git_output(workdir, &["merge-base", "--is-ancestor", sha, "HEAD"])
         .with_context(|| format!("could not check ancestry of {sha} vs HEAD"))?;
     // `--is-ancestor` exits 0 = ancestor, 1 = not, other = error (e.g. a
     // bad/orphaned rev). Anything other than a clean 0 ⇒ not reachable.
@@ -612,6 +692,7 @@ pub fn is_ancestor_of_head(workdir: &Path, sha: &str) -> Result<bool> {
 /// mistaken for a second diff), keeping the §8/Decision-5 guarantee
 /// machine-checkable.
 pub fn show_commit_diff(workdir: &Path, sha: &str) -> Result<String> {
+    check_revision_arg(sha, "revision")?;
     git(
         workdir,
         &[
@@ -622,6 +703,7 @@ pub fn show_commit_diff(workdir: &Path, sha: &str) -> Result<String> {
             "--format=",
             "--patch",
             sha,
+            "--",
         ],
     )
     .with_context(|| format!("could not `git show` commit {sha}"))
@@ -633,6 +715,8 @@ pub fn show_commit_diff(workdir: &Path, sha: &str) -> Result<String> {
 /// already exists or the SHA is invalid; callers that need a "create-or-check
 /// out" semantic should handle that at the call site.
 pub fn create_branch_from_sha(workdir: &Path, branch_name: &str, sha: &str) -> Result<()> {
+    check_ref_format(branch_name)?;
+    check_revision_arg(sha, "revision")?;
     git(workdir, &["checkout", "-b", branch_name, sha])
         .with_context(|| format!("could not create branch '{branch_name}' rooted at {sha}"))?;
     Ok(())
@@ -643,8 +727,11 @@ pub fn create_branch_from_sha(workdir: &Path, branch_name: &str, sha: &str) -> R
 /// Fails if the merge cannot be completed (e.g. due to conflicts); the error
 /// message contains the git stderr so callers can surface it to the user.
 pub fn merge_sha(workdir: &Path, sha: &str) -> Result<()> {
-    git(workdir, &["merge", "--no-ff", sha])
-        .with_context(|| format!("could not merge {sha} into current branch"))?;
+    check_revision_arg(sha, "revision")?;
+    if let Err(e) = git(workdir, &["merge", "--no-ff", sha]) {
+        let _ = git(workdir, &["merge", "--abort"]);
+        return Err(e).with_context(|| format!("could not merge {sha} into current branch"));
+    }
     Ok(())
 }
 
@@ -698,18 +785,18 @@ pub fn stash_push_with_untracked(workdir: &Path, message: &str) -> Result<Option
 }
 
 /// Like [`stash_push_with_untracked`] but excludes the named paths from the
-/// stash via negative pathspecs (`:!<path>`). Used by the interruption-park
-/// path to keep the user's *pre-existing* untracked files in the working
-/// tree — they were never the harness's WIP, so we must not bury them on
-/// the stash stack (a later `git stash clear` or pop-conflict would lose
-/// them outright).
+/// stash via literal negative pathspecs (`:(exclude,literal)<path>`). Used
+/// by the interruption-park path to keep the user's *pre-existing*
+/// untracked files in the working tree — they were never the harness's WIP,
+/// so we must not bury them on the stash stack (a later `git stash clear` or
+/// pop-conflict would lose them outright).
 ///
 /// `exclude_paths` is a list of repo-relative paths (the same shape as
 /// [`get_untracked_files`] returns). When empty, this is byte-equivalent to
 /// [`stash_push_with_untracked`]. When non-empty, the spawned command is:
 ///
 /// ```text
-/// git stash push --include-untracked -m <message> -- ':!<p1>' ':!<p2>' ...
+/// git stash push --include-untracked -m <message> -- ':(exclude,literal)<p1>' ...
 /// ```
 ///
 /// `git stash push` with a pathspec restricts the stash to matching paths;
@@ -742,17 +829,15 @@ pub fn stash_push_with_untracked_except(
     if !exclude_paths.is_empty() {
         args.push("--".to_string());
         for path in exclude_paths {
-            // `:!<path>` is git's negative-pathspec literal exclude. Quoting
-            // here is unnecessary because we're passing each path as a
-            // separate argv entry rather than through a shell.
-            args.push(format!(":!{path}"));
+            // Negative pathspecs are wildmatch patterns by default; force a
+            // literal exclude so untracked names containing glob metacharacters
+            // stay in the preserve set they were classified into.
+            args.push(format!(":(exclude,literal){path}"));
         }
     }
 
-    let output = Command::new("git")
-        .args(&args)
-        .current_dir(workdir)
-        .output()
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let output = git_output(workdir, &arg_refs)
         .with_context(|| format!("failed to execute git stash push -m '{message}'"))?;
 
     if !output.status.success() {
@@ -799,10 +884,7 @@ pub fn stash_pop(workdir: &Path, stash_ref: &StashRef) -> Result<StashPopOutcome
     // 2. Apply the stash by its commit SHA. This lets us be robust to
     //    other stashes being pushed/popped between our push and pop — we
     //    always apply exactly the commit we created.
-    let apply = Command::new("git")
-        .args(["stash", "apply", stash_ref.as_str()])
-        .current_dir(workdir)
-        .output()
+    let apply = git_output(workdir, &["stash", "apply", stash_ref.as_str()])
         .with_context(|| format!("failed to execute git stash apply {}", stash_ref.as_str()))?;
 
     if !apply.status.success() {
@@ -822,10 +904,7 @@ pub fn stash_pop(workdir: &Path, stash_ref: &StashRef) -> Result<StashPopOutcome
     }
 
     // 3. Drop the named stash ref now that it's safely applied.
-    let drop_out = Command::new("git")
-        .args(["stash", "drop", &stash_ref_name])
-        .current_dir(workdir)
-        .output()
+    let drop_out = git_output(workdir, &["stash", "drop", &stash_ref_name])
         .with_context(|| format!("failed to execute git stash drop {stash_ref_name}"))?;
 
     if !drop_out.status.success() {
@@ -853,10 +932,7 @@ pub fn drop_stash(workdir: &Path, stash_ref: &StashRef) -> Result<bool> {
         None => return Ok(false),
     };
 
-    let drop_out = Command::new("git")
-        .args(["stash", "drop", &stash_ref_name])
-        .current_dir(workdir)
-        .output()
+    let drop_out = git_output(workdir, &["stash", "drop", &stash_ref_name])
         .with_context(|| format!("failed to execute git stash drop {stash_ref_name}"))?;
 
     if !drop_out.status.success() {
@@ -1103,23 +1179,7 @@ pub fn parse_skipped_step_trailer(workdir: &Path, sha: &str) -> Result<Option<St
 
     // `git interpret-trailers --parse` prints only the trailer block, one
     // `Key: value` per line. We feed the raw message on stdin.
-    use std::io::Write;
-    use std::process::Stdio;
-    let mut child = Command::new("git")
-        .args(["interpret-trailers", "--parse"])
-        .current_dir(workdir)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("failed to spawn git interpret-trailers")?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(raw.as_bytes())
-            .context("failed to write commit message to git interpret-trailers")?;
-    }
-    let output = child
-        .wait_with_output()
+    let output = git_output_with_stdin(workdir, &["interpret-trailers", "--parse"], raw.as_bytes())
         .context("git interpret-trailers --parse failed to run")?;
     if !output.status.success() {
         bail!(
@@ -1151,6 +1211,7 @@ pub fn parse_skipped_step_trailer(workdir: &Path, sha: &str) -> Result<Option<St
 /// `branch` is resolved with `git rev-list`, so it works whether or not the
 /// branch is currently checked out. Commits without the trailer are ignored.
 pub fn list_skip_wip_commits(workdir: &Path, branch: &str) -> Result<Vec<SkipWipCommit>> {
+    check_ref_format(branch)?;
     // `git rev-list` already yields newest-first.
     let shas = git(workdir, &["rev-list", branch])
         .with_context(|| format!("could not list commits on branch '{branch}'"))?;
@@ -1193,17 +1254,18 @@ pub enum RevertOutcome {
 /// `git revert --no-edit <sha>`.
 ///
 /// Handles the "already reverted" edge case: when the commit's changes are
-/// already absent, `git revert` either reports "nothing to commit" (empty
-/// revert) or conflicts. In both cases we abort the in-progress revert with
-/// `git revert --abort` (so the worktree/index is left clean) and return
-/// [`RevertOutcome::AlreadyReverted`] instead of a hard error. A genuine
-/// merge conflict from *unrelated* later work is still surfaced as an error
-/// after aborting.
+/// already absent, a failed revert leaves the tree unchanged after
+/// `git revert --abort`. We classify that by comparing tree object ids before
+/// and after cleanup, not by matching Git's localized human text. A genuine
+/// merge conflict from unrelated later work changes the tree/index during the
+/// failed revert and is still surfaced as an error after aborting.
 pub fn revert_commit(workdir: &Path, sha: &str) -> Result<RevertOutcome> {
-    let output = Command::new("git")
-        .args(["revert", "--no-edit", sha])
-        .current_dir(workdir)
-        .output()
+    let before_tree = git(workdir, &["rev-parse", "HEAD^{tree}"])
+        .context("could not snapshot tree before revert")?
+        .trim()
+        .to_string();
+    let command = Command::new("git");
+    let output = git_output_from_command(workdir, &["revert", "--no-edit", sha], command)
         .with_context(|| format!("failed to execute git revert {sha}"))?;
 
     if output.status.success() {
@@ -1219,23 +1281,16 @@ pub fn revert_commit(workdir: &Path, sha: &str) -> Result<RevertOutcome> {
     // tree isn't wedged regardless of which failure path we took.
     let revert_in_progress = workdir.join(".git").join("REVERT_HEAD").exists();
     if revert_in_progress {
-        // Best-effort abort; ignore its own failure (nothing left to abort).
-        let _ = Command::new("git")
-            .args(["revert", "--abort"])
-            .current_dir(workdir)
-            .output();
+        // Best-effort abort; preserve the original revert failure if cleanup
+        // itself fails.
+        let _ = git_output(workdir, &["revert", "--abort"]);
     }
 
-    // Effective no-op: the change is already gone. git phrases this as
-    // "nothing to commit" / "previous cherry-pick/revert is now empty" / a
-    // conflict where every hunk is already applied.
-    let lc = combined.to_lowercase();
-    if lc.contains("nothing to commit")
-        || lc.contains("nothing added to commit")
-        || lc.contains("is now empty")
-        || lc.contains("no changes")
-        || lc.contains("the previous cherry-pick is now empty")
-    {
+    let after_tree = git(workdir, &["rev-parse", "HEAD^{tree}"])
+        .context("could not snapshot tree after failed revert cleanup")?
+        .trim()
+        .to_string();
+    if before_tree == after_tree {
         return Ok(RevertOutcome::AlreadyReverted);
     }
 
@@ -1348,23 +1403,7 @@ pub fn parse_trailer(workdir: &Path, sha: &str, key: &str) -> Result<Option<Stri
     let raw = git(workdir, &["log", "-1", "--format=%B", sha])
         .with_context(|| format!("could not read commit message for {sha}"))?;
 
-    use std::io::Write;
-    use std::process::Stdio;
-    let mut child = Command::new("git")
-        .args(["interpret-trailers", "--parse"])
-        .current_dir(workdir)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("failed to spawn git interpret-trailers")?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(raw.as_bytes())
-            .context("failed to write commit message to git interpret-trailers")?;
-    }
-    let output = child
-        .wait_with_output()
+    let output = git_output_with_stdin(workdir, &["interpret-trailers", "--parse"], raw.as_bytes())
         .context("git interpret-trailers --parse failed to run")?;
     if !output.status.success() {
         bail!(
@@ -1439,10 +1478,7 @@ pub fn annotate_review_verdict(workdir: &Path, sha: &str, verdict: &str) -> Resu
 /// tests and `ralph log` to surface the *final* verdict rather than the
 /// commit-time placeholder.
 pub fn read_review_verdict(workdir: &Path, sha: &str) -> Result<Option<String>> {
-    let output = Command::new("git")
-        .args(["notes", "--ref", REVIEW_NOTES_REF, "show", sha])
-        .current_dir(workdir)
-        .output()
+    let output = git_output(workdir, &["notes", "--ref", REVIEW_NOTES_REF, "show", sha])
         .with_context(|| format!("failed to read review note for {sha}"))?;
     if !output.status.success() {
         // `git notes show` exits non-zero when there is no note — that is the
@@ -1471,6 +1507,7 @@ pub fn read_review_verdict(workdir: &Path, sha: &str) -> Result<Option<String>> 
 /// `branch` is resolved with `git rev-list`, so it works whether or not it
 /// is currently checked out — mirrors [`list_skip_wip_commits`].
 pub fn list_iteration_commits(workdir: &Path, branch: &str) -> Result<Vec<IterationCommit>> {
+    check_ref_format(branch)?;
     let shas = git(workdir, &["rev-list", branch])
         .with_context(|| format!("could not list commits on branch '{branch}'"))?;
     let mut out = Vec::new();
@@ -1519,6 +1556,7 @@ pub fn iteration_commits_for_step(
 pub fn files_touched_by_commits(workdir: &Path, shas: &[String]) -> Result<Vec<String>> {
     let mut seen = Vec::new();
     for sha in shas {
+        check_revision_arg(sha, "revision")?;
         let out = git(
             workdir,
             &["diff-tree", "--no-commit-id", "--name-only", "-r", sha],
@@ -1573,6 +1611,10 @@ pub fn order_shas_newest_first(
     if targets.is_empty() {
         return Ok(Vec::new());
     }
+    check_ref_format(branch)?;
+    for target in targets {
+        check_revision_arg(target, "revision")?;
+    }
     let want: std::collections::HashSet<&str> = targets.iter().map(String::as_str).collect();
     let shas = git(workdir, &["rev-list", branch])
         .with_context(|| format!("could not list commits on branch '{branch}'"))?;
@@ -1594,12 +1636,10 @@ pub fn order_shas_newest_first(
 /// `git worktree add --detach <path> <sha>` checks `sha`'s tree out into a
 /// brand-new, *physically separate* directory whose `HEAD` is detached at
 /// `sha`. The reviewer harness is run with its cwd set to that directory, so
-/// it is structurally incapable of touching the implementation's live working
-/// tree: `echo evil >> src/foo.rs` inside the reviewer lands in the throwaway
-/// directory, never in the shared `workdir` the next implementation commits
-/// from. This is the §9-inv-2 "reviews are strictly read-only w.r.t. the
-/// working tree" hard invariant enforced *structurally* rather than only
-/// detected after the fact.
+/// ordinary relative-path edits land in the throwaway directory, never in the
+/// shared `workdir` the next implementation commits from. This supports the
+/// §9-inv-2 read-only review contract as defense-in-depth; it is not a
+/// filesystem sandbox, so reviewer harnesses remain trusted processes.
 pub fn add_detached_worktree(workdir: &Path, path: &Path, sha: &str) -> Result<()> {
     git(
         workdir,
@@ -1627,14 +1667,9 @@ pub fn add_detached_worktree(workdir: &Path, path: &Path, sha: &str) -> Result<(
 pub fn remove_worktree(workdir: &Path, path: &Path) {
     // Best-effort: a failure here (already-removed dir, etc.) must not mask
     // the review outcome. We still prune unconditionally afterwards.
-    let _ = Command::new("git")
-        .args(["worktree", "remove", "--force", &path.to_string_lossy()])
-        .current_dir(workdir)
-        .output();
-    let _ = Command::new("git")
-        .args(["worktree", "prune"])
-        .current_dir(workdir)
-        .output();
+    let path_arg = path.to_string_lossy();
+    let _ = git_output(workdir, &["worktree", "remove", "--force", &path_arg]);
+    let _ = git_output(workdir, &["worktree", "prune"]);
     // Belt-and-suspenders: if `git worktree remove` could not delete the
     // directory (e.g. it was already detached from git's metadata), make sure
     // no throwaway tree is left on disk.
@@ -1647,10 +1682,10 @@ pub fn remove_worktree(workdir: &Path, path: &Path) {
 ///
 /// `ReviewWorktree`'s RAII `Drop` cleans up on every *normal* exit path, but
 /// a forceful second Ctrl+C (`std::process::exit(130)`) or an OS `SIGKILL`
-/// skips `Drop`, leaving a `<tmp>/ralph-review-*` directory and a
+/// skips `Drop`, leaving a `ralph-review-*` directory and a
 /// `.git/worktrees/` admin entry behind. Reviews are short-lived (a single
-/// read-only `git show` diff), so any `ralph-review-*` temp dir older than a
-/// few hours is unambiguously orphaned. We prune git's admin entries, then
+/// read-only `git show` diff), so any `ralph-review-*` directory older than
+/// a few hours is unambiguously orphaned. We prune git's admin entries, then
 /// remove on-disk dirs that are BOTH older than the threshold AND owned by a
 /// process that is no longer alive. The mtime-age guard makes this safe under
 /// a *concurrent* ralph run whose review started recently; the PID-liveness
@@ -1662,7 +1697,20 @@ pub fn sweep_stale_review_worktrees(main_repo: &Path) {
     // 6h: orders of magnitude longer than any real review, far short of
     // anything that would race a live concurrent review.
     const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
-    if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
+    for root in review_worktree_sweep_roots() {
+        sweep_stale_review_worktree_root(&root, STALE_AFTER);
+    }
+
+    // Prune *after* the removals so that the `.git/worktrees/*` admin
+    // entries for the directories we just deleted are reaped in the same
+    // sweep (not stranded until some later run prunes again). A single
+    // prune at the end also clears any entries whose directory was already
+    // gone for unrelated reasons, so this still covers the original intent.
+    let _ = git_output(main_repo, &["worktree", "prune"]);
+}
+
+fn sweep_stale_review_worktree_root(root: &Path, stale_after: std::time::Duration) {
+    if let Ok(entries) = std::fs::read_dir(root) {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
@@ -1674,7 +1722,7 @@ pub fn sweep_stale_review_worktrees(main_repo: &Path) {
                 .and_then(|m| m.modified())
                 .ok()
                 .and_then(|mtime| mtime.elapsed().ok())
-                .map(|age| age >= STALE_AFTER)
+                .map(|age| age >= stale_after)
                 .unwrap_or(false);
             // WHY: the mtime guard alone can reap a worktree out from under a
             // LIVE reviewer — a review that legitimately runs past the 6h
@@ -1691,16 +1739,41 @@ pub fn sweep_stale_review_worktrees(main_repo: &Path) {
             }
         }
     }
+}
 
-    // Prune *after* the removals so that the `.git/worktrees/*` admin
-    // entries for the directories we just deleted are reaped in the same
-    // sweep (not stranded until some later run prunes again). A single
-    // prune at the end also clears any entries whose directory was already
-    // gone for unrelated reasons, so this still covers the original intent.
-    let _ = Command::new("git")
-        .args(["worktree", "prune"])
-        .current_dir(main_repo)
-        .output();
+fn review_worktree_sweep_roots() -> Vec<std::path::PathBuf> {
+    let mut roots = Vec::with_capacity(2);
+    if let Ok(root) = review_worktree_root() {
+        roots.push(root);
+    }
+    // Legacy location used before review worktrees moved under the private
+    // ralph data directory. Keep sweeping it so old orphans are still reaped.
+    roots.push(std::env::temp_dir());
+    roots
+}
+
+fn review_worktree_root() -> Result<std::path::PathBuf> {
+    #[cfg(test)]
+    let root = std::env::temp_dir().join("ralph-rs-test-review-worktrees");
+    #[cfg(not(test))]
+    let root = config::data_dir()?.join("review-worktrees");
+    std::fs::create_dir_all(&root)
+        .with_context(|| format!("failed to create review worktree dir {}", root.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&root)
+            .with_context(|| format!("failed to stat review worktree dir {}", root.display()))?
+            .permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&root, perms).with_context(|| {
+            format!(
+                "failed to set review worktree dir permissions on {}",
+                root.display()
+            )
+        })?;
+    }
+    Ok(root)
 }
 
 /// Liveness guard for [`sweep_stale_review_worktrees`]: given a review
@@ -1719,7 +1792,7 @@ pub fn sweep_stale_review_worktrees(main_repo: &Path) {
 /// reviewer exited, its PID can be recycled by an unrelated process, in which
 /// case a genuinely-orphaned (>6h) dir reads as "alive" and is skipped this
 /// sweep. The consequence is a bounded, benign disk-space leak of one stale
-/// temp dir — never data loss, and the unconditional `git worktree prune` in
+/// worktree directory — never data loss, and the unconditional `git worktree prune` in
 /// the caller still reaps the admin entry — and a later sweep reaps the dir
 /// once the recycled PID frees up. We accept that over the alternative
 /// (reaping a dir out from under a live reviewer).
@@ -1765,8 +1838,8 @@ pub fn list_worktree_paths(workdir: &Path) -> Result<Vec<String>> {
 /// *always* torn down before the value goes away. There is no code path that
 /// creates one and leaks it on a normal exit (a `SIGKILL`/forceful-exit that
 /// skips `Drop` entirely is the backstop's job — see
-/// `sweep_stale_review_worktrees`). The path lives under the OS temp dir with
-/// a unique component so concurrent reviews never collide.
+/// `sweep_stale_review_worktrees`). The path lives under ralph's private data
+/// directory with a unique component so concurrent reviews never collide.
 pub struct ReviewWorktree {
     /// The main repository the linked worktree is attached to (where
     /// `git worktree remove/prune` must run).
@@ -1778,9 +1851,10 @@ pub struct ReviewWorktree {
 impl ReviewWorktree {
     /// Create a uniquely-named detached worktree of `main_repo` at `sha`.
     ///
-    /// The directory is `<tmp>/ralph-review-<pid>-<sha12>-<nanos>` so two
-    /// concurrent reviews (allowed by §3.5 item 3) never collide and a stale
-    /// dir from a crashed prior run can never be reused.
+    /// The directory is
+    /// `<data_dir>/review-worktrees/ralph-review-<pid>-<sha12>-<nanos>` so
+    /// two concurrent reviews (allowed by §3.5 item 3) never collide and a
+    /// stale dir from a crashed prior run can never be reused.
     pub fn create(main_repo: &Path, sha: &str) -> Result<Self> {
         let unique = format!(
             "ralph-review-{}-{}-{}",
@@ -1791,7 +1865,7 @@ impl ReviewWorktree {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0),
         );
-        let path = std::env::temp_dir().join(unique);
+        let path = review_worktree_root()?.join(unique);
         add_detached_worktree(main_repo, &path, sha)?;
         Ok(Self {
             main_repo: main_repo.to_path_buf(),
@@ -1814,7 +1888,7 @@ impl Drop for ReviewWorktree {
         // version detached the cleanup onto a background task and returned
         // immediately; on a short run that finalizes and exits promptly the
         // detached task could be cut off before it ran, leaking the
-        // `<tmp>/ralph-review-*` dir + its `.git/worktrees/` admin entry until
+        // `ralph-review-*` dir + its `.git/worktrees/` admin entry until
         // the 6h sweep reaped it. Running cleanup inline closes that leak.
         //
         // The hazard with a synchronous subprocess call is that `Drop` can run
@@ -1879,6 +1953,36 @@ mod tests {
         git(&dir, &["commit", "-m", "init"]).unwrap();
 
         (tmp, dir)
+    }
+
+    #[test]
+    fn test_git_helpers_are_timeout_bounded() {
+        let src = include_str!("git.rs");
+        assert!(
+            src.contains("const GIT_TIMEOUT: Duration = Duration::from_secs(60);"),
+            "git wrapper timeout constant must remain explicit"
+        );
+
+        let wait_start = src.find("fn wait_git_child_output").unwrap();
+        let wait_end = src[wait_start..]
+            .find("/// Run a git command")
+            .map(|offset| wait_start + offset)
+            .unwrap();
+        let wait_body = &src[wait_start..wait_end];
+        assert!(wait_body.contains("try_wait()"));
+        assert!(wait_body.contains("started.elapsed() >= GIT_TIMEOUT"));
+        assert!(wait_body.contains("child.kill()"));
+
+        let stdin_start = src.find("fn git_output_with_stdin").unwrap();
+        let stdin_end = src[stdin_start..]
+            .find("fn wait_git_output")
+            .map(|offset| stdin_start + offset)
+            .unwrap();
+        let stdin_body = &src[stdin_start..stdin_end];
+        assert!(
+            stdin_body.contains("wait_git_child_output(child, args)"),
+            "stdin-backed git commands must use the same timeout-bound wait path"
+        );
     }
 
     #[test]
@@ -2380,6 +2484,21 @@ mod tests {
         check_ref_format("trailing/").expect_err("a trailing-'/' branch must reject");
     }
 
+    #[test]
+    fn test_check_revision_arg_rejects_flag_like_values() {
+        for bad in ["", "   ", "--help", "-C"] {
+            let e = check_revision_arg(bad, "revision")
+                .expect_err(&format!("{bad:?} must be rejected"));
+            assert!(
+                e.to_string().contains("invalid revision"),
+                "rejection for {bad:?} must use the actionable framing: {e}"
+            );
+        }
+
+        check_revision_arg("HEAD", "revision").expect("symbolic revision should be accepted");
+        check_revision_arg("abc1234", "revision").expect("sha-like revision should be accepted");
+    }
+
     /// `validate_refname` is the pure rule core; pin the documented decision
     /// for the bare-ref forms (no `refs/heads/` prefix) so the encoding can't
     /// silently drift from git-check-ref-format(1).
@@ -2578,6 +2697,42 @@ mod tests {
         let status = git(&dir, &["status", "--porcelain"]).unwrap();
         assert!(status.contains("A  keep.txt"));
         assert!(status.contains("?? drop.txt"));
+    }
+
+    #[test]
+    fn test_stage_except_batches_multiple_excluded_files() {
+        let (_tmp, dir) = init_repo();
+        fs::write(dir.join("keep.txt"), "k").unwrap();
+        fs::write(dir.join("drop-a.txt"), "a").unwrap();
+        fs::write(dir.join("drop-b.txt"), "b").unwrap();
+
+        stage_except(&dir, &["drop-a.txt".to_string(), "drop-b.txt".to_string()]).unwrap();
+
+        let status = git(&dir, &["status", "--porcelain"]).unwrap();
+        assert!(status.contains("A  keep.txt"));
+        assert!(status.contains("?? drop-a.txt"));
+        assert!(status.contains("?? drop-b.txt"));
+    }
+
+    #[test]
+    fn test_stage_except_uses_single_batched_reset() {
+        let src = include_str!("git.rs");
+        let body = src
+            .split("pub fn stage_except(")
+            .nth(1)
+            .expect("stage_except exists")
+            .split("pub fn commit_staged(")
+            .next()
+            .expect("stage_except precedes commit_staged");
+
+        assert!(
+            !body.contains("for file in exclude"),
+            "stage_except must not spawn one git reset per excluded file"
+        );
+        assert!(
+            body.contains("args.extend(exclude.iter().map(String::as_str))"),
+            "stage_except should append excluded paths to one git reset invocation"
+        );
     }
 
     #[test]
@@ -2880,6 +3035,41 @@ mod tests {
         // Merging A into B should fail with conflicts.
         let result = merge_sha(&dir, &a_sha);
         assert!(result.is_err());
+        assert!(
+            !dir.join(".git").join("MERGE_HEAD").exists(),
+            "merge_sha must abort failed merges before returning"
+        );
+        let status = git(&dir, &["status", "--porcelain"]).unwrap();
+        assert!(
+            !has_conflict_marker(&status),
+            "merge_sha must not leave unmerged entries behind: {status:?}"
+        );
+    }
+
+    #[test]
+    fn test_revision_wrappers_include_pathspec_separator() {
+        let src = include_str!("git.rs");
+        let reset_start = src.find("pub fn reset_mixed_to").unwrap();
+        let reset_end = src[reset_start..]
+            .find("/// Rollback changes")
+            .map(|offset| reset_start + offset)
+            .unwrap();
+        let reset_body = &src[reset_start..reset_end];
+        assert!(
+            reset_body.contains(r#"["reset", "--mixed", sha, "--"]"#),
+            "reset_mixed_to should terminate revisions before any pathspecs"
+        );
+
+        let show_start = src.find("pub fn show_commit_diff").unwrap();
+        let show_end = src[show_start..]
+            .find("/// Create a new branch rooted")
+            .map(|offset| show_start + offset)
+            .unwrap();
+        let show_body = &src[show_start..show_end];
+        assert!(
+            show_body.contains(r#"sha,"#) && show_body.contains(r#""--","#),
+            "show_commit_diff should terminate the revision before any pathspecs"
+        );
     }
 
     // ----- park_changes -----
@@ -3100,6 +3290,24 @@ mod tests {
     }
 
     #[test]
+    fn test_revert_commit_noop_detection_is_tree_based() {
+        let src = include_str!("git.rs");
+        let start = src.find("pub fn revert_commit").unwrap();
+        let end = src[start..]
+            .find("// ---------------------------------------------------------------------------\n// Per-iteration")
+            .map(|offset| start + offset)
+            .unwrap();
+        let body = &src[start..end];
+
+        assert!(body.contains(r#"["rev-parse", "HEAD^{tree}"]"#));
+        assert!(body.contains("before_tree == after_tree"));
+        assert!(
+            !body.contains("nothing to commit") && !body.contains("is now empty"),
+            "revert no-op detection must not depend on localized Git messages"
+        );
+    }
+
+    #[test]
     fn test_revert_commit_not_on_head() {
         // Edge case: a later step committed on top of the WIP. Revert must
         // still work and must NOT touch the later commit's file.
@@ -3317,6 +3525,23 @@ mod tests {
             "ReviewWorktree::Drop must NOT detach cleanup onto spawn_blocking \
              / std::thread::spawn — a detached task can be cut off when a \
              short run exits before it runs, leaking the worktree",
+        );
+    }
+
+    #[test]
+    fn test_review_worktree_production_root_is_private_data_dir() {
+        let src = include_str!("git.rs");
+        assert!(
+            src.contains("config::data_dir()?.join(\"review-worktrees\")"),
+            "production review worktrees must live under ralph's private data dir"
+        );
+        assert!(
+            src.contains("roots.push(std::env::temp_dir());"),
+            "legacy /tmp review worktrees must still be swept"
+        );
+        assert!(
+            src.contains("perms.set_mode(0o700);"),
+            "review worktree root should be private on unix"
         );
     }
 }

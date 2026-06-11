@@ -24,6 +24,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState};
 
+use crate::tui::chrome::display_width;
 use crate::tui::help::{self, HelpState};
 use crate::tui::theme;
 use crate::tui::toast::{ToastKind, ToastQueue};
@@ -273,7 +274,7 @@ impl PlanDependenciesApp {
 // Rendering
 // ---------------------------------------------------------------------------
 
-const LIST_HINT: &str = " [a] add   [d] remove   [j/k] move   [q/Esc] back ";
+const LIST_HINT: &str = " [a] add   [d] remove   [I] inbox   [j/k] move   [q/Esc] back ";
 const PICKER_HINT: &str = " [Enter] add   [j/k] move   [Esc] cancel ";
 
 /// Draw the dependency table over `area`. When the picker is open, render the
@@ -431,10 +432,10 @@ fn centered_picker_rect(area: Rect, app: &PlanDependenciesApp) -> Rect {
     let max_label = app
         .candidates
         .iter()
-        .map(|c| c.slug.chars().count())
+        .map(|c| display_width(&c.slug))
         .max()
         .unwrap_or(0);
-    let body_w = max_label.max(PICKER_HINT.chars().count()) + 4;
+    let body_w = max_label.max(display_width(PICKER_HINT)) + 4;
     let desired_w = (body_w as u16).max(40).min(area.width);
     let row_count = app.candidates.len().max(1);
     let desired_h = ((row_count + 4) as u16).min(area.height);

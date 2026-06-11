@@ -5,6 +5,7 @@
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::time::Duration;
 
 use tokio::process::Command;
 use tokio::sync::watch;
@@ -20,6 +21,39 @@ use crate::signal::CancelState;
 /// draining *concurrently* with `child.wait()` keeps the pipe flowing past
 /// the ~64 KiB kernel buffer.
 const TEST_OUTPUT_TAIL_BYTES: usize = 1024 * 1024;
+
+/// Default wall-clock ceiling for each deterministic test command when the
+/// global harness timeout is unset. Tests are validation commands, not
+/// interactive sessions; production runs should never wait forever on one.
+pub const DEFAULT_TEST_TIMEOUT_SECS: u64 = 30 * 60;
+
+fn apply_minimal_child_env(command: &mut Command) {
+    let keep = [
+        "PATH",
+        "HOME",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "SHELL",
+        "USER",
+        "USERNAME",
+        "SYSTEMROOT",
+        "SystemRoot",
+        "COMSPEC",
+    ];
+    let preserved: Vec<(String, String)> = keep
+        .iter()
+        .filter_map(|key| {
+            std::env::var(key)
+                .ok()
+                .map(|value| ((*key).to_string(), value))
+        })
+        .collect();
+    command.env_clear();
+    for (key, value) in preserved {
+        command.env(key, value);
+    }
+}
 
 /// Result of a single test command execution.
 #[derive(Debug, Clone)]
@@ -82,6 +116,7 @@ const TAIL_LINES: usize = 50;
 /// * `cwd` – working directory for each command.
 /// * `abort_rx` – watch channel; when it flips to `true`, any running test is
 ///   killed and the run is reported as aborted.
+/// * `timeout` – optional wall-clock ceiling for each individual command.
 /// * `chunk_cfg` – when `Some`, each test command's stdout/stderr is also
 ///   streamed line-by-line through the sink (one emit per newline plus a
 ///   final flush of any unterminated trailing line). When `None`, no chunk
@@ -94,6 +129,7 @@ pub async fn run_tests(
     tests: &[String],
     cwd: &Path,
     abort_rx: watch::Receiver<CancelState>,
+    timeout: Option<Duration>,
     chunk_cfg: Option<TestChunkConfig>,
 ) -> TestResults {
     let mut results: Vec<TestResult> = Vec::with_capacity(tests.len());
@@ -114,7 +150,8 @@ pub async fn run_tests(
             .as_ref()
             .map(|cfg| build_test_emitters(cfg, i))
             .unwrap_or((None, None));
-        let (result, was_aborted) = run_single_test(cmd, cwd, abort_rx.clone(), emitters).await;
+        let (result, was_aborted) =
+            run_single_test(cmd, cwd, abort_rx.clone(), timeout, emitters).await;
         let passed = result.passed;
         results.push(result);
 
@@ -179,6 +216,7 @@ async fn run_single_test(
     cmd: &str,
     cwd: &Path,
     mut abort_rx: watch::Receiver<CancelState>,
+    timeout: Option<Duration>,
     emitters: (Option<io_util::ChunkEmitter>, Option<io_util::ChunkEmitter>),
 ) -> (TestResult, bool) {
     let mut command = Command::new("sh");
@@ -186,8 +224,15 @@ async fn run_single_test(
         .arg("-c")
         .arg(cmd)
         .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stderr(std::process::Stdio::piped())
+        // Defense-in-depth: normal timeout/abort paths explicitly kill and
+        // wait on the process group. `kill_on_drop(true)` covers future
+        // early-return or unwinding paths that might otherwise orphan the
+        // shell while its drain tasks still own the pipes.
+        .kill_on_drop(true);
+    apply_minimal_child_env(&mut command);
 
     // Put the child into its own process group so SIGKILL on abort fans out
     // to grandchildren (e.g. `cargo test` workers, `pnpm -> turbo -> next`).
@@ -272,6 +317,37 @@ async fn run_single_test(
                 }
             }
         }
+        _ = async {
+            if let Some(timeout) = timeout {
+                tokio::time::sleep(timeout).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => {
+            kill_test_child(&mut child).await;
+            let _ = child.wait().await;
+            let stdout = io_util::join_drain_string(stdout_task).await;
+            let stderr = io_util::join_drain_string(stderr_task).await;
+            let combined = combine(&stdout, &stderr);
+            let output_tail = if combined.is_empty() {
+                format!("timed out after {}s", timeout.map_or(0, |d| d.as_secs()))
+            } else {
+                format!(
+                    "timed out after {}s\n{}",
+                    timeout.map_or(0, |d| d.as_secs()),
+                    tail_lines(&combined, TAIL_LINES)
+                )
+            };
+            (
+                TestResult {
+                    command: cmd.to_string(),
+                    exit_code: None,
+                    output_tail,
+                    passed: false,
+                },
+                false,
+            )
+        }
         _ = wait_for_abort(&mut abort_rx) => {
             // SIGKILL the entire process group so grandchildren (test-runner
             // workers, etc.) die with the shell. Without this, orphans would
@@ -279,16 +355,7 @@ async fn run_single_test(
             // the drain tasks below would block on `read` until those
             // orphans exited on their own. See `executor::signal_process_group`
             // for the `-pid` convention.
-            #[cfg(unix)]
-            {
-                if let Some(pid) = child.id().and_then(|id| i32::try_from(id).ok()) {
-                    crate::executor::signal_process_group(pid, libc::SIGKILL);
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = child.kill().await;
-            }
+            kill_test_child(&mut child).await;
             let _ = child.wait().await;
             // With the whole pgroup killed, the pipes EOF promptly, so we
             // can await the drain tasks normally. The output isn't used on
@@ -306,6 +373,19 @@ async fn run_single_test(
                 true,
             )
         }
+    }
+}
+
+async fn kill_test_child(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Some(pid) = child.id().and_then(|id| i32::try_from(id).ok()) {
+            crate::executor::signal_process_group(pid, libc::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill().await;
     }
 }
 
@@ -378,7 +458,7 @@ mod tests {
     #[tokio::test]
     async fn test_all_pass() {
         let tests = vec!["true".to_string(), "echo hello".to_string()];
-        let res = run_tests(&tests, &cwd(), never_abort(), None).await;
+        let res = run_tests(&tests, &cwd(), never_abort(), None, None).await;
         assert!(res.all_passed);
         assert!(!res.aborted);
         assert_eq!(res.results.len(), 2);
@@ -390,13 +470,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_test_commands_do_not_inherit_caller_environment() {
+        // SAFETY: this test uses a uniquely named variable and removes it
+        // immediately after the child process completes.
+        unsafe {
+            std::env::set_var("RALPH_TEST_SECRET_ENV", "leaked");
+        }
+        let tests = vec!["printf '%s' \"${RALPH_TEST_SECRET_ENV-unset}\"".to_string()];
+        let res = run_tests(&tests, &cwd(), never_abort(), None, None).await;
+        // SAFETY: see set_var above.
+        unsafe {
+            std::env::remove_var("RALPH_TEST_SECRET_ENV");
+        }
+
+        assert!(res.all_passed);
+        assert_eq!(res.results[0].output_tail, "unset");
+    }
+
+    #[test]
+    fn test_run_single_test_sets_kill_on_drop() {
+        let src = include_str!("test_runner.rs");
+        let start = src.find("async fn run_single_test").unwrap();
+        let end = src[start..]
+            .find("// Spawn concurrent drain tasks")
+            .map(|offset| start + offset)
+            .unwrap();
+        let body = &src[start..end];
+
+        assert!(
+            body.contains(".kill_on_drop(true)"),
+            "deterministic test child must be kill_on_drop so dropped children cannot leak"
+        );
+    }
+
+    #[tokio::test]
     async fn test_first_failure_short_circuits() {
         let tests = vec![
             "true".to_string(),
             "false".to_string(),
             "echo should_not_run".to_string(),
         ];
-        let res = run_tests(&tests, &cwd(), never_abort(), None).await;
+        let res = run_tests(&tests, &cwd(), never_abort(), None, None).await;
         assert!(!res.all_passed);
         assert_eq!(res.results.len(), 2);
         assert_eq!(res.first_failure_index, Some(1));
@@ -407,7 +521,7 @@ mod tests {
     #[tokio::test]
     async fn test_captures_output() {
         let tests = vec!["echo hello_world".to_string()];
-        let res = run_tests(&tests, &cwd(), never_abort(), None).await;
+        let res = run_tests(&tests, &cwd(), never_abort(), None, None).await;
         assert!(res.all_passed);
         assert!(res.results[0].output_tail.contains("hello_world"));
     }
@@ -415,7 +529,7 @@ mod tests {
     #[tokio::test]
     async fn test_captures_stderr() {
         let tests = vec!["echo err_output >&2".to_string()];
-        let res = run_tests(&tests, &cwd(), never_abort(), None).await;
+        let res = run_tests(&tests, &cwd(), never_abort(), None, None).await;
         assert!(res.all_passed);
         assert!(res.results[0].output_tail.contains("err_output"));
     }
@@ -423,7 +537,7 @@ mod tests {
     #[tokio::test]
     async fn test_exit_code_nonzero() {
         let tests = vec!["exit 42".to_string()];
-        let res = run_tests(&tests, &cwd(), never_abort(), None).await;
+        let res = run_tests(&tests, &cwd(), never_abort(), None, None).await;
         assert!(!res.all_passed);
         assert_eq!(res.results[0].exit_code, Some(42));
         assert!(!res.results[0].passed);
@@ -456,7 +570,7 @@ mod tests {
     #[tokio::test]
     async fn test_empty_tests() {
         let tests: Vec<String> = vec![];
-        let res = run_tests(&tests, &cwd(), never_abort(), None).await;
+        let res = run_tests(&tests, &cwd(), never_abort(), None, None).await;
         assert!(res.all_passed);
         assert!(res.results.is_empty());
         assert!(res.first_failure_index.is_none());
@@ -467,7 +581,7 @@ mod tests {
     async fn test_respects_cwd() {
         let tests = vec!["pwd".to_string()];
         let dir = std::env::temp_dir();
-        let res = run_tests(&tests, &dir, never_abort(), None).await;
+        let res = run_tests(&tests, &dir, never_abort(), None, None).await;
         assert!(res.all_passed);
         let canonical = dir.canonicalize().unwrap();
         let output_canonical = PathBuf::from(res.results[0].output_tail.trim())
@@ -489,7 +603,7 @@ mod tests {
         });
 
         let start = std::time::Instant::now();
-        let res = run_tests(&tests, &cwd(), rx, None).await;
+        let res = run_tests(&tests, &cwd(), rx, None, None).await;
         let elapsed = start.elapsed();
 
         abort_handle.await.ok();
@@ -506,13 +620,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_timeout_interrupts_running_test() {
+        let tests = vec!["sleep 30".to_string()];
+
+        let start = std::time::Instant::now();
+        let res = run_tests(
+            &tests,
+            &cwd(),
+            never_abort(),
+            Some(Duration::from_millis(100)),
+            None,
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(!res.aborted, "timeout is a test failure, not run abort");
+        assert!(!res.all_passed);
+        assert_eq!(res.first_failure_index, Some(0));
+        assert_eq!(res.results.len(), 1);
+        assert!(!res.results[0].passed);
+        assert!(res.results[0].output_tail.contains("timed out after"));
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "timeout took too long: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_abort_before_start() {
         // Abort already set before run_tests is called: no test should run.
         let tests = vec!["echo should_not_run".to_string()];
         let (tx, rx) = watch::channel(None);
         let _ = tx.send(Some(crate::signal::CancelReason::Aborted));
 
-        let res = run_tests(&tests, &cwd(), rx, None).await;
+        let res = run_tests(&tests, &cwd(), rx, None, None).await;
         assert!(res.aborted);
         assert!(!res.all_passed);
         assert!(res.results.is_empty());
@@ -533,7 +674,7 @@ mod tests {
         let start = std::time::Instant::now();
         let res = tokio::time::timeout(
             Duration::from_secs(30),
-            run_tests(&tests, &cwd(), never_abort(), None),
+            run_tests(&tests, &cwd(), never_abort(), None, None),
         )
         .await
         .expect("test_runner should not deadlock on large output");
@@ -593,7 +734,7 @@ mod tests {
             "echo second-line; echo second-err >&2".to_string(),
         ];
         let (cfg, collected) = collecting_chunk_cfg(4096);
-        let res = run_tests(&tests, &cwd(), never_abort(), Some(cfg)).await;
+        let res = run_tests(&tests, &cwd(), never_abort(), None, Some(cfg)).await;
         assert!(res.all_passed, "tests should pass: {res:?}");
 
         let events = collected.lock().unwrap().clone();
@@ -666,7 +807,7 @@ mod tests {
         // We can't easily prove "no events" via the public sink API since
         // there is no sink to observe; we instead verify that the captured
         // tail behavior is preserved exactly as it was before.
-        let res = run_tests(&tests, &cwd(), never_abort(), None).await;
+        let res = run_tests(&tests, &cwd(), never_abort(), None, None).await;
         assert!(res.all_passed);
         assert!(res.results[0].output_tail.contains("no-stream"));
     }

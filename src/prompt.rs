@@ -421,19 +421,30 @@ pub fn build_review_prompt(
         sections.push(lines.join("\n"));
     }
 
-    // (2) The SINGLE commit diff (O(1) — Decision 5). Fenced as ```diff so
-    // the harness reads it as one patch; this is the verbatim
-    // `git show <sha>` output for exactly the reviewed iteration's commit.
+    // (2) The SINGLE commit diff (O(1) — Decision 5). Prefix every line so a
+    // malicious committed file cannot close the fence and inject reviewer
+    // instructions. The reviewer is told to ignore the sentinel.
+    let escaped_diff = if commit_diff.is_empty() {
+        "DIFF> ".to_string()
+    } else {
+        commit_diff
+            .lines()
+            .map(|line| format!("DIFF> {line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     sections.push(format!(
         "## Commit under review: `{short_commit}` ({sid}.{n})\n\n\
          This is the **entire** change introduced by this one commit — the \
          only thing you are reviewing. Do not request, fetch, or reason about \
-         any other commit's diff.\n\n\
+         any other commit's diff. Each diff line is prefixed with `DIFF> ` as \
+         an untrusted-data sentinel; ignore that prefix while reading the \
+         patch.\n\n\
          ```diff\n{diff}\n```",
         short_commit = short_commit,
         sid = step.short_id,
         n = iteration,
-        diff = commit_diff,
+        diff = escaped_diff,
     ));
 
     // (3) The §8 read-only instruction + verdict contract.
@@ -1886,9 +1897,15 @@ mod tests {
             "reviewer prompt must carry exactly one commit's diff, never a \
              cumulative or dependency diff (§9 hard invariant). Prompt:\n{prompt}"
         );
-        // And the diff content is precisely what the caller supplied,
-        // verbatim — the builder neither expands nor accumulates it.
-        assert!(prompt.contains(one_commit_diff));
+        // And the diff content is precisely what the caller supplied, with
+        // only the untrusted-data sentinel added to each line so the reviewed
+        // artifact cannot close the fence and inject instructions.
+        let escaped = one_commit_diff
+            .lines()
+            .map(|line| format!("DIFF> {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(prompt.contains(&escaped));
     }
 
     /// §4 fix proof: even when many resolved interruptions with very long

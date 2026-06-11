@@ -62,17 +62,34 @@ pub const RETRY_EXHAUSTED_OPTION_FAIL: &str = "Mark step Failed";
 /// so the most recent (and usually most relevant) lines survive.
 const RETRY_EXHAUSTED_BODY_MAX_BYTES: usize = 8 * 1024;
 
-/// Truncate `text` to `max_bytes`, keeping the **tail** and prefixing an
-/// elision marker. Chosen over a head-keeping truncation because the *last*
-/// lines of a test/hook output usually carry the actual failure (assertion
-/// text, exit-code line) — head-keeping would lose them. UTF-8-safe via
-/// `char_indices()`: we never slice mid-codepoint.
+/// Truncate `text` to at most `max_bytes`, keeping the **tail** and prefixing
+/// an elision marker when it fits inside the cap. Chosen over a head-keeping
+/// truncation because the *last* lines of a test/hook output usually carry the
+/// actual failure (assertion text, exit-code line) — head-keeping would lose
+/// them. UTF-8-safe via `char_indices()`: we never slice mid-codepoint.
 fn truncate_tail_bytes(text: &str, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
         return text.to_string();
     }
-    // Find the largest start offset i such that `text.len() - i <= max_bytes`
-    // AND i lies on a char boundary. Walk from the tail backwards.
+    if max_bytes == 0 {
+        return String::new();
+    }
+
+    let marker = |elided_bytes: usize| format!("... ({elided_bytes} bytes elided from head) ...\n");
+
+    for (cut, _) in text.char_indices() {
+        if cut == 0 {
+            continue;
+        }
+        let marker = marker(cut);
+        let tail = &text[cut..];
+        if marker.len() + tail.len() <= max_bytes {
+            return format!("{marker}{tail}");
+        }
+    }
+
+    // Degenerate tiny cap: the marker cannot fit, so return the largest
+    // UTF-8-safe tail that fits the hard cap.
     let target = text.len().saturating_sub(max_bytes);
     let mut cut = text.len();
     for (i, _) in text.char_indices() {
@@ -81,11 +98,7 @@ fn truncate_tail_bytes(text: &str, max_bytes: usize) -> String {
             break;
         }
     }
-    let elided_bytes = cut;
-    format!(
-        "... ({elided_bytes} bytes elided from head) ...\n{}",
-        &text[cut..]
-    )
+    text[cut..].to_string()
 }
 
 /// Render a single test-command result for the execution-log `test_results`
@@ -141,7 +154,7 @@ fn build_retry_exhausted_body(
     max_attempts: i32,
     failure_reason: FailureReason,
     failure_output: &FailureOutput<'_>,
-) -> String {
+) -> Result<String> {
     const HEADER_RESERVE: usize = 256;
 
     // Resolve the step's current cycle, then take the last 3 attempts
@@ -154,9 +167,10 @@ fn build_retry_exhausted_body(
             rusqlite::params![step_id],
             |r| r.get(0),
         )
-        .unwrap_or(0);
+        .with_context(|| format!("failed to read current retry cycle for step '{step_id}'"))?;
 
-    let all_logs = storage::list_execution_logs_for_step(conn, step_id).unwrap_or_default();
+    let all_logs = storage::list_execution_logs_for_step(conn, step_id)
+        .with_context(|| format!("failed to read execution logs for step '{step_id}'"))?;
     let mut cycle_logs: Vec<_> = all_logs
         .into_iter()
         .filter(|l| l.cycle_index == current_cycle)
@@ -177,6 +191,11 @@ fn build_retry_exhausted_body(
         FailureReason::InsufficientDiskSpace => format!(
             "Step blocked: insufficient disk space (see attempt detail below). Free up disk \
              space and resolve with `{RETRY_EXHAUSTED_OPTION_RETRY}` to resume with the parked changes.\n",
+        ),
+        FailureReason::RetryBudgetExhausted => format!(
+            "Step is already at its retry budget ({max_attempts} attempts). Resolve with \
+             `{RETRY_EXHAUSTED_OPTION_RETRY}` to retry from scratch, or \
+             `{RETRY_EXHAUSTED_OPTION_FAIL}` to mark it failed.\n",
         ),
         _ => format!("Step failed after {max_attempts} attempts.\n"),
     };
@@ -218,7 +237,7 @@ fn build_retry_exhausted_body(
     body.push_str(&sections.join("\n\n"));
     // Final hard cap — even after per-attempt slicing the section count and
     // per-section overhead could in theory push us over; tail-truncate.
-    truncate_tail_bytes(&body, RETRY_EXHAUSTED_BODY_MAX_BYTES)
+    Ok(truncate_tail_bytes(&body, RETRY_EXHAUSTED_BODY_MAX_BYTES))
 }
 
 // ---------------------------------------------------------------------------
@@ -312,6 +331,9 @@ pub struct ExecuteOptions {
     /// interruption stash, so any untracked files now visible are step-owned
     /// WIP rather than pre-existing user files that should be preserved.
     pub resumed_parked_worktree: bool,
+    /// Preserve list captured when the restored parked stash was originally
+    /// created. Used if the resumed step parks again.
+    pub resumed_preserve_files: Vec<String>,
 }
 
 impl Default for ExecuteOptions {
@@ -325,6 +347,7 @@ impl Default for ExecuteOptions {
             chunk_seq: None,
             chunk_max_bytes: 4096,
             resumed_parked_worktree: false,
+            resumed_preserve_files: Vec::new(),
         }
     }
 }
@@ -430,6 +453,9 @@ enum FailureReason {
     /// [`raise_retry_exhausted_blocker`] as a recoverable auto-blocker so a
     /// transient FS hiccup doesn't permanently fail the step.
     InsufficientDiskSpace,
+    /// The step was already at or above its retry budget before this run
+    /// picked it. This is fenced per-step instead of aborting the whole run.
+    RetryBudgetExhausted,
 }
 
 impl FailureReason {
@@ -457,6 +483,7 @@ impl FailureReason {
             Self::HarnessFailed => "harness_failed",
             Self::CommitFailed => "commit_failed",
             Self::InsufficientDiskSpace => "insufficient_disk_space",
+            Self::RetryBudgetExhausted => "retry_budget_exhausted",
         }
     }
 }
@@ -752,6 +779,16 @@ fn attempt_cancelled_event(ctx: &ExecCtx<'_>, attempt: i32) -> crate::output::Ru
     }
 }
 
+fn skip_request_ignored_event(ctx: &ExecCtx<'_>, attempt: i32) -> crate::output::RunEvent {
+    crate::output::RunEvent::SkipRequestIgnored {
+        step_id: ctx.step.id.clone(),
+        step_num: ctx.step_num.max(0) as usize,
+        attempt,
+        reason: "attempt already completed before the skip request could interrupt it".to_string(),
+        at: chrono::Utc::now(),
+    }
+}
+
 fn cancel_skipped_attempt(ctx: &ExecCtx<'_>, exec_log_id: i64, attempt: i32) -> Result<()> {
     // 1. Roll back the killed harness's work, preserving the user's
     //    pre-existing untracked files. A clean tree makes this a no-op.
@@ -936,7 +973,7 @@ async fn finalize_skipped(ctx: &ExecCtx<'_>, args: SkippedArgs<'_>) -> Result<St
     let dependent_count = storage::list_step_dependents(ctx.conn, &ctx.step.id)?.len();
     if dependent_count > 0 && !ctx.json_output {
         eprintln!(
-            "warning: skipped step {} '{}' has {} dependent step(s); that branch will remain blocked until you reset, remove, or rewire those dependents",
+            "warning: skipped step {} '{}' has {} dependent step(s); a Skipped step satisfies its outgoing edges, so that branch will proceed as if this step had completed",
             ctx.step_num, ctx.step.title, dependent_count
         );
     }
@@ -1057,6 +1094,109 @@ async fn handle_skipped_attempt(
     Ok(SkipDisposition::Finalized(result))
 }
 
+/// Recover from the narrow post-commit/pre-DB crash window.
+///
+/// If Ralph created the per-step git commit and then crashed before writing
+/// `execution_logs.commit_hash`, the stale-run sweep has no durable DB proof
+/// and would otherwise requeue the step for implementation. The commit
+/// trailer is still durable on the branch, so recreate the successful DB
+/// state and return the normal success shape instead of making a second
+/// commit for the same step.
+async fn recover_existing_iteration_commit(
+    ctx: &ExecCtx<'_>,
+    config: &Config,
+) -> Result<Option<StepResult>> {
+    if storage::committed_review_target(ctx.conn, &ctx.step.id)?.is_some() {
+        return Ok(None);
+    }
+
+    let commits = match git::iteration_commits_for_step(
+        ctx.workdir,
+        &ctx.plan.branch_name,
+        &ctx.step.short_id,
+    ) {
+        Ok(commits) => commits,
+        Err(_) => return Ok(None),
+    };
+    let Some(commit) = commits.into_iter().next() else {
+        return Ok(None);
+    };
+
+    let log = storage::create_execution_log(ctx.conn, &ctx.step.id, commit.iteration, None, None)?;
+    let success_test_status = if ctx.plan.deterministic_tests.is_empty() {
+        TestStatus::NotConfigured
+    } else {
+        TestStatus::Passed
+    };
+    storage::update_execution_log(
+        ctx.conn,
+        log.id,
+        crate::storage::ExecutionLogUpdate {
+            duration_secs: Some(0.0),
+            test_results: &[],
+            committed: true,
+            commit_hash: Some(&commit.sha),
+            termination_reason: Some(TerminationReason::Success),
+            test_status: Some(success_test_status),
+            ..Default::default()
+        },
+    )?;
+    set_step_attempts(ctx.conn, &ctx.step.id, commit.iteration)?;
+
+    let review_on = crate::config::effective_review_enabled(ctx.step, ctx.plan, config);
+    let needs_review = if review_on {
+        storage::update_step_status(ctx.conn, &ctx.step.id, StepStatus::InProgress)?;
+        storage::update_step_review_status(
+            ctx.conn,
+            &ctx.step.id,
+            crate::plan::ReviewStatus::Pending,
+        )?;
+        Some((commit.sha.clone(), commit.iteration))
+    } else {
+        storage::update_step_review_status(
+            ctx.conn,
+            &ctx.step.id,
+            crate::plan::ReviewStatus::Disabled,
+        )?;
+        storage::update_step_status(ctx.conn, &ctx.step.id, StepStatus::Complete)?;
+        None
+    };
+
+    write_phase(
+        ctx.conn,
+        PhaseWrite {
+            plan: ctx.plan,
+            step_id: &ctx.step.id,
+            step_num: ctx.step_num,
+            attempt: commit.iteration,
+            max_attempts: ctx.max_attempts,
+            execution_log_id: Some(log.id),
+            phase: Phase::PostStepHook,
+            current_command: None,
+            child: ChildUpdate::Clear,
+            json_output: ctx.json_output,
+        },
+    )?;
+    hooks::run_post_step(
+        ctx.conn,
+        ctx.hook_ctx,
+        ctx.plan,
+        ctx.step,
+        commit.iteration,
+        "complete",
+        ctx.workdir,
+    )
+    .await?;
+
+    Ok(Some(StepResult {
+        outcome: StepOutcome::Success,
+        step_id: ctx.step.id.clone(),
+        attempts_used: commit.iteration,
+        commit_hash: Some(commit.sha),
+        needs_review,
+    }))
+}
+
 /// Finalize an attempt that the harness ended by raising an interruption
 /// (an open `interruptions` row — a `ralph question ask` *or* a `ralph
 /// block` — for this (step, attempt)). The cross-process bridge of
@@ -1084,7 +1224,7 @@ async fn handle_skipped_attempt(
 /// side effect) with [`commit_park_atomically`] (the transactional pointer
 /// write) so the two can be made consistent: the stash is restored if the
 /// transaction that would have recorded it fails to commit.
-type ParkedStash = (git::StashRef, Vec<String>);
+type ParkedStash = (git::StashRef, Vec<String>, Vec<String>);
 
 /// Push the step's in-flight WIP onto the git stash so the working tree is
 /// clean while the branch is parked awaiting a human. This is a **pure git
@@ -1122,7 +1262,11 @@ fn stash_step_worktree_for_interruption(
     else {
         return Ok(None);
     };
-    Ok(Some((stash_ref, staged_files)))
+    Ok(Some((
+        stash_ref,
+        staged_files,
+        ctx.pre_existing_untracked.to_vec(),
+    )))
 }
 
 /// Pop a stash created by [`stash_step_worktree_for_interruption`] back onto
@@ -1131,7 +1275,7 @@ fn stash_step_worktree_for_interruption(
 /// committed — so the WIP returns to the tree (and staged files are re-staged)
 /// rather than being stranded in a dangling stash with no pointer.
 fn restore_parked_stash(ctx: &ExecCtx<'_>, parked: &ParkedStash) -> Result<()> {
-    let (stash_ref, staged_files) = parked;
+    let (stash_ref, staged_files, _) = parked;
     match git::stash_pop(ctx.workdir, stash_ref)? {
         git::StashPopOutcome::Clean => {
             if !staged_files.is_empty() {
@@ -1169,8 +1313,14 @@ fn commit_park_atomically<T>(
     let result = (|| -> Result<T> {
         let tx = ctx.conn.unchecked_transaction()?;
         let value = write(&tx)?;
-        if let Some((stash_ref, staged_files)) = &parked {
-            storage::set_step_parked_worktree(&tx, &ctx.step.id, stash_ref.as_str(), staged_files)?;
+        if let Some((stash_ref, staged_files, preserve_files)) = &parked {
+            storage::set_step_parked_worktree(
+                &tx,
+                &ctx.step.id,
+                stash_ref.as_str(),
+                staged_files,
+                preserve_files,
+            )?;
         }
         tx.commit()?;
         Ok(value)
@@ -1335,6 +1485,7 @@ async fn raise_retry_exhausted_blocker(
             FailureReason::TestFailed
                 | FailureReason::CommitFailed
                 | FailureReason::InsufficientDiskSpace
+                | FailureReason::RetryBudgetExhausted
         ),
         "raise_retry_exhausted_blocker must only be called for retryable \
          failure modes (TestFailed / CommitFailed / InsufficientDiskSpace); \
@@ -1362,6 +1513,7 @@ async fn raise_retry_exhausted_blocker(
         FailureReason::TestFailed => TestStatus::Failed,
         FailureReason::CommitFailed => TestStatus::NotRun,
         FailureReason::InsufficientDiskSpace => TestStatus::NotRun,
+        FailureReason::RetryBudgetExhausted => TestStatus::NotRun,
         _ => TestStatus::NotRun,
     };
     // Insert + park atomically. A scheduler tick observing
@@ -1441,7 +1593,7 @@ async fn raise_retry_exhausted_blocker(
             ctx.max_attempts,
             failure_reason,
             failure_output,
-        );
+        )?;
 
         let interruption_id = storage::insert_interruption(
             tx,
@@ -1608,28 +1760,7 @@ pub async fn execute_step(args: ExecuteStepArgs<'_>) -> Result<StepResult> {
         .unwrap_or(config.max_retries_per_step as i32);
     let max_attempts = max_retries + 1; // first attempt + retries
 
-    // Refuse to run a step that has already exhausted its retry budget.
-    // Without this guard, the retry loop would skip its body entirely and
-    // silently return Failed with zero new work — the user wouldn't know
-    // why nothing happened. Require an explicit reset or wider budget.
-    if step.attempts >= max_attempts {
-        bail!(
-            "Step '{}' has already used all {} attempts — run \
-             `ralph step reset --step-id {}` to retry from scratch, \
-             or raise --max-retries",
-            step.title,
-            max_attempts,
-            step.id,
-        );
-    }
-
     let timeout = config.timeout_secs.map(Duration::from_secs);
-
-    // Resolve harness once (doesn't change between retries).
-    let (harness_name, harness_config) = harness::resolve_harness(step, plan, config)?;
-
-    // Resolve agent file path.
-    let agent_file_path: Option<PathBuf> = resolve_agent_file(step, plan);
 
     // Snapshot all steps in the plan so the prompt builder can render the
     // compact "Plan step map" section. Taken once up front (pre-attempt)
@@ -1637,14 +1768,14 @@ pub async fn execute_step(args: ExecuteStepArgs<'_>) -> Result<StepResult> {
     // consistent snapshot keeps the prompt stable across retries.
     let all_steps = storage::list_steps(conn, &plan.id)?;
 
-    // 1-based position of `step` within its plan. Computed once up front so
-    // every `write_phase` call can pass it without reshuffling the plan's
-    // step list each time.
-    let step_num = resolve_step_num(conn, plan, step)?;
+    // 1-based position of `step` within its plan. Computed from the same
+    // snapshot the prompt uses, so step numbering and rendered context cannot
+    // drift and `execute_step` does not hit the DB twice for the same list.
+    let step_num = resolve_step_num(plan, step, &all_steps)?;
 
     // Snapshot pre-existing untracked files so we don't accidentally commit them.
     let pre_existing_untracked = if exec_opts.resumed_parked_worktree {
-        Vec::new()
+        exec_opts.resumed_preserve_files.clone()
     } else {
         git::get_untracked_files(workdir)?
     };
@@ -1661,6 +1792,49 @@ pub async fn execute_step(args: ExecuteStepArgs<'_>) -> Result<StepResult> {
         max_attempts,
         json_output: exec_opts.json_output,
     };
+
+    if let Some(recovered) = recover_existing_iteration_commit(&ctx, config).await? {
+        return Ok(recovered);
+    }
+
+    // Fence a step that was already over budget before this run picked it.
+    // This can happen after a user lowers max-retries below the stored
+    // attempts. It is a per-step recoverable state, not a run-level error:
+    // independent DAG branches should continue while this step waits for a
+    // human decision.
+    if step.attempts >= max_attempts {
+        let msg = format!(
+            "step already used {} attempts; current retry budget allows {} attempts",
+            step.attempts, max_attempts
+        );
+        let test_results = vec![msg];
+        let parsed = ParsedHarnessOutput::default();
+        let fail_output = FailureOutput {
+            diff: None,
+            test_results: &test_results,
+            stdout: "",
+            stderr: "",
+            parsed: &parsed,
+            has_changes: false,
+        };
+        return raise_retry_exhausted_blocker(
+            &ctx,
+            None,
+            0.0,
+            step.attempts,
+            &fail_output,
+            FailureReason::RetryBudgetExhausted,
+        )
+        .await;
+    }
+
+    // Resolve harness once (doesn't change between retries). Done after the
+    // pre-exhausted fence because that path never spawns a harness and should
+    // not fail on unused harness configuration.
+    let (harness_name, harness_config) = harness::resolve_harness(step, plan, config)?;
+
+    // Resolve agent file path.
+    let agent_file_path: Option<PathBuf> = resolve_agent_file(step, plan);
 
     // Per-step disk-space gate.
     //
@@ -2182,11 +2356,22 @@ async fn run_step_attempt(
                 // the only request that can still be present targets a
                 // DIFFERENT, not-yet-running step — clear ours by predicate so
                 // a sibling step's queued `ralph skip` survives.
-                storage::clear_skip_request_for_step(conn, &plan.id, &step.id)?;
+                if storage::clear_skip_request_for_step(conn, &plan.id, &step.id)?
+                    && exec_opts.json_output
+                {
+                    crate::output::emit_ndjson(&skip_request_ignored_event(ctx, attempt))?;
+                }
 
                 let parsed = parse_harness_json(&output.stdout);
 
                 // Check for changes.
+                let head_after_harness = git::get_commit_hash(workdir).ok();
+                let head_advanced = matches!((&head_before_harness, &head_after_harness), (Some(before), Some(after)) if before != after);
+                let dirty_after_harness = git::has_uncommitted_changes(workdir)?;
+                if head_advanced && let Some(before) = &head_before_harness {
+                    git::reset_mixed_to(workdir, before)?;
+                }
+
                 let has_changes = git::has_uncommitted_changes(workdir)?;
                 let diff = if has_changes {
                     Some(git::get_diff(workdir)?)
@@ -2200,18 +2385,14 @@ async fn run_step_attempt(
                 };
 
                 // Detect "agent appears to have committed on its own": the
-                // worktree is clean *and* HEAD advanced during this attempt.
+                // worktree was clean *and* HEAD advanced during this attempt.
                 // Surfaced in the no_changes diagnostic below so authors who
                 // told the harness to commit themselves get a self-explanatory
                 // error instead of a generic no_changes loop. Both halves
                 // must be Some — if either snapshot failed we can't compare
                 // safely, so suppress the hint rather than risk a false
                 // positive.
-                let agent_committed_clean = !has_changes
-                    && match (&head_before_harness, git::get_commit_hash(workdir).ok()) {
-                        (Some(before), Some(after)) => before != &after,
-                        _ => false,
-                    };
+                let agent_committed_clean = head_advanced && !dirty_after_harness;
 
                 // Pause if the harness raised an open interruption
                 // (`ralph question ask` / `ralph block` — native
@@ -2424,6 +2605,11 @@ async fn run_step_attempt(
                         &plan.deterministic_tests,
                         workdir,
                         abort_rx.clone(),
+                        Some(Duration::from_secs(
+                            config
+                                .timeout_secs
+                                .unwrap_or(test_runner::DEFAULT_TEST_TIMEOUT_SECS),
+                        )),
                         test_chunk_cfg,
                     )
                     .await;
@@ -3878,17 +4064,18 @@ fn render_prompt_preview_to<W: std::io::Write>(
     Ok(())
 }
 
-/// Resolve the 1-based position of `step` within its plan. Falls back to 1
-/// if the step isn't found in the list (which would be a consistency bug, but
-/// we'd rather proceed than crash the run over observability bookkeeping).
-fn resolve_step_num(conn: &Connection, plan: &Plan, step: &Step) -> Result<i32> {
-    let all_steps = storage::list_steps(conn, &plan.id)?;
+/// Resolve the 1-based position of `step` within its plan.
+fn resolve_step_num(plan: &Plan, step: &Step, all_steps: &[Step]) -> Result<i32> {
     let pos = all_steps
         .iter()
         .position(|s| s.id == step.id)
-        .map(|p| p as i32 + 1)
-        .unwrap_or(1);
-    Ok(pos)
+        .with_context(|| {
+            format!(
+                "step '{}' ({}) is not part of plan '{}' while resolving step number",
+                step.title, step.id, plan.slug
+            )
+        })?;
+    Ok(pos as i32 + 1)
 }
 
 // ---------------------------------------------------------------------------
@@ -4020,6 +4207,45 @@ mod tests {
         assert_eq!(StepOutcome::Success, StepOutcome::Success);
         assert_ne!(StepOutcome::Success, StepOutcome::Failed);
         assert_ne!(StepOutcome::Success, StepOutcome::PausedForQuestion);
+    }
+
+    #[test]
+    fn test_resolve_step_num_errors_when_step_not_in_plan_snapshot() {
+        let conn = crate::db::open_memory().unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "p",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+        let err = resolve_step_num(&plan, &step, &[]).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("is not part of plan"),
+            "missing step must be a consistency error, got: {err:#}"
+        );
     }
 
     #[test]
@@ -4244,7 +4470,7 @@ mod tests {
     fn seed_run_lock_row(conn: &Connection, project: &str) {
         conn.execute(
             "INSERT INTO run_locks (project, pid, plan_id, plan_slug) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![project, 1i64, "p-test", "slug"],
+            rusqlite::params![project, std::process::id() as i64, "p-test", "slug"],
         )
         .unwrap();
     }
@@ -6021,7 +6247,7 @@ mod tests {
             // and operate on process-global atomics/mutexes, so running them
             // on this OS thread is behaviorally identical to the prior
             // `tokio::spawn` — just immune to cooperative starvation.
-            let _g = crate::signal::StepInFlightGuard::enter();
+            let _g = crate::signal::StepInFlightGuard::enter("test-step");
             assert!(
                 crate::signal::request_skip_in_flight(kind),
                 "request_skip_in_flight must signal when a step is in-flight"
@@ -6145,6 +6371,27 @@ mod tests {
             logs[0].commit_hash.as_deref(),
             Some(head_sha.as_str()),
             "commit_hash must be the WIP commit SHA"
+        );
+    }
+
+    #[test]
+    fn test_finalize_skipped_warning_matches_dependency_semantics() {
+        let src = include_str!("executor.rs");
+        let body = src
+            .split("async fn finalize_skipped(")
+            .nth(1)
+            .expect("finalize_skipped exists")
+            .split("async fn cancel_skipped_attempt(")
+            .next()
+            .expect("finalize_skipped has following function");
+
+        assert!(
+            body.contains("Skipped step satisfies its outgoing edges"),
+            "skip warning must tell users dependents can proceed"
+        );
+        assert!(
+            !body.contains("will remain blocked until you reset"),
+            "skip warning must not contradict deps_satisfied accepting Skipped"
         );
     }
 
@@ -6415,7 +6662,7 @@ mod tests {
         let skip_task = tokio::spawn(async move {
             // Invocation #1 → request CANCEL.
             wait_for_invocation(&count_clone, &pid_clone, 1).await;
-            let _g = crate::signal::StepInFlightGuard::enter();
+            let _g = crate::signal::StepInFlightGuard::enter("test-step");
             assert!(
                 crate::signal::request_skip_in_flight(crate::git::ParkStrategyKind::Cancel),
                 "Cancel skip must signal when a step is in-flight"
@@ -7003,10 +7250,10 @@ mod tests {
         .await
         .unwrap();
 
-        // HEAD must actually have advanced — otherwise the hint can't fire
-        // and we'd be testing nothing.
+        // The harness advanced HEAD, and the executor must rewind it before
+        // returning so agent-owned commits never remain in history.
         let head_after = crate::git::get_commit_hash(&dir).unwrap();
-        assert_ne!(head_before, head_after, "harness should have committed");
+        assert_eq!(head_before, head_after, "harness commit should be rewound");
 
         assert_eq!(result.outcome, StepOutcome::Failed);
 
@@ -7133,7 +7380,7 @@ mod tests {
         .unwrap();
 
         let head_after = crate::git::get_commit_hash(&dir).unwrap();
-        assert_ne!(head_before, head_after, "harness should have committed");
+        assert_eq!(head_before, head_after, "harness commit should be rewound");
 
         assert_eq!(
             result.outcome,
@@ -7238,7 +7485,7 @@ mod tests {
         .unwrap();
 
         let head_after = crate::git::get_commit_hash(&dir).unwrap();
-        assert_ne!(head_before, head_after, "harness should have committed");
+        assert_eq!(head_before, head_after, "harness commit should be rewound");
 
         assert_eq!(
             result.outcome,
@@ -7663,6 +7910,140 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_agent_commit_with_dirty_tree_is_uncommitted_before_success_commit() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+        fs::write(dir.join("seed.txt"), "seed\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "seed",
+            ])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let base_commits = commit_count(&dir);
+        let base_head = crate::git::get_commit_hash(&dir).unwrap();
+
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = harness_tmp.path().join("commit-and-dirty.sh");
+        let script = format!(
+            "#!/bin/sh\n\
+             cd {dir}\n\
+             echo committed > committed.txt\n\
+             git add committed.txt\n\
+             git -c user.email=a@a -c user.name=a commit -m 'agent commit' >/dev/null\n\
+             echo dirty > dirty.txt\n\
+             exit 0\n",
+            dir = dir.to_string_lossy(),
+        );
+        fs::write(&harness_path, script).unwrap();
+        let mut perms = fs::metadata(&harness_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&harness_path, perms).unwrap();
+
+        let conn = crate::db::open_memory().unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("poly"),
+                agent: None,
+                deterministic_tests: &["test -f committed.txt && test -f dirty.txt".to_string()],
+            },
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            crate::storage::NewStep {
+                title: "Own commit",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config
+            .harnesses
+            .insert("poly".to_string(), harness_config_for_script(&harness_path));
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (_tx, rx) = watch::channel(None);
+        let result = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx,
+            exec_opts: ExecuteOptions::default(),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(result.outcome, StepOutcome::Success);
+        assert_eq!(
+            commit_count(&dir),
+            base_commits + 1,
+            "agent commit must be mixed-reset away before ralph creates the step commit"
+        );
+        let head = crate::git::get_commit_hash(&dir).unwrap();
+        assert_ne!(head, base_head);
+        assert_eq!(result.commit_hash.as_deref(), Some(head.as_str()));
+        let msg = {
+            let out = std::process::Command::new("git")
+                .args(["log", "-1", "--pretty=%s"])
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert!(
+            msg.starts_with(&format!("ralph {}.1 - Own commit", step.short_id)),
+            "final commit must be ralph-owned, got: {msg}"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("committed.txt")).unwrap(),
+            "committed\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("dirty.txt")).unwrap(),
+            "dirty\n"
+        );
+    }
+
     /// Build an executable harness script at `harness_dir` that appends one
     /// line to `acc.txt` in `workdir` per invocation. Written OUTSIDE the
     /// workdir so the script isn't counted as a step change.
@@ -7998,6 +8379,121 @@ mod tests {
         );
         let its = crate::git::iteration_commits_for_step(&dir, "HEAD", &step.short_id).unwrap();
         assert_eq!(its.len(), 1, "exactly one commit (the final passing one)");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_existing_trailer_commit_recovered_without_reimplementation() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+        Command::new("git")
+            .args(["checkout", "-b", "branch"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let base_commits = commit_count(&dir);
+
+        let conn = crate::db::open_memory().unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("poly"),
+                agent: None,
+                deterministic_tests: &["test -f recovered.txt".to_string()],
+            },
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            crate::storage::NewStep {
+                title: "Recovered",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+
+        fs::write(dir.join("recovered.txt"), "done\n").unwrap();
+        crate::git::stage_except(&dir, &[]).unwrap();
+        let msg =
+            crate::git::build_iteration_commit_message(&step.short_id, 1, &step.title, &plan.slug);
+        crate::git::commit_staged(&dir, &msg).unwrap();
+        let recovered_sha = crate::git::get_commit_hash(&dir).unwrap();
+
+        let harness_tmp = TempDir::new().unwrap();
+        let marker = harness_tmp.path().join("harness-ran");
+        let harness_path = harness_tmp.path().join("fail-if-run.sh");
+        fs::write(
+            &harness_path,
+            format!(
+                "#!/bin/sh\n\
+                 touch {}\n\
+                 exit 99\n",
+                marker.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&harness_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&harness_path, perms).unwrap();
+
+        let mut config = Config::default();
+        config
+            .harnesses
+            .insert("poly".to_string(), harness_config_for_script(&harness_path));
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (_tx, rx) = watch::channel(None);
+        let result = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx,
+            exec_opts: ExecuteOptions::default(),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(result.outcome, StepOutcome::Success);
+        assert_eq!(result.commit_hash.as_deref(), Some(recovered_sha.as_str()));
+        assert!(!marker.exists(), "recovery must not re-run the harness");
+        assert_eq!(commit_count(&dir), base_commits + 1);
+
+        let step_after = storage::get_step(&conn, &step.id).unwrap();
+        assert_eq!(step_after.status, StepStatus::Complete);
+        assert_eq!(
+            step_after.review_status,
+            Some(crate::plan::ReviewStatus::Disabled)
+        );
+        let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
+        assert_eq!(logs.len(), 1);
+        assert!(logs[0].committed);
+        assert_eq!(logs[0].commit_hash.as_deref(), Some(recovered_sha.as_str()));
+        let its = crate::git::iteration_commits_for_step(&dir, "branch", &step.short_id).unwrap();
+        assert_eq!(its.len(), 1);
     }
 
     /// STEP 42 / docs/dag-redesign.md §3.3/§6/§7 — the **disabled review
@@ -10148,11 +10644,11 @@ mod tests {
             out.ends_with("line 199\n"),
             "the final line of the input must survive the truncation: {out}",
         );
-        // The output is approximately the cap plus the marker length.
+        // The cap includes the elision marker.
         assert!(
-            out.len() <= 256 + 128,
-            "elision overhead bounded: len={}",
-            out.len()
+            out.len() <= 256,
+            "truncation must obey max_bytes including marker: len={}",
+            out.len(),
         );
     }
 
@@ -10165,6 +10661,17 @@ mod tests {
         // Must not panic and must remain valid UTF-8 (the format! itself
         // would have panicked on an invalid slice).
         assert!(out.contains("🌟"));
+    }
+
+    #[test]
+    fn test_truncate_tail_bytes_tiny_cap_is_hard_cap() {
+        let out = truncate_tail_bytes("abcdef", 3);
+        assert_eq!(out, "def");
+        assert!(out.len() <= 3);
+
+        let utf8 = truncate_tail_bytes("🌟🌟🌟", 5);
+        assert!(utf8.len() <= 5);
+        assert!(utf8.is_char_boundary(utf8.len()));
     }
 
     /// Phase B core: a step driven through a test-failing exhausted budget
@@ -10365,6 +10872,83 @@ mod tests {
             base_head,
             "HEAD unchanged when the step is parked",
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_pre_exhausted_step_raises_blocker_instead_of_bailing() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+
+        let conn = crate::db::open_memory().unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "pre-exhausted",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("unused"),
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            crate::storage::NewStep {
+                title: "Already spent",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+        super::set_step_attempts(&conn, &step.id, 1).unwrap();
+        let step = storage::get_step(&conn, &step.id).unwrap();
+
+        let config = Config::default();
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (_tx, rx) = watch::channel(None);
+        let result = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx,
+            exec_opts: ExecuteOptions::default(),
+        })
+        .await
+        .expect("pre-exhausted step should be fenced, not bubble an error");
+
+        assert_eq!(result.outcome, StepOutcome::PausedForQuestion);
+        assert_eq!(result.attempts_used, 1);
+        let open = storage::list_open_interruptions_for_plan(&conn, &plan.id).unwrap();
+        assert_eq!(open.len(), 1);
+        let blocker = &open[0];
+        assert_eq!(blocker.kind, InterruptionKind::Blocker);
+        assert!(
+            blocker.body.contains("already at its retry budget"),
+            "body must explain the pre-exhausted state; got:\n{}",
+            blocker.body,
+        );
+        assert_eq!(blocker.options[0].text, RETRY_EXHAUSTED_OPTION_RETRY);
+        assert_eq!(blocker.options[1].text, RETRY_EXHAUSTED_OPTION_FAIL);
     }
 
     /// Commit-hook rejection on the last attempt also routes to the Phase B
@@ -11113,7 +11697,8 @@ mod tests {
             4,
             FailureReason::TestFailed,
             &failure_output,
-        );
+        )
+        .unwrap();
 
         assert!(
             body.len() <= RETRY_EXHAUSTED_BODY_MAX_BYTES,
@@ -11137,6 +11722,34 @@ mod tests {
         assert!(
             final_pos < older_pos,
             "final attempt must be rendered first; got:\n{body}",
+        );
+    }
+
+    #[test]
+    fn test_auto_blocker_body_diagnostic_reads_are_not_silently_defaulted() {
+        let conn = crate::db::open_memory().unwrap();
+        let dummy_parsed = ParsedHarnessOutput::default();
+        let live = vec!["final failure".to_string()];
+        let failure_output = FailureOutput {
+            test_results: &live,
+            diff: None,
+            stdout: "",
+            stderr: "",
+            parsed: &dummy_parsed,
+            has_changes: false,
+        };
+
+        let err = build_retry_exhausted_body(
+            &conn,
+            "missing-step",
+            1,
+            FailureReason::TestFailed,
+            &failure_output,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("failed to read current retry cycle"),
+            "diagnostic read errors must be surfaced, got: {err:#}"
         );
     }
 
@@ -11326,7 +11939,8 @@ mod tests {
         let parked = stash_step_worktree_for_interruption(&ctx, 1, "interruption")
             .unwrap()
             .expect("there is dirty WIP to park");
-        storage::set_step_parked_worktree(&conn, &step.id, parked.0.as_str(), &parked.1).unwrap();
+        storage::set_step_parked_worktree(&conn, &step.id, parked.0.as_str(), &parked.1, &parked.2)
+            .unwrap();
 
         // The user's pre-existing file MUST still be on disk with its
         // original contents — the whole point of the fix.
@@ -11351,6 +11965,10 @@ mod tests {
         let parked = storage::get_step_parked_worktree(&conn, &step.id)
             .unwrap()
             .expect("park must persist a parked worktree row");
+        assert_eq!(
+            parked.preserve_files, pre,
+            "parked row must persist the original preserve list for any later re-park"
+        );
 
         // Now run the resume path to re-apply the parked stash. We invoke
         // `git::stash_pop` directly with the SHA — same code path

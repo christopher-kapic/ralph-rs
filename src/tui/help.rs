@@ -15,6 +15,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use super::theme;
+use crate::tui::chrome::display_width;
 
 // ---------------------------------------------------------------------------
 // Help model
@@ -150,7 +151,7 @@ pub fn for_plan_list() -> HelpModel {
                 "Selection",
                 vec![
                     ("space", "Toggle selection on plan"),
-                    ("<esc>", "Clear selection / quit if none"),
+                    ("<esc>", "Clear selection"),
                 ],
             ),
             Group::new(
@@ -165,6 +166,7 @@ pub fn for_plan_list() -> HelpModel {
                 "Other",
                 vec![
                     ("r", "Refresh from DB"),
+                    ("I", "Open interruptions inbox"),
                     ("?", "Toggle this help"),
                     ("/ or :", "Open command palette"),
                     ("q / Ctrl-C", "Quit TUI"),
@@ -207,6 +209,7 @@ pub fn for_archived_list() -> HelpModel {
                 "Other",
                 vec![
                     ("r", "Refresh from DB"),
+                    ("I", "Open interruptions inbox"),
                     ("?", "Toggle this help"),
                     ("Ctrl-C", "Back to plan list"),
                 ],
@@ -242,7 +245,7 @@ pub fn for_plan_detail() -> HelpModel {
                     ("i", "Insert step above cursor"),
                     ("a", "Append step below cursor"),
                     ("d", "Delete selection or cursor step"),
-                    ("r", "Reset highlighted step"),
+                    ("r", "Refresh"),
                     ("Shift-J", "Move step down"),
                     ("Shift-K", "Move step up"),
                 ],
@@ -267,6 +270,7 @@ pub fn for_plan_detail() -> HelpModel {
                 "Sub-views",
                 vec![
                     ("D", "Plan dependencies"),
+                    ("H", "Plan hooks"),
                     ("A", "Answer oldest open question"),
                     ("I", "Open interruptions inbox"),
                 ],
@@ -293,6 +297,8 @@ pub fn for_inbox() -> HelpModel {
                 vec![
                     ("j / ↓", "Next interruption"),
                     ("k / ↑", "Previous interruption"),
+                    ("g", "Jump to top"),
+                    ("G", "Jump to bottom"),
                     ("mouse wheel", "Move cursor (list mode only)"),
                     ("enter / a", "Start run-through (answer all in one pass)"),
                     ("q / h / ←", "Back"),
@@ -359,6 +365,8 @@ pub fn for_step_detail() -> HelpModel {
             Group::new(
                 "Other",
                 vec![
+                    ("I", "Open interruptions inbox"),
+                    ("/ or :", "Open command palette"),
                     ("?", "Toggle this help"),
                     ("q / <esc> / Ctrl-C", "Back to plan detail"),
                 ],
@@ -392,6 +400,7 @@ pub fn for_plan_dependencies() -> HelpModel {
             Group::new(
                 "Other",
                 vec![
+                    ("I", "Open interruptions inbox"),
                     ("?", "Toggle this help"),
                     ("q / <esc> / h / ← / Ctrl-C", "Back to plan detail"),
                 ],
@@ -425,6 +434,7 @@ pub fn for_plan_hooks() -> HelpModel {
             Group::new(
                 "Other",
                 vec![
+                    ("I", "Open interruptions inbox"),
                     ("?", "Toggle this help"),
                     ("q / <esc> / h / ← / Ctrl-C", "Back to plan detail"),
                 ],
@@ -458,6 +468,7 @@ pub fn for_step_hooks() -> HelpModel {
             Group::new(
                 "Other",
                 vec![
+                    ("I", "Open interruptions inbox"),
                     ("?", "Toggle this help"),
                     ("q / <esc> / h / ← / Ctrl-C", "Back to step detail"),
                 ],
@@ -490,12 +501,15 @@ pub fn for_step_tags() -> HelpModel {
             Group::new(
                 "Save / cancel",
                 vec![
-                    ("enter / q", "Save and close"),
-                    ("<esc>", "Discard changes and close"),
+                    ("enter", "Save and close"),
+                    ("q / <esc>", "Discard changes and close"),
                     ("Ctrl-C", "Discard changes and close"),
                 ],
             ),
-            Group::new("Other", vec![("?", "Toggle this help")]),
+            Group::new(
+                "Other",
+                vec![("I", "Open interruptions inbox"), ("?", "Toggle this help")],
+            ),
         ],
     )
 }
@@ -509,13 +523,15 @@ pub fn for_rendered_prompt() -> HelpModel {
             Group::new(
                 "Attempts",
                 vec![
-                    ("j / ↓", "Next (newer) attempt"),
-                    ("k / ↑", "Previous (older) attempt"),
+                    ("n", "Next (newer) attempt"),
+                    ("p", "Previous (older) attempt"),
                 ],
             ),
             Group::new(
                 "Scroll",
                 vec![
+                    ("j / ↓", "Scroll down one line"),
+                    ("k / ↑", "Scroll up one line"),
                     ("J", "Scroll down one line"),
                     ("K", "Scroll up one line"),
                     ("mouse wheel", "Scroll the body (never switches attempts)"),
@@ -528,6 +544,7 @@ pub fn for_rendered_prompt() -> HelpModel {
             Group::new(
                 "Other",
                 vec![
+                    ("I", "Open interruptions inbox"),
                     ("?", "Toggle this help"),
                     ("q / <esc> / h / ← / Ctrl-C", "Back to step detail"),
                 ],
@@ -581,16 +598,16 @@ pub fn line_count(model: &HelpModel) -> usize {
 /// Width of the longest displayed line in the rendered model, used for sizing
 /// the overlay. Includes the 2-col left padding ("  ") on binding rows.
 pub fn max_line_width(model: &HelpModel) -> usize {
-    let mut max = model.title.chars().count() + 2;
+    let mut max = display_width(&model.title) + 2;
     for group in &model.groups {
-        max = max.max(group.name.chars().count());
+        max = max.max(display_width(group.name));
         for (key, action) in &group.bindings {
             // "  " + key + " " + action, with key padded to KEY_COL.
-            let row = 2 + key.chars().count().max(KEY_COL) + 1 + action.chars().count();
+            let row = 2 + display_width(key).max(KEY_COL) + 1 + display_width(action);
             max = max.max(row);
         }
     }
-    max = max.max("  ? or <esc> to close".chars().count());
+    max = max.max(display_width("  ? or <esc> to close"));
     max
 }
 
@@ -629,7 +646,7 @@ fn build_lines(model: &HelpModel) -> Vec<Line<'_>> {
 }
 
 fn pad_right(s: &str, width: usize) -> String {
-    let len = s.chars().count();
+    let len = display_width(s);
     if len >= width {
         s.to_string()
     } else {
@@ -764,6 +781,17 @@ mod tests {
         let names: Vec<&str> = m.groups.iter().map(|g| g.name).collect();
         assert!(names.contains(&"Navigation"));
         assert!(names.contains(&"Other"));
+        let bindings: Vec<(&str, &str)> = m
+            .groups
+            .iter()
+            .flat_map(|g| g.bindings.iter().copied())
+            .collect();
+        assert!(
+            bindings
+                .iter()
+                .any(|(key, action)| *key == "<esc>" && *action == "Clear selection"),
+            "plan-list Esc help must not advertise quitting: {bindings:?}"
+        );
         // Sanity: every group has at least one binding.
         for g in &m.groups {
             assert!(!g.bindings.is_empty(), "{} has no bindings", g.name);
@@ -773,14 +801,22 @@ mod tests {
     #[test]
     fn archived_list_documents_destructive_d() {
         let m = for_archived_list();
-        let actions: Vec<&str> = m
+        let bindings: Vec<(&str, &str)> = m
             .groups
             .iter()
-            .flat_map(|g| g.bindings.iter().map(|(_, a)| *a))
+            .flat_map(|g| g.bindings.iter().copied())
             .collect();
         assert!(
-            actions.iter().any(|a| a.contains("Permanently delete")),
-            "archived-list help missing destructive d entry: {actions:?}"
+            bindings
+                .iter()
+                .any(|(_, a)| a.contains("Permanently delete")),
+            "archived-list help missing destructive d entry: {bindings:?}"
+        );
+        assert!(
+            bindings
+                .iter()
+                .any(|(k, a)| *k == "I" && a.to_lowercase().contains("inbox")),
+            "archived-list help missing inbox entry: {bindings:?}"
         );
     }
 
@@ -843,14 +879,20 @@ mod tests {
     #[test]
     fn step_detail_documents_editor_handoff() {
         let m = for_step_detail();
-        let actions: Vec<&str> = m
+        let bindings: Vec<(&str, &str)> = m
             .groups
             .iter()
-            .flat_map(|g| g.bindings.iter().map(|(_, a)| *a))
+            .flat_map(|g| g.bindings.iter().copied())
             .collect();
         assert!(
-            actions.iter().any(|a| a.contains("$EDITOR")),
-            "step-detail help missing $EDITOR entry: {actions:?}"
+            bindings.iter().any(|(_, a)| a.contains("$EDITOR")),
+            "step-detail help missing $EDITOR entry: {bindings:?}"
+        );
+        assert!(
+            bindings
+                .iter()
+                .any(|(k, a)| *k == "I" && a.to_lowercase().contains("inbox")),
+            "step-detail help missing inbox entry: {bindings:?}"
         );
     }
 
@@ -880,6 +922,7 @@ mod tests {
             for_step_hooks(),
             for_step_tags(),
             for_inbox(),
+            for_rendered_prompt(),
         ] {
             let has_q = m
                 .groups
@@ -887,6 +930,28 @@ mod tests {
                 .flat_map(|g| g.bindings.iter())
                 .any(|(k, _)| k.contains('?'));
             assert!(has_q, "{} missing ? binding", m.title);
+        }
+    }
+
+    #[test]
+    fn non_inbox_views_document_global_inbox_binding() {
+        for m in [
+            for_plan_list(),
+            for_archived_list(),
+            for_plan_detail(),
+            for_step_detail(),
+            for_plan_dependencies(),
+            for_plan_hooks(),
+            for_step_hooks(),
+            for_step_tags(),
+            for_rendered_prompt(),
+        ] {
+            let has_inbox = m
+                .groups
+                .iter()
+                .flat_map(|g| g.bindings.iter())
+                .any(|(k, a)| *k == "I" && a.contains("inbox"));
+            assert!(has_inbox, "{} missing global inbox binding", m.title);
         }
     }
 
@@ -973,5 +1038,11 @@ mod tests {
         );
         let w = max_line_width(&m);
         assert!(w >= "a very long action description".chars().count());
+    }
+
+    #[test]
+    fn max_line_width_counts_terminal_columns() {
+        let m = HelpModel::new("表", vec![Group::new("G", vec![("界界", "move")])]);
+        assert_eq!(max_line_width(&m), 2 + KEY_COL + 1 + "move".len());
     }
 }

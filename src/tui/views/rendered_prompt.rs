@@ -6,8 +6,8 @@
 // from step_detail when the `StepPrompt` pane is focused and the user presses
 // `l` / `→`.
 //
-// When the step has multiple `execution_logs` rows (one per attempt), `j`/`k`
-// (and `↑`/`↓`) navigate between attempts; each attempt re-renders
+// When the step has multiple `execution_logs` rows (one per attempt), `n`/`p`
+// navigate between attempts; each attempt re-renders
 // `build_step_prompt` with the retry context the executor would have built
 // for that attempt (attempt 1 = no retry context; later attempts = retry
 // context derived from the *previous* attempt's stored log). Zero
@@ -32,6 +32,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::plan::{ExecutionLog, Interruption, Plan, Step, TerminationReason};
 use crate::prompt::{self, Prompts, RetryContext};
+use crate::tui::chrome::display_width;
 use crate::tui::help::{self, HelpState};
 use crate::tui::theme;
 
@@ -459,27 +460,29 @@ impl RenderedPromptApp {
             // Pop back to step-detail.
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') | KeyCode::Left => Outcome::Pop,
 
-            // Attempt navigation. j/k (and ↑/↓) move between attempts when
-            // there is more than one; with a single attempt they fall
-            // through to scrolling so the binding is never dead.
+            // Scrolling the prompt body. These bindings never switch meaning
+            // when another attempt appears while the user is reading.
             KeyCode::Char('j') | KeyCode::Down => {
-                if self.has_multiple_attempts() {
-                    self.select_next_attempt();
-                } else {
-                    self.scroll_down();
-                }
+                self.scroll_down();
                 Outcome::Pending
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                if self.has_multiple_attempts() {
-                    self.select_prev_attempt();
-                } else {
-                    self.scroll_up();
-                }
+                self.scroll_up();
                 Outcome::Pending
             }
 
-            // Scrolling the (potentially long) prompt body.
+            // Attempt navigation uses explicit bindings so it cannot be
+            // confused with body scrolling.
+            KeyCode::Char('n') => {
+                self.select_next_attempt();
+                Outcome::Pending
+            }
+            KeyCode::Char('p') => {
+                self.select_prev_attempt();
+                Outcome::Pending
+            }
+
+            // Alternate scrolling bindings for the (potentially long) prompt body.
             KeyCode::Char('J') => {
                 self.scroll_down();
                 Outcome::Pending
@@ -510,10 +513,8 @@ impl RenderedPromptApp {
     }
 
     /// Mouse handler. The scroll wheel scrolls the prompt body regardless of
-    /// attempt count — keyboard `j`/`k` switches attempts when there are
-    /// multiple, but the wheel is always a body-scroll gesture (matches
-    /// step_detail's `handle_mouse`, where the wheel scrolls the focused
-    /// pane). Other mouse events are no-ops for now.
+    /// attempt count, matching the stable keyboard `j`/`k` scroll bindings.
+    /// Other mouse events are no-ops for now.
     pub fn handle_mouse(&mut self, event: MouseEvent) {
         use crossterm::event::MouseEventKind;
 
@@ -552,18 +553,65 @@ fn relative_time(started: DateTime<Utc>, now: DateTime<Utc>) -> String {
 // Rendering
 // ---------------------------------------------------------------------------
 
-/// Wrapped (visual) line count for `text` at `width` columns, mirroring the
-/// helper of the same name in `step_detail` (kept local so this sub-view
-/// doesn't depend on its parent's internals). Each `\n`-delimited logical
-/// line wraps to `ceil(chars / width)` visual rows; a zero-width viewport
-/// returns 0. Caps at `u16::MAX` because the scroll API is `u16`.
+fn hard_wrapped_visual_line_count(chars: usize, width: u16) -> u16 {
+    if width == 0 {
+        return 0;
+    }
+    chars.max(1).div_ceil(width as usize).min(u16::MAX as usize) as u16
+}
+
+fn word_wrapped_visual_line_count(line: &str, width: u16) -> u16 {
+    if width == 0 {
+        return 0;
+    }
+    if line.is_empty() {
+        return 1;
+    }
+
+    let width = width as usize;
+    let mut rows = 1usize;
+    let mut current = 0usize;
+
+    for word in line.split_whitespace() {
+        let word_w = display_width(word);
+        if current == 0 {
+            rows += word_w.saturating_sub(1) / width;
+            current = if word_w == 0 {
+                0
+            } else {
+                ((word_w - 1) % width) + 1
+            };
+        } else if current + 1 + word_w <= width {
+            current += 1 + word_w;
+        } else {
+            rows += 1;
+            rows += word_w.saturating_sub(1) / width;
+            current = if word_w == 0 {
+                0
+            } else {
+                ((word_w - 1) % width) + 1
+            };
+        }
+    }
+
+    rows.min(u16::MAX as usize) as u16
+}
+
+/// Wrapped (visual) line count for `text` at `width` columns. This mirrors
+/// ratatui's word-wrapped `Paragraph` behavior conservatively: it may allow
+/// a little extra bottom scroll for unusual whitespace, but it must not
+/// under-count and hide tail content. A zero-width viewport returns 0. Caps
+/// at `u16::MAX` because the scroll API is `u16`.
 fn text_visual_line_count(text: &str, width: u16) -> u16 {
     if width == 0 {
         return 0;
     }
-    let w = width as usize;
     text.split('\n')
-        .map(|line| line.chars().count().max(1).div_ceil(w))
+        .map(|line| {
+            let word_wrapped = word_wrapped_visual_line_count(line, width);
+            let hard_wrapped = hard_wrapped_visual_line_count(display_width(line), width);
+            word_wrapped.max(hard_wrapped) as usize
+        })
         .sum::<usize>()
         .min(u16::MAX as usize) as u16
 }
@@ -668,7 +716,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut RenderedPromptApp) {
 
     // -- Hint ------------------------------------------------------------
     let hint = if app.has_multiple_attempts() {
-        "[j/k] attempt  [J/K] scroll  [g/G] top/bottom  [h/←/esc] back  [?] help"
+        "[j/k] scroll  [n/p] attempt  [I] inbox  [g/G] top/bottom  [h/←/esc] back  [?] help"
     } else {
         "[j/k] scroll  [g/G] top/bottom  [h/←/esc] back  [?] help"
     };
@@ -1095,22 +1143,22 @@ mod tests {
         assert_eq!(app.selected, 2);
         assert_eq!(app.current().attempt, 3);
 
-        // k moves to the previous (older) attempt.
-        assert_eq!(app.handle_key(key(KeyCode::Char('k'))), Outcome::Pending);
+        // p moves to the previous (older) attempt.
+        assert_eq!(app.handle_key(key(KeyCode::Char('p'))), Outcome::Pending);
         assert_eq!(app.current().attempt, 2);
-        assert_eq!(app.handle_key(key(KeyCode::Up)), Outcome::Pending);
+        assert_eq!(app.handle_key(key(KeyCode::Char('p'))), Outcome::Pending);
         assert_eq!(app.current().attempt, 1);
         // Clamped at the oldest.
-        app.handle_key(key(KeyCode::Char('k')));
+        app.handle_key(key(KeyCode::Char('p')));
         assert_eq!(app.current().attempt, 1);
 
-        // j moves to the next (newer) attempt.
-        app.handle_key(key(KeyCode::Char('j')));
+        // n moves to the next (newer) attempt.
+        app.handle_key(key(KeyCode::Char('n')));
         assert_eq!(app.current().attempt, 2);
-        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Char('n')));
         assert_eq!(app.current().attempt, 3);
         // Clamped at the newest.
-        app.handle_key(key(KeyCode::Char('j')));
+        app.handle_key(key(KeyCode::Char('n')));
         assert_eq!(app.current().attempt, 3);
     }
 
@@ -1134,12 +1182,12 @@ mod tests {
         app.last_body_height = 1;
         app.last_line_count = 5;
         app.scroll = 3;
-        app.handle_key(key(KeyCode::Char('k'))); // move to attempt 1
+        app.handle_key(key(KeyCode::Char('p'))); // move to attempt 1
         assert_eq!(app.scroll, 0, "scroll resets when attempt changes");
     }
 
     #[test]
-    fn single_attempt_jk_scrolls_instead_of_navigating() {
+    fn jk_scrolls_regardless_of_attempt_count() {
         let attempts = vec![AttemptPrompt {
             attempt: 1,
             cycle_index: 0,
@@ -1157,6 +1205,48 @@ mod tests {
         assert_eq!(app.scroll, 1);
         app.handle_key(key(KeyCode::Char('k')));
         assert_eq!(app.scroll, 0);
+
+        let attempts = vec![
+            AttemptPrompt {
+                attempt: 1,
+                cycle_index: 0,
+                started_at: None,
+                prompt: (0..50)
+                    .map(|i| format!("first {i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            },
+            AttemptPrompt {
+                attempt: 2,
+                cycle_index: 0,
+                started_at: None,
+                prompt: (0..50)
+                    .map(|i| format!("second {i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            },
+        ];
+        let mut app = RenderedPromptApp::new("s".into(), "l".into(), attempts);
+        let initial_attempt = app.current().attempt;
+        app.last_body_height = 10;
+        app.last_line_count = 50;
+        assert!(app.has_multiple_attempts());
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.scroll, 1);
+        assert_eq!(
+            app.current().attempt,
+            initial_attempt,
+            "j scrolls instead of switching attempts"
+        );
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.scroll, 2);
+        app.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(app.scroll, 1);
+        assert_eq!(
+            app.current().attempt,
+            initial_attempt,
+            "k scrolls instead of switching attempts"
+        );
     }
 
     // -- pop bindings ----------------------------------------------------
@@ -1198,9 +1288,9 @@ mod tests {
             }
         }
 
-        // Multi-attempt: keyboard j/k switches attempts, but the wheel must
-        // still scroll the body (we want consistent gesture semantics — wheel
-        // = scroll, regardless of how many attempts there are).
+        // Multi-attempt: the wheel must still scroll the body (we want
+        // consistent gesture semantics — wheel = scroll, regardless of how
+        // many attempts there are).
         let now = Utc::now();
         let attempts = vec![
             AttemptPrompt {
@@ -1233,7 +1323,7 @@ mod tests {
         assert_eq!(
             app.current().attempt,
             initial_attempt,
-            "wheel never switches attempts (that is keyboard j/k territory)"
+            "wheel never switches attempts"
         );
         app.handle_mouse(wheel(MouseEventKind::ScrollUp));
         assert_eq!(app.scroll, 0, "wheel-up reverses by one line");
@@ -1285,6 +1375,10 @@ mod tests {
         assert_eq!(super::text_visual_line_count("\n\n", 10), 3);
         // Zero-width viewport returns 0 (caller guards the render path).
         assert_eq!(super::text_visual_line_count("hello", 0), 0);
+        // Three CJK chars are six display columns, so they wrap in width four.
+        assert_eq!(super::text_visual_line_count("界界界", 4), 2);
+        // Word wrapping can produce more rows than total-width division.
+        assert_eq!(super::text_visual_line_count("abcdef ghijkl mnopqr", 10), 3);
     }
 
     // -- relative time ---------------------------------------------------

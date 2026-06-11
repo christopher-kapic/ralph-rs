@@ -13,7 +13,7 @@
 // never writes the DB and never affects the scheduler (§12.2): scheduling
 // still spans the whole DAG; focus only narrows what is *drawn*.
 
-use std::cell::RefCell;
+use std::cell::{Ref, RefCell};
 use std::collections::{HashMap, HashSet};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -318,6 +318,12 @@ impl OutlineState {
         self.cache.get_mut().take();
     }
 
+    /// True when `step_id` has at least one open interruption and should
+    /// present with the derived `Blocked` overlay.
+    pub fn is_blocked_step(&self, step_id: &str) -> bool {
+        self.blocked_ids.contains(step_id)
+    }
+
     /// Replace the step set / edges / blocked set after a DB poll, preserving
     /// the cursor *by step id* and dropping any focus-stack entries whose
     /// step no longer exists (a deleted focus root pops to the true root).
@@ -327,10 +333,10 @@ impl OutlineState {
         deps_of: HashMap<String, Vec<String>>,
         blocked_ids: HashSet<String>,
     ) {
-        let cursor_id = self
-            .visible_rows()
-            .get(self.cursor)
-            .map(|r| r.step_id.clone());
+        let cursor_id = {
+            let rows = self.visible_rows_ref();
+            rows.get(self.cursor).map(|r| r.step_id.clone())
+        };
         let valid: HashSet<&str> = steps.iter().map(|s| s.id.as_str()).collect();
         self.focus_stack.retain(|id| valid.contains(id.as_str()));
         self.steps = steps;
@@ -339,21 +345,26 @@ impl OutlineState {
         // New steps/edges/blocked set → previous frame's cache is stale.
         self.invalidate_cache();
         // Restore cursor by id within the (possibly changed) visible set.
-        let rows = self.visible_rows();
-        if let Some(id) = cursor_id
-            && let Some(idx) = rows.iter().position(|r| r.step_id == id)
-        {
+        let new_cursor = {
+            let rows = self.visible_rows_ref();
+            if let Some(id) = cursor_id {
+                rows.iter().position(|r| r.step_id == id)
+            } else {
+                None
+            }
+            .or_else(|| {
+                if rows.is_empty() {
+                    Some(0)
+                } else if self.cursor >= rows.len() {
+                    Some(rows.len() - 1)
+                } else {
+                    None
+                }
+            })
+        };
+        if let Some(idx) = new_cursor {
             self.cursor = idx;
-        } else if rows.is_empty() {
-            self.cursor = 0;
-        } else if self.cursor >= rows.len() {
-            self.cursor = rows.len() - 1;
         }
-    }
-
-    /// `step_id -> Step` index helper.
-    fn step_by_id(&self) -> HashMap<&str, &Step> {
-        self.steps.iter().map(|s| (s.id.as_str(), s)).collect()
     }
 
     /// The transitive **downstream dependents** cone of `root_id` (the step
@@ -395,14 +406,18 @@ impl OutlineState {
     /// path's short ids, e.g. `["c9d4", "f1a0"]` for nested focus. Empty
     /// when not focused. The renderer joins these as `focus: c9d4 › f1a0`.
     pub fn focus_breadcrumb(&self) -> Vec<String> {
-        let by_id = self.step_by_id();
         self.focus_stack
             .iter()
-            .filter_map(|id| by_id.get(id.as_str()).map(|s| s.short_id.clone()))
+            .filter_map(|id| {
+                self.steps
+                    .iter()
+                    .find(|s| s.id == *id)
+                    .map(|s| s.short_id.clone())
+            })
             .collect()
     }
 
-    /// Project the currently-visible rows.
+    /// Borrow the currently-visible rows from the cache.
     ///
     /// Pipeline: project the full DAG via [`project_outline`] (scheduler
     /// order — preserves the §12.1 "outline ⇔ scheduler" invariant *at
@@ -414,21 +429,27 @@ impl OutlineState {
     /// scheduler still walks `(depth, sort_key, short_id)` independently
     /// off of `compute_step_depths`, so this is purely a display order.
     ///
-    /// Frame-scoped memoization: the first call populates [`Self::cache`]
-    /// with a clone of the projection; subsequent calls within the same
-    /// frame just clone the cached vec (cheap — `OutlineRow` is a handful
-    /// of `String`s) instead of re-running the full pipeline. Any mutator
+    /// Frame-scoped memoization: the first call populates [`Self::cache`].
+    /// Subsequent calls borrow the cached rows instead of reallocating every
+    /// `OutlineRow` string on the hot navigation/render path. Any mutator
     /// that changes a pipeline input (`sync`, the focus push/pop family)
-    /// calls [`Self::invalidate_cache`]; cursor-only moves don't, so the
-    /// hot keystroke path (navigate → render → selected_step_id → …) only
-    /// pays for one projection per frame.
-    pub fn visible_rows(&self) -> Vec<OutlineRow> {
-        if let Some(rows) = self.cache.borrow().as_ref() {
-            return rows.clone();
+    /// calls [`Self::invalidate_cache`].
+    pub fn visible_rows_ref(&self) -> Ref<'_, Vec<OutlineRow>> {
+        if self.cache.borrow().is_none() {
+            let rows = self.build_visible_rows();
+            *self.cache.borrow_mut() = Some(rows);
         }
-        let rows = self.build_visible_rows();
-        *self.cache.borrow_mut() = Some(rows.clone());
-        rows
+        Ref::map(self.cache.borrow(), |rows| {
+            rows.as_ref()
+                .expect("outline row cache must be populated before borrow")
+        })
+    }
+
+    /// Project the currently-visible rows into an owned vector.
+    ///
+    /// Prefer [`Self::visible_rows_ref`] on render/navigation paths.
+    pub fn visible_rows(&self) -> Vec<OutlineRow> {
+        self.visible_rows_ref().clone()
     }
 
     /// Run the full project_outline → focus filter → tree_layout pipeline,
@@ -478,7 +499,7 @@ impl OutlineState {
     /// highlight on the clamped last row while keyboard/mouse selection
     /// resolved to a different row or `None` — a one-frame divergence.
     pub fn selected_step_id(&self) -> Option<String> {
-        let rows = self.visible_rows();
+        let rows = self.visible_rows_ref();
         if rows.is_empty() {
             return None;
         }
@@ -488,7 +509,7 @@ impl OutlineState {
 
     /// Move the cursor down one row (wraps), no-op on an empty outline.
     pub fn navigate_down(&mut self) {
-        let n = self.visible_rows().len();
+        let n = self.visible_rows_ref().len();
         if n == 0 {
             return;
         }
@@ -497,7 +518,7 @@ impl OutlineState {
 
     /// Move the cursor up one row (wraps).
     pub fn navigate_up(&mut self) {
-        let n = self.visible_rows().len();
+        let n = self.visible_rows_ref().len();
         if n == 0 {
             return;
         }
@@ -508,6 +529,21 @@ impl OutlineState {
         };
     }
 
+    /// Jump to the first visible row, no-op on an empty outline.
+    pub fn jump_top(&mut self) {
+        if !self.visible_rows_ref().is_empty() {
+            self.cursor = 0;
+        }
+    }
+
+    /// Jump to the last visible row, no-op on an empty outline.
+    pub fn jump_bottom(&mut self) {
+        let n = self.visible_rows_ref().len();
+        if n != 0 {
+            self.cursor = n - 1;
+        }
+    }
+
     /// Park the cursor on visible row `idx` (clamped to the visible range),
     /// no-op on an empty outline. Pure cursor move within the outline's own
     /// index space — used by the mouse path to land the cursor on a clicked
@@ -516,7 +552,7 @@ impl OutlineState {
     /// (driven by [`Self::cursor`]) follows the click. Does **not** poke any
     /// divergent flat index.
     pub fn set_cursor(&mut self, idx: usize) {
-        let n = self.visible_rows().len();
+        let n = self.visible_rows_ref().len();
         if n == 0 {
             return;
         }
@@ -552,8 +588,11 @@ impl OutlineState {
             return false;
         };
         self.invalidate_cache();
-        let rows = self.visible_rows();
-        self.cursor = rows.iter().position(|r| r.step_id == popped).unwrap_or(0);
+        let cursor = {
+            let rows = self.visible_rows_ref();
+            rows.iter().position(|r| r.step_id == popped).unwrap_or(0)
+        };
+        self.cursor = cursor;
         true
     }
 
@@ -567,10 +606,13 @@ impl OutlineState {
         let first_root = self.focus_stack.first().cloned();
         self.focus_stack.clear();
         self.invalidate_cache();
-        let rows = self.visible_rows();
-        self.cursor = first_root
-            .and_then(|id| rows.iter().position(|r| r.step_id == id))
-            .unwrap_or(0);
+        let cursor = {
+            let rows = self.visible_rows_ref();
+            first_root
+                .and_then(|id| rows.iter().position(|r| r.step_id == id))
+                .unwrap_or(0)
+        };
+        self.cursor = cursor;
         true
     }
 
@@ -584,8 +626,11 @@ impl OutlineState {
         let new_top = self.focus_stack[crumb_index].clone();
         self.focus_stack.truncate(keep);
         self.invalidate_cache();
-        let rows = self.visible_rows();
-        self.cursor = rows.iter().position(|r| r.step_id == new_top).unwrap_or(0);
+        let cursor = {
+            let rows = self.visible_rows_ref();
+            rows.iter().position(|r| r.step_id == new_top).unwrap_or(0)
+        };
+        self.cursor = cursor;
         true
     }
 
@@ -602,6 +647,14 @@ impl OutlineState {
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.navigate_up();
+                OutlineOutcome::Handled
+            }
+            KeyCode::Char('g') | KeyCode::Home => {
+                self.jump_top();
+                OutlineOutcome::Handled
+            }
+            KeyCode::Char('G') | KeyCode::End => {
+                self.jump_bottom();
                 OutlineOutcome::Handled
             }
             KeyCode::Char('z') => {
@@ -856,6 +909,25 @@ mod tests {
         st.navigate_up();
         // Wrapped to the last row (dddd).
         assert_eq!(st.selected_step_id().as_deref(), Some("uuid-dddd"));
+    }
+
+    #[test]
+    fn handle_key_jumps_to_top_and_bottom() {
+        let mut st = diamond();
+        assert_eq!(
+            st.handle_key(key(KeyCode::Char('G'))),
+            OutlineOutcome::Handled
+        );
+        assert_eq!(st.selected_step_id().as_deref(), Some("uuid-dddd"));
+        assert_eq!(
+            st.handle_key(key(KeyCode::Char('g'))),
+            OutlineOutcome::Handled
+        );
+        assert_eq!(st.selected_step_id().as_deref(), Some("uuid-aaaa"));
+        assert_eq!(st.handle_key(key(KeyCode::End)), OutlineOutcome::Handled);
+        assert_eq!(st.selected_step_id().as_deref(), Some("uuid-dddd"));
+        assert_eq!(st.handle_key(key(KeyCode::Home)), OutlineOutcome::Handled);
+        assert_eq!(st.selected_step_id().as_deref(), Some("uuid-aaaa"));
     }
 
     #[test]

@@ -1,21 +1,18 @@
 // Confirm-dialog primitive (TUI-plan.md §11).
 //
-// A blocking modal yes/no dialog used by destructive flows (archive, delete,
-// cancel) that need explicit confirmation. The renderer and key-decision
-// logic are factored apart from the event loop so they can be unit-tested
-// without a real terminal.
+// A modal yes/no dialog used by destructive flows (archive, delete, cancel)
+// that need explicit confirmation. The host view owns the event loop; this
+// module owns rendering and key-decision logic.
 
-use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
-use ratatui::Terminal;
-use ratatui::backend::Backend;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use super::theme;
+use crate::tui::chrome::display_width;
 
 /// One confirm dialog instance — title, body, and which button is the
 /// default action (selected by Enter).
@@ -40,8 +37,12 @@ pub enum Decision {
 /// Map a key event to a `Decision`. Pure for tests.
 pub fn decide_key(key: KeyEvent, default: bool) -> Decision {
     match key.code {
-        KeyCode::Char('y') | KeyCode::Char('Y') => Decision::Yes,
-        KeyCode::Char('n') | KeyCode::Char('N') => Decision::No,
+        KeyCode::Char('y') | KeyCode::Char('Y') if key.modifiers == KeyModifiers::NONE => {
+            Decision::Yes
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') if key.modifiers == KeyModifiers::NONE => {
+            Decision::No
+        }
         KeyCode::Esc => Decision::No,
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Decision::No,
         KeyCode::Enter => {
@@ -96,9 +97,9 @@ fn centered_rect(area: Rect, c: &Confirm<'_>) -> Rect {
     let desired_h = body_lines.saturating_add(4);
     let height = desired_h.min(area.height).max(5.min(area.height));
 
-    let body_w = c.body.lines().map(|l| l.chars().count()).max().unwrap_or(0);
-    let title_w = c.title.chars().count() + 2;
-    let hint_w = " [y/N] confirm   [Esc] cancel ".chars().count();
+    let body_w = c.body.lines().map(display_width).max().unwrap_or(0);
+    let title_w = display_width(c.title) + 2;
+    let hint_w = display_width(" [y/N] confirm   [Esc] cancel ");
     let desired_w = body_w.max(title_w).max(hint_w) as u16 + 4;
     let width = desired_w.min(area.width).max(20.min(area.width));
 
@@ -109,31 +110,6 @@ fn centered_rect(area: Rect, c: &Confirm<'_>) -> Rect {
         .flex(Flex::Center)
         .areas(vert);
     horiz
-}
-
-/// Block until the user accepts or rejects the dialog. Renders over the
-/// terminal's current contents — the caller is expected to have rendered the
-/// background view immediately prior.
-pub fn run<B: Backend>(terminal: &mut Terminal<B>, c: &Confirm<'_>) -> Result<bool>
-where
-    <B as Backend>::Error: Send + Sync + 'static,
-{
-    loop {
-        terminal.draw(|f| {
-            let area = f.area();
-            render(f, area, c);
-        })?;
-        match event::read()? {
-            Event::Key(key) if key.kind == KeyEventKind::Press => {
-                match decide_key(key, c.default) {
-                    Decision::Yes => return Ok(true),
-                    Decision::No => return Ok(false),
-                    Decision::Pending => continue,
-                }
-            }
-            _ => continue,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -170,6 +146,25 @@ mod tests {
     #[test]
     fn uppercase_n_is_no() {
         assert_eq!(decide_key(key(KeyCode::Char('N')), true), Decision::No);
+    }
+
+    #[test]
+    fn modified_y_n_are_pending() {
+        for ch in ['y', 'Y', 'n', 'N'] {
+            assert_eq!(
+                decide_key(
+                    key_with_mod(KeyCode::Char(ch), KeyModifiers::CONTROL),
+                    false
+                ),
+                Decision::Pending,
+                "Ctrl-{ch} must not confirm/cancel"
+            );
+            assert_eq!(
+                decide_key(key_with_mod(KeyCode::Char(ch), KeyModifiers::ALT), true),
+                Decision::Pending,
+                "Alt-{ch} must not confirm/cancel"
+            );
+        }
     }
 
     #[test]

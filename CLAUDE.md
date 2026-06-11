@@ -272,10 +272,10 @@ view bindings don't fire under the overlay.
   orchestrator's single scheduler loop is the **sole DB writer** and
   drains finished reviews at scheduler ticks; an **implementation
   semaphore of 1** serializes implement+test+commit; the reviewer runs
-  **read-only in a throwaway, isolated `git worktree`** pinned at the
-  reviewed SHA (RAII `git::ReviewWorktree`, `Drop` cleanup) so it
-  physically cannot touch the live tree (ancestry guard kept as
-  defense-in-depth).
+  **read-only by contract in a throwaway `git worktree`** pinned at the
+  reviewed SHA (RAII `git::ReviewWorktree`, `Drop` cleanup, Git env
+  redirection scrubbed). This is defense-in-depth, not filesystem
+  sandboxing; reviewer harnesses are trusted processes.
 - **No `StepStatus::AwaitingReview` variant.** A review-gated step stays
   `InProgress` — gating is **structural** (the re-parented edge to the
   corrective step / deps-not-satisfied), per §3.3/§10, not status-based.
@@ -341,8 +341,8 @@ view bindings don't fire under the overlay.
   = 3); exceeding it raises a `kind=blocker` interruption ("review loop —
   needs human") instead of spawning forever.
 - **§9 concurrency invariants** (hard): (1) one implementation slot
-  (semaphore=1); (2) reviews strictly read-only w.r.t. the working tree
-  (isolated worktree at a fixed SHA); (3) single DAG writer (only the
+  (semaphore=1); (2) reviews are read-only by contract and run from a
+  throwaway worktree at a fixed SHA; (3) single DAG writer (only the
   orchestrator mutates the DAG; reviewers only *request*); (4)
   cross-process interruption bridge via `run_locks` (reviews never take
   the run-lock).

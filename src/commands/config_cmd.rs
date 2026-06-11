@@ -21,11 +21,12 @@ pub fn config_show(out: &OutputContext) -> Result<()> {
     let config = config::load_or_create_config()?;
 
     if matches!(out.format, crate::output::OutputFormat::Json) {
-        // When `--json` is active, return the full config as JSON so
-        // tooling can scrape any field without a parser per field.
+        // Keep the broad JSON shape for diagnostics, but do not echo harness
+        // argv vectors: custom harness configs sometimes carry inline API
+        // keys or bearer tokens in those fields.
         let payload = serde_json::json!({
             "config_path": config_path.display().to_string(),
-            "config": config,
+            "config": redacted_config_value(&config)?,
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(());
@@ -53,10 +54,49 @@ pub fn config_show(out: &OutputContext) -> Result<()> {
     Ok(())
 }
 
+fn redacted_config_value(config: &Config) -> Result<serde_json::Value> {
+    let mut value = serde_json::to_value(config)?;
+    let Some(harnesses) = value
+        .get_mut("harnesses")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return Ok(value);
+    };
+
+    for harness in harnesses.values_mut() {
+        let Some(obj) = harness.as_object_mut() else {
+            continue;
+        };
+        for key in [
+            "args",
+            "plan_args",
+            "json_output_args",
+            "agent_file_args",
+            "model_args",
+            "auth_probe_args",
+        ] {
+            if obj
+                .get(key)
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|items| !items.is_empty())
+            {
+                obj.insert(
+                    key.to_string(),
+                    serde_json::Value::Array(vec![serde_json::Value::String(
+                        "<redacted>".to_string(),
+                    )]),
+                );
+            }
+        }
+    }
+
+    Ok(value)
+}
+
 /// Set the `display_timezone` field to `tz` and write the config back to
 /// disk. Rejects invalid IANA names up front so a typo never corrupts the
 /// on-disk config.
-pub fn config_set_timezone(tz: &str) -> Result<()> {
+pub fn config_set_timezone(tz: &str, out: &OutputContext) -> Result<()> {
     // Validate the IANA name first — we don't want to persist garbage.
     chrono_tz::Tz::from_str(tz).map_err(|e| {
         anyhow!(
@@ -71,7 +111,7 @@ pub fn config_set_timezone(tz: &str) -> Result<()> {
         .save()
         .context("Failed to persist updated config to disk")?;
 
-    eprintln!("display_timezone set to '{tz}'.");
+    out.status(format!("display_timezone set to '{tz}'."));
     Ok(())
 }
 
@@ -92,6 +132,7 @@ pub fn config_review_set(
     harness: Option<&str>,
     model: Option<&str>,
     enabled: Option<bool>,
+    out: &OutputContext,
 ) -> Result<()> {
     if harness.is_none() && model.is_none() && enabled.is_none() {
         return Err(anyhow!(
@@ -113,7 +154,7 @@ pub fn config_review_set(
         .save()
         .context("Failed to persist updated config to disk")?;
 
-    eprintln!(
+    out.status(format!(
         "Review config updated: enabled={}, harness={}, model={}.",
         config
             .review
@@ -130,7 +171,7 @@ pub fn config_review_set(
         } else {
             &config.review.model
         },
-    );
+    ));
     Ok(())
 }
 
@@ -167,13 +208,21 @@ mod tests {
         XdgGuard { _lock: lock, prev }
     }
 
+    fn quiet_out() -> OutputContext {
+        OutputContext {
+            format: crate::output::OutputFormat::Plain,
+            quiet: true,
+            color: false,
+        }
+    }
+
     #[test]
     fn test_set_timezone_persists_to_file() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _guard = set_xdg(tmp.path());
 
         // First call creates the file with the default config.
-        config_set_timezone("America/New_York").expect("set_timezone ok");
+        config_set_timezone("America/New_York", &quiet_out()).expect("set_timezone ok");
 
         let reloaded: Config = config::load_or_create_config().expect("reload");
         assert_eq!(reloaded.display_timezone, "America/New_York");
@@ -192,8 +241,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _guard = set_xdg(tmp.path());
 
-        let err =
-            config_set_timezone("Not/A_Real_Zone").expect_err("must reject invalid IANA name");
+        let err = config_set_timezone("Not/A_Real_Zone", &quiet_out())
+            .expect_err("must reject invalid IANA name");
         let msg = format!("{err}");
         assert!(msg.contains("Not/A_Real_Zone"), "{msg}");
         assert!(msg.contains("IANA"), "{msg}");
@@ -216,14 +265,14 @@ mod tests {
         let _guard = set_xdg(tmp.path());
 
         // First call: harness only. enabled/model stay at defaults.
-        config_review_set(Some("codex"), None, None).expect("set harness ok");
+        config_review_set(Some("codex"), None, None, &quiet_out()).expect("set harness ok");
         let c = config::load_or_create_config().expect("reload");
         assert_eq!(c.review.harness, "codex");
         assert_eq!(c.review.model, "");
         assert_eq!(c.review.enabled, None, "unpassed --enabled stays unset");
 
         // Second call: enabled only. harness must survive untouched.
-        config_review_set(None, None, Some(true)).expect("set enabled ok");
+        config_review_set(None, None, Some(true), &quiet_out()).expect("set enabled ok");
         let c = config::load_or_create_config().expect("reload");
         assert_eq!(c.review.enabled, Some(true));
         assert_eq!(
@@ -232,7 +281,7 @@ mod tests {
         );
 
         // Third call: model only. enabled + harness survive.
-        config_review_set(None, Some("gpt-5-codex"), None).expect("set model ok");
+        config_review_set(None, Some("gpt-5-codex"), None, &quiet_out()).expect("set model ok");
         let c = config::load_or_create_config().expect("reload");
         assert_eq!(c.review.model, "gpt-5-codex");
         assert_eq!(c.review.harness, "codex");
@@ -250,9 +299,47 @@ mod tests {
     fn test_config_review_set_requires_at_least_one_field() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _guard = set_xdg(tmp.path());
-        let err = config_review_set(None, None, None)
+        let err = config_review_set(None, None, None, &quiet_out())
             .expect_err("no fields must error rather than silently no-op");
         assert!(err.to_string().contains("Nothing to set"), "{err}");
+    }
+
+    #[test]
+    fn test_redacted_config_value_hides_harness_argument_vectors() {
+        let mut config = Config::default();
+        let harness = config
+            .harnesses
+            .get_mut("codex")
+            .expect("default codex harness should exist");
+        harness.args = vec![
+            "--api-key".to_string(),
+            "sk-test-secret".to_string(),
+            "--safe-flag".to_string(),
+        ];
+        harness.plan_args = vec!["--token=plan-secret".to_string()];
+        harness.auth_probe_args = vec!["auth".to_string(), "probe-secret".to_string()];
+        harness.auth_env_vars = vec!["OPENAI_API_KEY".to_string()];
+
+        let redacted = redacted_config_value(&config).unwrap();
+        let serialized = serde_json::to_string(&redacted).unwrap();
+        assert!(
+            !serialized.contains("sk-test-secret")
+                && !serialized.contains("plan-secret")
+                && !serialized.contains("probe-secret"),
+            "redacted config JSON must not contain inline harness secrets: {serialized}"
+        );
+        assert!(
+            serialized.contains("<redacted>"),
+            "argument vectors should be visibly redacted: {serialized}"
+        );
+        assert!(
+            serialized.contains("OPENAI_API_KEY"),
+            "auth env var names are not secret values and should remain useful diagnostics"
+        );
+        assert!(
+            serialized.contains("\"command\""),
+            "non-argv harness metadata should remain present"
+        );
     }
 
     #[test]
@@ -263,11 +350,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _guard = set_xdg(tmp.path());
 
-        let out = OutputContext {
-            format: crate::output::OutputFormat::Plain,
-            quiet: true,
-            color: false,
-        };
+        let out = quiet_out();
         config_show(&out).expect("config_show must succeed on a fresh config");
 
         // The show path loads-or-creates, so a config file now exists.

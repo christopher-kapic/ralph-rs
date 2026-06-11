@@ -4,6 +4,7 @@
 // by ratatui. Renders the step list, step detail panel, and keybinding help
 // bar.
 
+use std::borrow::Cow;
 use std::path::Path;
 use std::time::Instant;
 
@@ -126,9 +127,9 @@ fn running_indicator(app: &PlanDetailApp) -> Option<String> {
     Some(format!("{step_label}{phase_label} {mins:02}:{secs:02}"))
 }
 
-fn hint_for(app: &PlanDetailApp) -> String {
+fn hint_for(app: &PlanDetailApp) -> Cow<'static, str> {
     if app.palette_active() {
-        return "[tab] complete  [enter] submit  [esc] cancel".to_string();
+        return Cow::Borrowed("[tab] complete  [enter] submit  [esc] cancel");
     }
     match app.input_mode {
         InputMode::Normal => {
@@ -137,20 +138,22 @@ fn hint_for(app: &PlanDetailApp) -> String {
             // cancel). Outside a live run there's nothing to pause, so the
             // hint stays compact.
             if app.is_run_live() {
-                "[j/k] nav  [enter] open  [space] sel  [i/a] add  [d] del  [s] skip  [R] run  [P] pause  [S] stop  [/:] cmd  [q] back"
-                    .to_string()
+                Cow::Borrowed(
+                    "[j/k] nav  [enter] open  [i/a] add  [d] del  [z/Z] focus  [D/H/A/I] tools  [P] pause  [S] stop  [/:] cmd  [q] back",
+                )
             } else {
-                "[j/k] nav  [enter] open  [space] sel  [i/a] add  [d] del  [s] skip  [R] run  [S] stop  [/:] cmd  [q] back"
-                    .to_string()
+                Cow::Borrowed(
+                    "[j/k] nav  [enter] open  [space] sel  [i/a] add  [d] del  [z/Z] focus  [D/H/A/I] tools  [R] run  [/:] cmd  [q] back",
+                )
             }
         }
-        InputMode::AddStep(_) => "[Enter] confirm  [Esc] cancel".to_string(),
+        InputMode::AddStep(_) => Cow::Borrowed("[Enter] confirm  [Esc] cancel"),
     }
 }
 
 fn render_toast_overlay(frame: &mut Frame, area: Rect, text: &str, color: ratatui::style::Color) {
     let max_toast = area.width.saturating_sub(1).max(1);
-    let desired = text.chars().count().min(max_toast as usize) as u16;
+    let desired = chrome::display_width(text).min(max_toast as usize) as u16;
     if desired == 0 {
         return;
     }
@@ -182,7 +185,7 @@ fn draw_step_list(frame: &mut Frame, app: &mut PlanDetailApp, area: Rect) {
     // the topological dependency outline. The visible rows already honor the
     // §12.2 focus cone; the bordered title shows the focus tail so the user
     // sees where they're re-rooted even without looking at the breadcrumb.
-    let rows = app.outline.visible_rows();
+    let rows = app.outline.visible_rows_ref();
     let cursor = if rows.is_empty() {
         None
     } else {
@@ -242,7 +245,16 @@ fn draw_step_detail(frame: &mut Frame, app: &PlanDetailApp, area: Rect) {
     }
     let area = body_area;
 
-    let step = &app.steps[app.selected_index];
+    let Some(step) = app.current_step() else {
+        let empty = Paragraph::new("No visible step selected.").block(
+            Block::default()
+                .title(" Details ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        );
+        frame.render_widget(empty, body_area);
+        return;
+    };
     let mut lines: Vec<Line> = Vec::new();
 
     // §29: tails follow the cursor — they belong to the live step, so when
@@ -266,10 +278,12 @@ fn draw_step_detail(frame: &mut Frame, app: &PlanDetailApp, area: Rect) {
     // the plan-detail status line, the step-list glyph, and the plan-list
     // dot all funnel through `theme::step_status_color` so one concept can
     // never render two colors across screens.
-    let status_color = theme::step_status_color(step.status);
+    let effective_status =
+        crate::plan::effective_step_status(step.status, app.outline.is_blocked_step(&step.id));
+    let status_color = theme::step_status_color(effective_status);
     lines.push(Line::from(vec![
         Span::styled("Status: ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled(step.status.as_str(), Style::default().fg(status_color)),
+        Span::styled(effective_status.as_str(), Style::default().fg(status_color)),
     ]));
 
     // Attempt counter
@@ -792,6 +806,24 @@ mod tests {
             .join("\n")
     }
 
+    #[test]
+    fn right_pane_resolves_step_through_outline_cursor() {
+        let mut app = make_app(3);
+        app.outline.navigate_down();
+        assert_eq!(app.selected_index, 0, "flat index intentionally stale");
+
+        let out = rendered(&mut app, 80, 24);
+
+        assert!(
+            out.contains("Step 1"),
+            "right pane should render the outline-selected step:\n{out}"
+        );
+        assert!(
+            !out.contains("Step 0"),
+            "right pane must not render stale selected_index step:\n{out}"
+        );
+    }
+
     /// Build a single-step app with the given status / overrides for
     /// right-pane assertions. Plan-level harness is `claude` and tests are a
     /// two-command list; step-level overrides default to `None`.
@@ -870,6 +902,20 @@ mod tests {
         assert!(out.contains("• cargo test"), "test cmd missing:\n{out}");
         assert!(out.contains("• cargo clippy"), "clippy cmd missing:\n{out}");
         assert!(!out.contains("Elapsed:"), "no timer for pending:\n{out}");
+    }
+
+    #[test]
+    fn right_pane_uses_blocked_overlay_for_open_interruption() {
+        let mut app = app_with_step(StepStatus::Pending, 0, Some(3), None, None, None);
+        app.sync_outline(Default::default(), ["s0".to_string()].into_iter().collect());
+
+        let out = rendered(&mut app, 80, 24);
+
+        assert!(out.contains("Status: blocked"), "status missing:\n{out}");
+        assert!(
+            !out.contains("Status: pending"),
+            "right pane must not show stored pending status while blocked:\n{out}"
+        );
     }
 
     #[test]
@@ -1003,11 +1049,12 @@ mod tests {
     #[test]
     fn right_pane_renders_tails_when_cursor_on_live_step() {
         // §29: tail content only appears in the right pane when the cursor
-        // is parked on the live step. Park selection at index 1 (matching
+        // is parked on the live step. Park the outline cursor at row 1 (matching
         // step_id `s1`), push tail lines, render, and confirm the tail
         // headers + content are present.
         let mut app = make_app(3);
-        app.selected_index = 1;
+        app.outline.navigate_down();
+        app.realign_selection_to_outline();
         app.update_live_run(Some(make_live_run_for(
             "s1",
             2,
@@ -1038,7 +1085,9 @@ mod tests {
         // status) must still render normally.
         let mut app = make_app(3);
         // live step is `s1` (step 2); cursor parked on `s2` (step 3).
-        app.selected_index = 2;
+        app.outline.navigate_down();
+        app.outline.navigate_down();
+        app.realign_selection_to_outline();
         app.update_live_run(Some(make_live_run_for(
             "s1",
             2,
@@ -1087,12 +1136,24 @@ mod tests {
     }
 
     #[test]
-    fn hint_bar_advertises_run_and_stop_keybinds() {
-        // §7 keybinding: bottom hint must include [R] run and [S] stop so
-        // the controls are discoverable in the chrome footer.
+    fn hint_bar_advertises_core_plan_detail_keybinds() {
         let mut app = make_app(1);
         let out = rendered(&mut app, 120, 6);
         assert!(out.contains("[R] run"), "missing [R] hint:\n{out}");
+        assert!(out.contains("[z/Z] focus"), "missing focus hint:\n{out}");
+        assert!(
+            out.contains("[D/H/A/I] tools"),
+            "missing tools hint:\n{out}"
+        );
+    }
+
+    #[test]
+    fn live_hint_bar_advertises_pause_and_stop_keybinds() {
+        let mut app = make_app(1);
+        app.note_run_started(Utc::now());
+
+        let out = rendered(&mut app, 180, 6);
+        assert!(out.contains("[P] pause"), "missing [P] hint:\n{out}");
         assert!(out.contains("[S] stop"), "missing [S] hint:\n{out}");
     }
 

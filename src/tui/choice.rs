@@ -15,6 +15,7 @@
 // [`super::run_dialog`]. The `/run` branch-choice dialog is the first
 // consumer; the skip dialog (plan phase 5) is the second.
 
+use crate::tui::chrome::display_width;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
@@ -114,12 +115,32 @@ impl<T: Clone> Choice<T> {
 /// Draw the dialog as a centered overlay over `area`. The caller renders
 /// the background view first; `Clear` blanks just the dialog rectangle.
 pub fn render<T: ChoiceItem>(frame: &mut Frame, area: Rect, title: &str, choice: &Choice<T>) {
-    let lines: Vec<Line> = choice
-        .choices
+    let labels: Vec<String> = choice.choices.iter().map(|c| c.label()).collect();
+    let content_w = labels
+        .iter()
+        .map(|label| display_width(label))
+        .max()
+        .unwrap_or(0)
+        + 2; // "> " / "  " prefix
+
+    let body_lines = labels.len().max(1) as u16;
+    let max_w = content_w.max(display_width(title)).max(20) as u16;
+    let height = (body_lines + 2).min(area.height).max(3.min(area.height));
+    let width = (max_w + 4).min(area.width).max(20.min(area.width));
+    let visible_rows = height.saturating_sub(2).max(1) as usize;
+    let window_start = if choice.focused >= visible_rows {
+        choice.focused + 1 - visible_rows
+    } else {
+        0
+    };
+    let window_end = (window_start + visible_rows).min(labels.len());
+
+    let lines: Vec<Line> = labels
         .iter()
         .enumerate()
-        .map(|(i, c)| {
-            let label = c.label();
+        .skip(window_start)
+        .take(window_end.saturating_sub(window_start))
+        .map(|(i, label)| {
             if i == choice.focused {
                 Line::from(Span::styled(
                     format!("> {label}"),
@@ -130,19 +151,6 @@ pub fn render<T: ChoiceItem>(frame: &mut Frame, area: Rect, title: &str, choice:
             }
         })
         .collect();
-
-    let content_w = choice
-        .choices
-        .iter()
-        .map(|c| c.label().chars().count())
-        .max()
-        .unwrap_or(0)
-        + 2; // "> " / "  " prefix
-
-    let body_lines = lines.len().max(1) as u16;
-    let max_w = content_w.max(title.chars().count()).max(20) as u16;
-    let height = (body_lines + 2).min(area.height).max(3.min(area.height));
-    let width = (max_w + 4).min(area.width).max(20.min(area.width));
 
     let [vert] = Layout::vertical([Constraint::Length(height)])
         .flex(Flex::Center)
@@ -344,5 +352,44 @@ mod tests {
         assert!(dump.contains("Alpha"), "Alpha missing:\n{dump}");
         assert!(dump.contains("Beta"), "Beta missing:\n{dump}");
         assert!(dump.contains("Gamma"), "Gamma missing:\n{dump}");
+    }
+
+    #[test]
+    fn render_windows_long_lists_to_keep_focus_visible() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        #[derive(Debug, Clone)]
+        struct Row(usize);
+
+        impl ChoiceItem for Row {
+            fn label(&self) -> String {
+                format!("Row {}", self.0)
+            }
+        }
+
+        let backend = TestBackend::new(30, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let c = Choice::new((0..10).map(Row).collect(), 9);
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render(f, area, " Pick one ", &c);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let dump: String = (0..buf.area().height)
+            .map(|y| {
+                (0..buf.area().width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(dump.contains("> Row 9"), "focused row missing:\n{dump}");
+        assert!(
+            !dump.contains("Row 0"),
+            "old top rows should be outside the visible window:\n{dump}"
+        );
     }
 }

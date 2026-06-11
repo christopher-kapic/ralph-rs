@@ -11,12 +11,11 @@
 //
 // Hard invariants enforced here:
 //  - O(1) reviewer prompt: a SINGLE `git show <sha>` diff (Decision 5).
-//  - Reviews are strictly read-only w.r.t. the working tree (§9-inv-2),
-//    enforced *structurally*: the reviewer harness is spawned in a THROWAWAY
-//    detached `git worktree` pinned at the reviewed SHA, NOT in the shared
-//    implementation workdir. It is physically incapable of touching the live
-//    tree the next implementation commits from. `assert_tree_unchanged_by_review`
-//    is kept as a cheap defense-in-depth ancestry check on the main repo.
+//  - Reviews are intended to be read-only w.r.t. the working tree (§9-inv-2).
+//    The reviewer harness is spawned in a THROWAWAY detached `git worktree`
+//    pinned at the reviewed SHA, NOT in the shared implementation workdir, and
+//    Git redirection env vars are scrubbed. This is defense-in-depth, not a
+//    filesystem sandbox: configured reviewer harnesses are trusted processes.
 //  - Single DAG writer: nothing in the reviewer path writes step rows/edges;
 //    only `consume_corrective_request` (orchestrator) does.
 
@@ -135,15 +134,15 @@ pub fn effective_max_review_corrections(plan: &Plan) -> usize {
 
 /// Snapshot taken just before a reviewer subprocess runs, used by
 /// [`assert_tree_unchanged_by_review`] as **defense-in-depth** for the
-/// history dimension of the §9-inv-2 hard invariant. The *primary* guarantee
-/// is now structural: the reviewer runs in a throwaway detached worktree
-/// (`git::ReviewWorktree`) and is physically unable to touch the main
-/// workdir/HEAD. This ancestry snapshot remains as a cheap belt-and-suspenders
-/// check that the reviewed commit is still reachable from the main repo's
-/// HEAD afterwards (catching a hypothetical reviewer that rewrote the
-/// reviewed line). A review runs against a *fixed commit SHA* and must never
-/// check out, edit, amend, reset, or rebase the line of history it is
-/// reviewing.
+/// history dimension of the §9-inv-2 review contract. The reviewer runs in a
+/// throwaway detached worktree (`git::ReviewWorktree`) with Git redirection
+/// environment variables scrubbed, but it is not filesystem-sandboxed;
+/// reviewer harnesses are trusted processes. This ancestry snapshot remains
+/// as a cheap defense-in-depth check that the reviewed commit is still
+/// reachable from the main repo's HEAD afterwards (catching a reviewer that
+/// rewrote the reviewed line). A review runs against a *fixed commit SHA* and
+/// must never check out, edit, amend, reset, or rebase the line of history it
+/// is reviewing.
 ///
 /// **Why reachability-from-HEAD, not a live HEAD/worktree snapshot:** under
 /// the spec's concurrency model (§2 Decision 3 / §3.5 item 3) a review of
@@ -183,13 +182,12 @@ impl ReviewTreeGuard {
     }
 }
 
-/// Hard assertion that the reviewer subprocess did NOT check out, edit,
+/// Defense-in-depth assertion that the reviewer subprocess did NOT check out,
 /// amend, reset, or rebase the **history line under review**
-/// (docs/dag-redesign.md §9 invariant 2). Reviews are "strictly read-only" —
-/// this is the guard that makes that machine-checkable rather than
-/// aspirational. A violation is a blocker (returns `Err`), never silently
-/// tolerated, because a review that rewrote the reviewed history would
-/// corrupt the linear history the concurrent implementation is building on.
+/// (docs/dag-redesign.md §9 invariant 2). A violation is a blocker (returns
+/// `Err`), never silently tolerated, because a review that rewrote the
+/// reviewed history would corrupt the linear history the concurrent
+/// implementation is building on.
 ///
 /// This deliberately does **not** compare live `HEAD` / worktree: under
 /// genuine concurrency (§2 Decision 3) the next unrelated implementation
@@ -352,19 +350,16 @@ pub struct ReviewSubprocessArgs<'a> {
 ///   (`config.review.harness` / `.model`), not the implementation harness.
 /// - Spawns the reviewer in a THROWAWAY detached `git worktree` pinned at
 ///   the reviewed SHA ([`git::ReviewWorktree`]) — *not* in the shared
-///   implementation `workdir`. This makes the §9-inv-2 read-only invariant
-///   *structural*: a reviewer that does `echo evil >> src/foo.rs` (no commit)
-///   writes into the disposable tree, which is torn down on every exit path
-///   (RAII `Drop`) and is never the directory the next implementation commits
-///   from. The throwaway tree cannot interfere with a concurrent unrelated
-///   implementation in the main workdir — which is the entire premise of
-///   §3.5-item-3 concurrent review.
+///   implementation `workdir`. This keeps ordinary cwd-relative reviewer
+///   edits out of the live tree, but it is not a filesystem sandbox; reviewer
+///   harnesses are trusted processes. The disposable tree is torn down on
+///   every exit path (RAII `Drop`) and is never the directory the next
+///   implementation commits from.
 /// - Additionally captures a [`ReviewTreeGuard`] on the **main repo** before
 ///   spawning and asserts the reviewed commit is still an ancestor of HEAD
 ///   after — kept as cheap defense-in-depth for the history dimension (it
-///   catches a reviewer that somehow rewrote the reviewed line). With the
-///   reviewer isolated in its own worktree it cannot affect the main tree or
-///   HEAD anyway; the assertion is a belt-and-suspenders invariant check.
+///   catches a trusted reviewer that accidentally or intentionally rewrote
+///   the reviewed line through an explicit main-repo path).
 ///
 /// It does NOT write `review_status`, does NOT annotate the git note, and
 /// does NOT write the V29 bridge row — all of that is the orchestrator's
@@ -407,7 +402,7 @@ pub async fn run_review_subprocess(args: ReviewSubprocessArgs<'_>) -> Result<Rev
 
     // O(1) reviewer diff: EXACTLY one commit's `git show` patch. This is the
     // single place the reviewer diff is produced — never a cumulative/range
-    // or dependency diff (Decision 5 / §9 hard invariant). `short_sha` and
+    // or dependency diff (Decision 5 / §9 review contract). `short_sha` and
     // `show_commit_diff` are synchronous blocking git subprocess calls on this
     // runtime-worker task, so run them under `review_blocking_git`.
     let (short, commit_diff) = review_blocking_git(|| {
@@ -428,16 +423,14 @@ pub async fn run_review_subprocess(args: ReviewSubprocessArgs<'_>) -> Result<Rev
     // practice; kept for parity with the implementation spawn path.
     let env_vars = harness::build_harness_env(harness_config, None);
 
-    // STRUCTURAL §9-inv-2 ENFORCEMENT: spawn the reviewer in a THROWAWAY
+    // Defense-in-depth for §9-inv-2: spawn the reviewer in a THROWAWAY
     // detached worktree pinned at the reviewed SHA — never the shared
-    // implementation `workdir`. A reviewer that edits files (with or without
-    // committing) can only touch this disposable tree; it physically cannot
-    // reach the live workdir the next implementation commits from. The RAII
-    // guard's `Drop` removes the worktree on EVERY exit path of this function
-    // (normal return, the `?` below, a spawn/await error, a panic unwinding
-    // through this spawned task, or the task being aborted) — there is no
-    // path that creates a worktree and leaks it; `git worktree prune` runs
-    // unconditionally so no orphan administrative entry survives either.
+    // implementation `workdir`. This keeps ordinary reviewer edits out of the
+    // live tree, but it is not a filesystem sandbox; reviewer harnesses are
+    // trusted processes. The RAII guard's `Drop` removes the worktree on EVERY
+    // exit path of this function (normal return, the `?` below, a spawn/await
+    // error, a panic unwinding through this spawned task, or the task being
+    // aborted), with `git worktree prune` as cleanup for admin entries.
     // `ReviewWorktree::create` shells out to `git worktree add` (blocking) on
     // this runtime worker — wrap it like the other inline git calls.
     let review_wt = review_blocking_git(|| git::ReviewWorktree::create(workdir, commit_sha))
@@ -456,7 +449,7 @@ pub async fn run_review_subprocess(args: ReviewSubprocessArgs<'_>) -> Result<Rev
     // The harness's cwd is the THROWAWAY worktree, NOT `workdir`. The child
     // is a process-group leader (spawn_harness_with_delivery sets
     // process_group(0) on unix), so a timeout can SIGKILL the whole group.
-    let (child, _tmp) = harness::spawn_harness_with_delivery(
+    let (child, _tmp) = harness::spawn_reviewer_harness_with_delivery(
         harness_config,
         &args,
         &env_vars,
@@ -510,9 +503,9 @@ pub async fn run_review_subprocess(args: ReviewSubprocessArgs<'_>) -> Result<Rev
     let stdout = wait.stdout;
 
     // Defense-in-depth: the reviewed commit must remain reachable from the
-    // main repo's HEAD (catches a hypothetical history rewrite of the
-    // reviewed line; the worktree isolation already prevents worktree-only
-    // tampering of the live implementation tree structurally).
+    // main repo's HEAD. The throwaway worktree keeps ordinary cwd-relative
+    // reviewer writes out of the live tree, while this catches explicit
+    // history rewrites against the main repo.
     review_blocking_git(|| assert_tree_unchanged_by_review(workdir, commit_sha, &guard))?;
     // Explicit teardown on the success path (Drop would also do this on any
     // early return / panic above; calling it here makes the lifecycle
@@ -1180,7 +1173,7 @@ mod tests {
 
     // ---------------------------------------------------------------------
     // Integration tests (real git repo + in-memory DB + stub harness).
-    // These prove the §9 hard invariants: read-only review (STEP 37),
+    // These prove the §9 review contracts: throwaway-worktree review (STEP 37),
     // single DAG writer / structured channel (STEP 39), corrective insert +
     // re-parent (STEP 40), recursion cap → blocker (STEP 41).
     // ---------------------------------------------------------------------
@@ -1378,24 +1371,21 @@ mod tests {
         );
     }
 
-    /// HARD-INVARIANT PROOF (§9-inv-2) — the **worktree-only tamper class**
-    /// (the regression this fix closes). A malicious reviewer that ONLY edits
-    /// the working tree (writes/overwrites files, NEVER commits) must not be
-    /// able to corrupt the implementation's live workdir. Before the fix the
-    /// ancestry guard returned `Ok` for this case (the reviewed commit stayed
-    /// an ancestor of HEAD) and the injected junk was swept into the next
-    /// per-iteration commit. Now the reviewer is spawned in a THROWAWAY
-    /// detached worktree, so its writes land there and CANNOT appear in the
-    /// shared `workdir`. We prove the live workdir is byte-for-byte untouched.
+    /// REVIEW WORKTREE PROOF (§9-inv-2) — cwd-relative reviewer writes land in
+    /// the throwaway worktree, not the live implementation workdir. This is not
+    /// filesystem sandboxing: reviewer harnesses remain trusted processes and
+    /// could still write absolute paths. The regression this covers is the
+    /// ordinary "reviewer edits its cwd" class that ancestry checks alone could
+    /// not detect.
     #[tokio::test]
     async fn test_review_worktree_only_tamper_cannot_touch_live_workdir() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         init_repo(dir);
-        // Malicious reviewer: edits a tracked file AND drops a brand-new
-        // untracked file — but NEVER commits (the exact class the ancestry
-        // guard alone could not catch). It runs in its own cwd (the throwaway
-        // worktree); these writes must never reach `dir`.
+        // Reviewer edits a tracked file AND drops a brand-new untracked file
+        // in its cwd, but NEVER commits (the exact class the ancestry guard
+        // alone could not catch). It runs in its own cwd (the throwaway
+        // worktree); these cwd-relative writes must never reach `dir`.
         let script = write_stub(
             dir,
             "evil.sh",
@@ -1428,8 +1418,7 @@ mod tests {
         // The injected untracked file NEVER appears in the live workdir.
         assert!(
             !dir.join("injected_by_reviewer.txt").exists(),
-            "reviewer-written file leaked into the live implementation workdir \
-             (§9-inv-2 worktree isolation violated)"
+            "reviewer cwd-relative file leaked into the live implementation workdir"
         );
         // The tracked file the reviewer appended to is unchanged in the
         // live workdir (seed_committed_step never wrote to README.md after
@@ -1444,8 +1433,8 @@ mod tests {
         // sweep in any reviewer-introduced content.
         assert!(
             !crate::git::has_uncommitted_changes(dir).unwrap(),
-            "reviewer tampering dirtied the live workdir; the next step's \
-             commit would sweep it in (the corruption §9-inv-2 prevents)"
+            "reviewer cwd-relative writes dirtied the live workdir; the next step's \
+             commit would sweep them in"
         );
         // No orphan review worktree left behind on a passing review.
         // `Drop` cleans up synchronously; `await_worktree_count` converges
@@ -1458,7 +1447,7 @@ mod tests {
         );
     }
 
-    /// HARD-INVARIANT PROOF (§9-inv-2) — the **history-rewrite dimension**
+    /// DEFENSE-IN-DEPTH PROOF (§9-inv-2) — the **history-rewrite dimension**
     /// (kept defense-in-depth coverage). A reviewer that reaches back into
     /// the *main* repo and rewrites the reviewed line (`git -C <workdir>
     /// commit --amend`) removes the reviewed commit from HEAD's ancestry; the
@@ -1505,8 +1494,7 @@ mod tests {
 
         assert!(
             res.is_err(),
-            "a reviewer that rewrote the reviewed commit MUST be rejected \
-             (§9-inv-2 read-only review hard invariant)"
+            "a reviewer that rewrote the reviewed commit MUST be rejected"
         );
         let msg = format!("{:#}", res.unwrap_err());
         assert!(

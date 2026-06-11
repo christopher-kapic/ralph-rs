@@ -11,10 +11,10 @@
 // [`dispatch_event`]. Because the receiver is owned by the sync loop and
 // the producer side runs inside an owned tokio runtime, the subscription's
 // lifetime is bounded by the user's view: when the user pops back to the
-// plan list, the subscription is dropped, the tokio runtime shuts down, the
-// reader task is cancelled, and the runner subprocess is reaped via
-// [`tokio::process::Child`]'s default kill_on_drop semantics (see
-// [`spawn_streaming_runner`]).
+// plan list, the subscription is dropped and the tokio runtime shuts down.
+// The runner subprocess is deliberately not killed on subscription drop:
+// leaving the TUI detaches from the live stream, while explicit cancel/skip
+// controls are responsible for stopping a run.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -24,7 +24,7 @@ use anyhow::{Context, Result};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::runtime::Runtime;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, error::TryRecvError};
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::oneshot;
 
 use crate::output::RunEvent;
@@ -43,6 +43,11 @@ pub const TAIL_BUFFER_LINES: usize = 256;
 /// "Last ~20 lines" the spec mentions in TUI-plan.md §13.
 pub const TAIL_VISIBLE_LINES: usize = 20;
 
+/// Maximum live-run events buffered while the synchronous TUI is busy in a
+/// nested view or modal. Once full, newer events are dropped rather than
+/// allowing unbounded memory growth or blocking the runner stdout reader.
+pub const EVENT_BUFFER_CAPACITY: usize = 1024;
+
 // ---------------------------------------------------------------------------
 // RunSubscription — handle to a live event stream
 // ---------------------------------------------------------------------------
@@ -52,9 +57,9 @@ pub const TAIL_VISIBLE_LINES: usize = 20;
 /// Constructed via [`spawn_streaming_runner`]. The owned tokio runtime keeps
 /// the reader task and child process alive for the subscription's lifetime;
 /// dropping a `RunSubscription` shuts the runtime down, which cancels the
-/// reader task and (via `kill_on_drop`) terminates the child.
+/// reader task and detaches from the child without terminating the run.
 pub struct RunSubscription {
-    rx: UnboundedReceiver<RunEvent>,
+    rx: Receiver<RunEvent>,
     /// Single-use channel for the runner's stderr + non-zero exit status
     /// when it fails to start (preflight errors, missing harness, dirty
     /// tree, run-lock held by another process, etc.). The spawn task
@@ -108,8 +113,8 @@ impl RunSubscription {
     /// True once the producer side has hung up — i.e. the runner subprocess
     /// exited and the reader task drained its stdout. Callers use this to
     /// detect run completion and clean up the subscription.
-    pub fn is_disconnected(&mut self) -> bool {
-        matches!(self.rx.try_recv(), Err(TryRecvError::Disconnected))
+    pub fn is_disconnected(&self) -> bool {
+        self.rx.is_closed() && self.rx.is_empty()
     }
 
     /// Poll the runner-failure side channel without blocking. This keeps the
@@ -190,7 +195,7 @@ pub fn build_streaming_run_command(
         // surface them to the TUI as a toast instead of silently dropping
         // them on the floor.
         .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .kill_on_drop(false);
     cmd
 }
 
@@ -201,7 +206,7 @@ pub fn build_streaming_run_command(
 /// Spawn the runner subprocess and return a [`RunSubscription`] that yields
 /// the parsed NDJSON event stream. The owned tokio runtime stays alive for
 /// the subscription; dropping the subscription tears the runtime down,
-/// which kills the child and cancels the reader task.
+/// which cancels the reader task and leaves the runner subprocess alive.
 pub fn spawn_streaming_runner(
     exe: PathBuf,
     project: PathBuf,
@@ -211,7 +216,7 @@ pub fn spawn_streaming_runner(
     let runtime = Arc::new(
         tokio::runtime::Runtime::new().context("create tokio runtime for run subscription")?,
     );
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, rx) = tokio::sync::mpsc::channel(EVENT_BUFFER_CAPACITY);
     let (failure_tx, failure_rx) = oneshot::channel::<String>();
     // Held in an Option so the (at most one) send site can `.take()` it; on
     // clean exits the Option remains Some at task end, the Sender drops, and
@@ -308,22 +313,34 @@ pub fn spawn_streaming_runner(
 /// is dropped. Lines that fail to parse are silently skipped — the
 /// runner's stdout may contain stray non-JSON lines (panics, crash backtraces),
 /// and dropping a single line is preferable to tearing down the subscription.
-pub async fn consume_lines<R>(reader: R, tx: UnboundedSender<RunEvent>)
+pub async fn consume_lines<R>(reader: R, tx: Sender<RunEvent>)
 where
     R: AsyncBufRead + Unpin,
 {
-    let mut lines = reader.lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        let trimmed = line.trim();
+    let mut reader = reader;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let n = match reader.read_until(b'\n', &mut line).await {
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        if n == 0 {
+            break;
+        }
+        let decoded = String::from_utf8_lossy(&line);
+        let trimmed = decoded.trim();
         if trimmed.is_empty() {
             continue;
         }
         match serde_json::from_str::<RunEvent>(trimmed) {
-            Ok(evt) => {
-                if tx.send(evt).is_err() {
-                    break;
+            Ok(evt) => match tx.try_send(evt) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    continue;
                 }
-            }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+            },
             Err(_) => continue,
         }
     }
@@ -385,6 +402,13 @@ pub fn dispatch_event(app: &mut PlanDetailApp, event: &RunEvent) {
             // tail buffers stay so the user can see what the cancelled attempt
             // produced. No state mutation here — the next `PhaseChanged` /
             // `HarnessChunk` from the retry refreshes the right pane.
+        }
+        RunEvent::SkipRequestIgnored { reason, .. } => {
+            app.toasts.push(
+                format!("Skip request ignored: {reason}"),
+                crate::tui::toast::ToastKind::Info,
+                std::time::Instant::now(),
+            );
         }
         RunEvent::PromptPrepared { .. } => {
             // Prompt preview surfaces in `execution_logs`; the DB-poll sync
@@ -856,6 +880,60 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_streaming_runner_detaches_on_subscription_drop() {
+        let src = include_str!("events.rs");
+        let start = src
+            .find("pub fn build_streaming_run_command(")
+            .expect("build_streaming_run_command must exist");
+        let rest = &src[start..];
+        let end = rest
+            .find("// ---------------------------------------------------------------------------\n// Spawn entry point")
+            .expect("command builder section end must exist");
+        let body = &rest[..end];
+        assert!(
+            body.contains(".kill_on_drop(false)"),
+            "TUI live-run subscription drops must detach; explicit cancel controls stop the run"
+        );
+        assert!(
+            !body.contains(".kill_on_drop(true)"),
+            "dropping the TUI subscription must not implicitly kill the runner"
+        );
+    }
+
+    #[test]
+    fn test_is_disconnected_does_not_consume_buffered_event() {
+        let runtime = Arc::new(Runtime::new().expect("runtime"));
+        let (tx, rx) = tokio::sync::mpsc::channel(EVENT_BUFFER_CAPACITY);
+        let (_failure_tx, failure_rx) = oneshot::channel::<String>();
+        tx.try_send(RunEvent::Summary {
+            plan_status: PlanStatus::Complete,
+            steps_complete: 1,
+            steps_total: 1,
+            duration_secs: 0.1,
+            cost_usd: None,
+            started_at: Utc::now(),
+            ended_at: Utc::now(),
+        })
+        .expect("queue event");
+        drop(tx);
+
+        let mut sub = RunSubscription {
+            rx,
+            failure: failure_rx,
+            _runtime: runtime,
+        };
+
+        assert!(
+            !sub.is_disconnected(),
+            "buffered events must be drained before the subscription is considered complete"
+        );
+        let drained = sub.drain();
+        assert_eq!(drained.len(), 1, "is_disconnected must not drop events");
+        assert!(matches!(drained[0], RunEvent::Summary { .. }));
+        assert!(sub.is_disconnected());
+    }
+
     // -- consume_lines integration with an in-memory pipe --
 
     /// Integration test (per TUI-plan.md §13): the fake runner is a
@@ -867,7 +945,7 @@ mod tests {
     #[tokio::test]
     async fn test_fake_runner_streams_into_app_via_dispatch() {
         let (mut writer, reader) = tokio::io::duplex(4096);
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RunEvent>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<RunEvent>(EVENT_BUFFER_CAPACITY);
         let buf_reader = BufReader::new(reader);
 
         // Spawn the consumer in the background so we can write while it reads.
@@ -915,7 +993,7 @@ mod tests {
     #[tokio::test]
     async fn test_consume_lines_skips_malformed_lines() {
         let (mut writer, reader) = tokio::io::duplex(4096);
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RunEvent>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<RunEvent>(EVENT_BUFFER_CAPACITY);
         let buf_reader = BufReader::new(reader);
         let consumer = tokio::spawn(async move {
             consume_lines(buf_reader, tx).await;
@@ -941,11 +1019,83 @@ mod tests {
         assert_eq!(count, 2, "exactly 2 well-formed events should pass through");
     }
 
+    #[tokio::test]
+    async fn test_consume_lines_drops_when_event_buffer_is_full() {
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<RunEvent>(1);
+        let buf_reader = BufReader::new(reader);
+        let consumer = tokio::spawn(async move {
+            consume_lines(buf_reader, tx).await;
+        });
+
+        for seq in 0..3 {
+            writer
+                .write_all(
+                    format!(
+                        r#"{{"event":"harness_chunk","stream":"stdout","text":"line {seq}","seq":{seq}}}"#
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            writer.write_all(b"\n").await.unwrap();
+        }
+        drop(writer);
+        consumer.await.unwrap();
+
+        let mut count = 0usize;
+        while rx.try_recv().is_ok() {
+            count += 1;
+        }
+        assert_eq!(
+            count, 1,
+            "bounded stream buffer should drop events instead of growing without limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_consume_lines_invalid_utf8_does_not_stop_stream() {
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<RunEvent>(EVENT_BUFFER_CAPACITY);
+        let buf_reader = BufReader::new(reader);
+        let consumer = tokio::spawn(async move {
+            consume_lines(buf_reader, tx).await;
+        });
+
+        writer.write_all(b"\xff\xfe not utf8\n").await.unwrap();
+        writer
+            .write_all(
+                br#"{"event":"phase_changed","phase":"harness","phase_started_at":"2026-04-22T18:00:00Z"}"#,
+            )
+            .await
+            .unwrap();
+        writer.write_all(b"\n\xff\n").await.unwrap();
+        writer
+            .write_all(br#"{"event":"harness_chunk","stream":"stdout","text":"ok","seq":0}"#)
+            .await
+            .unwrap();
+        writer.write_all(b"\n").await.unwrap();
+        drop(writer);
+        consumer.await.unwrap();
+
+        let mut events = Vec::new();
+        while let Ok(evt) = rx.try_recv() {
+            events.push(evt);
+        }
+        assert_eq!(
+            events.len(),
+            2,
+            "invalid UTF-8 lines must be skipped without stopping the reader"
+        );
+        assert!(matches!(events[0], RunEvent::PhaseChanged { .. }));
+        assert!(matches!(events[1], RunEvent::HarnessChunk { .. }));
+    }
+
     /// A delivered failure message is surfaced exactly once.
     #[test]
     fn test_poll_failure_status_message_then_clean() {
         let runtime = Arc::new(Runtime::new().unwrap());
-        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<RunEvent>();
+        let (_tx, rx) = tokio::sync::mpsc::channel::<RunEvent>(EVENT_BUFFER_CAPACITY);
         let (failure_tx, failure_rx) = oneshot::channel::<String>();
         failure_tx.send("preflight failed".to_string()).unwrap();
         let mut sub = RunSubscription {
@@ -969,7 +1119,7 @@ mod tests {
     #[test]
     fn test_poll_failure_status_pending() {
         let runtime = Arc::new(Runtime::new().unwrap());
-        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<RunEvent>();
+        let (_tx, rx) = tokio::sync::mpsc::channel::<RunEvent>(EVENT_BUFFER_CAPACITY);
         let (failure_tx, failure_rx) = oneshot::channel::<String>();
         let _keep_sender_alive = failure_tx;
         let mut sub = RunSubscription {
@@ -984,7 +1134,7 @@ mod tests {
     #[test]
     fn test_poll_failure_status_clean_run() {
         let runtime = Arc::new(Runtime::new().unwrap());
-        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<RunEvent>();
+        let (_tx, rx) = tokio::sync::mpsc::channel::<RunEvent>(EVENT_BUFFER_CAPACITY);
         let (failure_tx, failure_rx) = oneshot::channel::<String>();
         drop(failure_tx);
         let mut sub = RunSubscription {
@@ -1001,7 +1151,7 @@ mod tests {
     #[test]
     fn test_run_subscription_disconnect_after_drain() {
         let runtime = Arc::new(Runtime::new().unwrap());
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::channel(EVENT_BUFFER_CAPACITY);
         let (_failure_tx, failure_rx) = oneshot::channel::<String>();
         let mut sub = RunSubscription {
             rx,
@@ -1009,7 +1159,7 @@ mod tests {
             _runtime: runtime,
         };
 
-        tx.send(RunEvent::PhaseChanged {
+        tx.try_send(RunEvent::PhaseChanged {
             phase: Phase::Harness,
             phase_started_at: Utc::now(),
         })

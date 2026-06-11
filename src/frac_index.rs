@@ -65,7 +65,8 @@ pub fn initial_key() -> String {
 
 /// Returns a key that sorts after the given key.
 ///
-/// Increments the last character. If it overflows, appends a '0'.
+/// Increments the last character. If it overflows, appends a midpoint suffix
+/// so there remains room to insert between the original key and the new key.
 ///
 /// # Errors
 /// Returns [`FracIndexError::EmptyKey`] if `key` is empty.
@@ -89,9 +90,17 @@ pub fn key_after(key: &str) -> Result<String, FracIndexError> {
         }
         Ok(result)
     } else {
-        // Last char is 'z', append '0' to go after
-        Ok(format!("{key}0"))
+        Ok(format!("{key}{}", ALPHABET[ALPHABET.len() / 2] as char))
     }
+}
+
+/// Returns a key that sorts before the given key.
+///
+/// # Errors
+/// Returns [`FracIndexError::NoKeyBetween`] when the key is already at the
+/// lower edge of the alphabet and no non-empty key can sort before it.
+pub fn key_before(key: &str) -> Result<String, FracIndexError> {
+    key_between("", key)
 }
 
 /// Returns a key that is lexicographically between `a` and `b`.
@@ -208,10 +217,28 @@ fn suffix_between(a: &str, b: Option<&str>) -> Result<String, FracIndexError> {
                     let mid = bi / 2;
                     return Ok(String::from(ALPHABET[mid] as char));
                 }
-                // b[0] is 0 or 1, go deeper
-                let mut result = String::from(ALPHABET[0] as char);
-                result.push_str(&suffix_between("", Some(&b_str[1..]))?);
-                return Ok(result);
+                if bi == 1 {
+                    // Anything starting with '0' sorts before a key starting
+                    // with '1'; choose a midpoint inside the '0...' range so
+                    // repeated move-to-front operations do not bottom out at
+                    // "1".
+                    let mut result = String::from(ALPHABET[0] as char);
+                    result.push_str(&suffix_between("", None)?);
+                    return Ok(result);
+                }
+                if b_str.len() > 1 {
+                    // Stay inside the "0..." range without returning the
+                    // exact alphabet-floor key "0"; exact floor-prefix gaps
+                    // such as ("0", "000") remain unsplittable by design.
+                    let mut result = String::from(ALPHABET[0] as char);
+                    result.push_str(&suffix_between("", Some(&b_str[1..]))?);
+                    return Ok(result);
+                }
+                // No non-empty key sorts between "" and the alphabet floor.
+                return Err(FracIndexError::NoKeyBetween {
+                    a: String::new(),
+                    b: b_str.to_string(),
+                });
             }
 
             let a_bytes = a.as_bytes();
@@ -259,8 +286,9 @@ mod tests {
         assert_eq!(key_after("a9").unwrap(), "aA");
         assert_eq!(key_after("aZ").unwrap(), "aa");
         assert_eq!(key_after("ay").unwrap(), "az");
-        // Overflow: 'z' wraps by appending
-        assert_eq!(key_after("az").unwrap(), "az0");
+        // Overflow appends a midpoint suffix, leaving room between old and new.
+        assert_eq!(key_after("az").unwrap(), "azV");
+        assert!(key_between("az", "azV").is_ok());
     }
 
     #[test]
@@ -297,8 +325,9 @@ mod tests {
     #[test]
     fn test_multiple_insertions_maintain_order() {
         let mut keys = vec![initial_key()];
-        // Insert 10 keys after each previous one
-        for _ in 0..10 {
+        // Insert enough keys to cross the base-62 suffix boundary that used
+        // to produce adjacent unsplittable keys (`az` / `az0`).
+        for _ in 0..70 {
             let last = keys.last().unwrap();
             keys.push(key_after(last).unwrap());
         }
@@ -310,6 +339,57 @@ mod tests {
                 keys[i],
                 i + 1,
                 keys[i + 1]
+            );
+        }
+
+        for pair in keys.windows(2) {
+            let between = key_between(&pair[0], &pair[1]).unwrap();
+            assert!(
+                between > pair[0] && between < pair[1],
+                "expected a splittable gap between {:?} and {:?}, got {between:?}",
+                pair[0],
+                pair[1],
+            );
+        }
+    }
+
+    #[test]
+    fn test_key_before_first_normal_key() {
+        let before = key_before("a0").unwrap();
+        assert!(before.as_str() > "");
+        assert!(before.as_str() < "a0");
+        let before_one = key_before("1").unwrap();
+        assert!(before_one.as_str() > "");
+        assert!(before_one.as_str() < "1");
+        assert_eq!(before_one, "0V");
+        assert_eq!(
+            key_before("0").unwrap_err(),
+            FracIndexError::NoKeyBetween {
+                a: String::new(),
+                b: "0".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_repeated_key_before_stays_ordered_and_splittable() {
+        let mut keys = vec![initial_key()];
+        for _ in 0..20 {
+            let first = keys.first().unwrap().clone();
+            keys.insert(0, key_before(&first).unwrap());
+        }
+
+        for pair in keys.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "front-inserted keys must remain ordered: {pair:?}"
+            );
+            let between = key_between(&pair[0], &pair[1]).unwrap();
+            assert!(
+                between > pair[0] && between < pair[1],
+                "front-inserted gap must remain splittable between {:?} and {:?}, got {between:?}",
+                pair[0],
+                pair[1],
             );
         }
     }

@@ -29,10 +29,13 @@ use std::path::Path;
 use crate::config;
 use crate::db;
 use crate::git;
-use crate::output::{self, OutputContext};
+use crate::output::{self, OutputContext, OutputFormat};
 use crate::plan::{Plan, Step};
 use crate::preflight;
 use crate::storage;
+
+pub const NO_ACTIVE_PLAN_MESSAGE: &str =
+    "No active plan found. Specify a plan slug as a positional argument.";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -59,16 +62,30 @@ pub fn resolve_plan(
     project: &str,
     include_complete: bool,
 ) -> Result<Plan> {
+    resolve_plan_optional(conn, slug.as_deref(), project, include_complete)?
+        .context(NO_ACTIVE_PLAN_MESSAGE)
+}
+
+/// Resolve an optional plan slug without forcing "no active plan" into an
+/// error. Commands that intentionally emit `null` for missing active plans
+/// still share exact slug lookup and empty-slug validation with
+/// [`resolve_plan`].
+pub fn resolve_plan_optional(
+    conn: &Connection,
+    slug: Option<&str>,
+    project: &str,
+    include_complete: bool,
+) -> Result<Option<Plan>> {
     match slug {
         Some(s) if s.is_empty() => {
             bail!(
                 "Plan slug cannot be empty. Specify a non-empty slug or omit the argument to use the active plan."
             )
         }
-        Some(s) => storage::get_plan_by_slug(conn, &s, project)?
+        Some(s) => storage::get_plan_by_slug(conn, s, project)?
+            .map(Some)
             .with_context(|| format!("Plan not found: {s}")),
-        None => storage::find_active_plan(conn, project, include_complete)?
-            .context("No active plan found. Specify a plan slug as a positional argument."),
+        None => storage::find_active_plan(conn, project, include_complete),
     }
 }
 
@@ -275,12 +292,12 @@ pub fn cmd_init(opts: &InitOptions, out: &OutputContext) -> Result<()> {
     let config_dir = config::config_dir()?;
     fs::create_dir_all(&config_dir)
         .with_context(|| format!("Failed to create config directory {}", config_dir.display()))?;
-    eprintln!("{icon} Config directory: {}", config_dir.display());
+    out.status(format!("{icon} Config directory: {}", config_dir.display()));
 
     let agents_dir = config::agents_dir()?;
     fs::create_dir_all(&agents_dir)
         .with_context(|| format!("Failed to create agents directory {}", agents_dir.display()))?;
-    eprintln!("{icon} Agents directory: {}", agents_dir.display());
+    out.status(format!("{icon} Agents directory: {}", agents_dir.display()));
 
     // 2. Build the default config so we can scan its harnesses regardless
     //    of whether we end up writing it to disk.
@@ -300,9 +317,9 @@ pub fn cmd_init(opts: &InitOptions, out: &OutputContext) -> Result<()> {
         // Schema migration: layer built-in harness defaults under the
         // user's on-disk config and persist if any recognized fields were
         // added. Explicit values for known config keys are preserved;
-        // unknown JSON keys are outside the closed config schema and are
-        // not preserved when the typed Config is rewritten. `--force` is
-        // reserved for the full default-config rewrite path below.
+        // unknown JSON keys are preserved by Config::save_at's JSON-level
+        // merge. `--force` is reserved for the full default-config rewrite
+        // path below.
         migrate_existing_config(&config_path, out)?;
     } else {
         // Pick the default harness: explicit flag > interactive prompt >
@@ -310,15 +327,15 @@ pub fn cmd_init(opts: &InitOptions, out: &OutputContext) -> Result<()> {
         let chosen = choose_default_harness(opts, &availability)?;
         new_config.default_harness = chosen.clone();
 
-        let json = serde_json::to_string_pretty(&new_config)?;
-        fs::write(&config_path, &json)
+        new_config
+            .save_at(&config_dir)
             .with_context(|| format!("Failed to write config to {}", config_path.display()))?;
 
         let verb = if config_exists { "Rewrote" } else { "Wrote" };
-        eprintln!(
+        out.status(format!(
             "{icon} {verb} config: {} (default harness: {chosen})",
             config_path.display()
-        );
+        ));
     }
 
     // 4b. Seed the global prompt. `ralph init` is the canonical source of
@@ -333,20 +350,24 @@ pub fn cmd_init(opts: &InitOptions, out: &OutputContext) -> Result<()> {
     // 5. Initialize database (idempotent — `db::open` runs migrations).
     let _conn = db::open()?;
     let db_path = db::db_path()?;
-    eprintln!("{icon} Database: {}", db_path.display());
+    out.status(format!("{icon} Database: {}", db_path.display()));
 
-    eprintln!();
-    eprintln!("ralph initialized successfully.");
+    if !out.quiet && out.format == OutputFormat::Plain {
+        eprintln!();
+    }
+    out.status("ralph initialized successfully.");
 
     // Hint about non-interactive mode when stdin isn't a TTY and we had to
     // silently fall back, so users notice why no prompt appeared.
     if !std::io::stdin().is_terminal() && !opts.non_interactive && opts.default_harness.is_none() {
-        eprintln!();
-        eprintln!(
+        if !out.quiet && out.format == OutputFormat::Plain {
+            eprintln!();
+        }
+        out.status(format!(
             "  note: stdin is not a TTY — skipped interactive harness prompt. \
              Pass --default-harness <name> or edit {} to change the default.",
             config_path.display()
-        );
+        ));
     }
 
     Ok(())
@@ -381,10 +402,10 @@ fn migrate_existing_config(config_path: &Path, out: &OutputContext) -> Result<()
     })?;
 
     if filled.is_empty() {
-        eprintln!(
+        out.status(format!(
             "{icon} Config up to date: {} (no missing built-in fields)",
             config_path.display()
-        );
+        ));
         return Ok(());
     }
 
@@ -429,14 +450,14 @@ fn migrate_existing_config(config_path: &Path, out: &OutputContext) -> Result<()
             .push(field.clone());
     }
 
-    eprintln!(
+    out.status(format!(
         "{warn} Migrated config: filled in {} missing field(s) for built-in harnesses.",
         filled.len()
-    );
+    ));
     for (harness, fields) in &by_harness {
-        eprintln!("    {harness}: {}", fields.join(", "));
+        out.status(format!("    {harness}: {}", fields.join(", ")));
     }
-    eprintln!("  Saved to: {}", config_path.display());
+    out.status(format!("  Saved to: {}", config_path.display()));
 
     Ok(())
 }
@@ -489,9 +510,13 @@ fn seed_global_prompt(config_dir: &Path, restore_prompts: bool, out: &OutputCont
         .context("Failed to persist seeded global prompt")?;
 
     if restore_prompts && !is_blank {
-        eprintln!("{icon} Restored global prompt to ralph's built-in default.");
+        out.status(format!(
+            "{icon} Restored global prompt to ralph's built-in default."
+        ));
     } else {
-        eprintln!("{icon} Seeded global prompt with ralph's built-in default.");
+        out.status(format!(
+            "{icon} Seeded global prompt with ralph's built-in default."
+        ));
     }
     Ok(())
 }
@@ -522,12 +547,15 @@ fn print_harness_availability(availability: &[(String, bool)], out: &OutputConte
     let warn = output::severity_icon("warning", out.color);
 
     if found.is_empty() {
-        eprintln!("{warn} No known harnesses found on PATH.");
+        out.status(format!("{warn} No known harnesses found on PATH."));
     } else {
-        eprintln!("{check} Harnesses found on PATH: {}", found.join(", "));
+        out.status(format!(
+            "{check} Harnesses found on PATH: {}",
+            found.join(", ")
+        ));
     }
     if !missing.is_empty() {
-        eprintln!("  Not found: {}", missing.join(", "));
+        out.status(format!("  Not found: {}", missing.join(", ")));
     }
 }
 
@@ -641,30 +669,48 @@ fn prompt_for_default(installed: &[&str]) -> Result<String> {
 // ---------------------------------------------------------------------------
 
 pub fn cmd_doctor(config: &config::Config, workdir: &Path, out: &OutputContext) -> Result<()> {
-    println!("ralph doctor");
-    println!();
-
     let checks = preflight::run_doctor_checks(config, workdir);
+    let has_errors = checks
+        .iter()
+        .any(|check| check.severity == preflight::CheckSeverity::Error);
 
-    let mut has_errors = false;
-    for check in &checks {
-        let severity_str = match check.severity {
-            preflight::CheckSeverity::Pass => "pass",
-            preflight::CheckSeverity::Warning => "warning",
-            preflight::CheckSeverity::Error => {
-                has_errors = true;
-                "error"
-            }
-        };
-        let icon = output::severity_icon(severity_str, out.color);
-        println!("  {} {}: {}", icon, check.name, check.message);
+    if out.format == OutputFormat::Json {
+        #[derive(serde::Serialize)]
+        struct DoctorOutput<'a> {
+            ok: bool,
+            checks: &'a [preflight::CheckResult],
+        }
+        serde_json::to_writer_pretty(
+            std::io::stdout(),
+            &DoctorOutput {
+                ok: !has_errors,
+                checks: &checks,
+            },
+        )?;
+        println!();
+    } else if !out.quiet {
+        println!("ralph doctor");
+        println!();
+
+        for check in &checks {
+            let severity_str = match check.severity {
+                preflight::CheckSeverity::Pass => "pass",
+                preflight::CheckSeverity::Warning => "warning",
+                preflight::CheckSeverity::Error => "error",
+            };
+            let icon = output::severity_icon(severity_str, out.color);
+            println!("  {} {}: {}", icon, check.name, check.message);
+        }
+
+        println!();
+        if has_errors {
+            println!("Some checks failed. Please fix the issues above.");
+        } else {
+            println!("All checks passed.");
+        }
     }
-
-    println!();
     if has_errors {
-        println!("Some checks failed. Please fix the issues above.");
-    } else {
-        println!("All checks passed.");
+        anyhow::bail!("doctor checks failed");
     }
 
     Ok(())
@@ -714,6 +760,25 @@ mod tests {
         // SAFETY: guarded by ENV_LOCK for the duration of the returned guard.
         unsafe { std::env::set_var("XDG_CONFIG_HOME", path) };
         XdgGuard { _lock: lock, prev }
+    }
+
+    #[test]
+    fn test_init_writes_config_through_atomic_save_at() {
+        let src = include_str!("mod.rs");
+        let start = src.find("pub fn cmd_init").expect("cmd_init exists");
+        let rest = &src[start..];
+        let end = rest
+            .find("fn migrate_existing_config")
+            .expect("next init helper exists");
+        let body = &rest[..end];
+        assert!(
+            body.contains(".save_at(&config_dir)"),
+            "cmd_init fresh/rewrite path must use Config::save_at"
+        );
+        assert!(
+            !body.contains("fs::write(&config_path"),
+            "cmd_init must not publish config.json with a direct fs::write"
+        );
     }
 
     #[test]
@@ -811,6 +876,47 @@ mod tests {
             quiet: true,
             color: false,
         }
+    }
+
+    #[test]
+    fn test_resolve_plan_optional_returns_none_without_active_plan() {
+        let conn = db::open_memory().unwrap();
+        let got = resolve_plan_optional(&conn, None, "/tmp/no-active", true).unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn test_resolve_plan_optional_rejects_empty_slug() {
+        let conn = db::open_memory().unwrap();
+        let err = resolve_plan_optional(&conn, Some(""), "/tmp/no-active", true).unwrap_err();
+        assert!(
+            err.to_string().contains("Plan slug cannot be empty"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_plan_optional_finds_explicit_slug() {
+        let conn = db::open_memory().unwrap();
+        let project = "/tmp/resolve-plan-optional";
+        storage::create_plan(
+            &conn,
+            storage::NewPlan {
+                slug: "target",
+                project,
+                branch_name: "target",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+
+        let got = resolve_plan_optional(&conn, Some("target"), project, true)
+            .unwrap()
+            .expect("plan");
+        assert_eq!(got.slug, "target");
     }
 
     // -- init migration ---------------------------------------------------
@@ -1004,10 +1110,45 @@ mod tests {
             &test_out(),
         )
         .unwrap();
-        plan_delete(&conn, "my-plan", &project, true, &test_out()).unwrap();
+        plan_delete(&conn, "my-plan", &project, true, false, &test_out()).unwrap();
 
         let plan = storage::get_plan_by_slug(&conn, "my-plan", &project).unwrap();
         assert!(plan.is_none());
+    }
+
+    #[test]
+    fn test_plan_delete_non_interactive_requires_force() {
+        let (conn, project) = setup();
+
+        plan_create(
+            &conn,
+            PlanCreateArgs {
+                slug: "my-plan",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
+            &test_out(),
+        )
+        .unwrap();
+
+        let err = plan_delete(&conn, "my-plan", &project, false, true, &test_out())
+            .expect_err("non-interactive delete must require --force");
+        assert!(
+            err.to_string().contains("pass --force"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            storage::get_plan_by_slug(&conn, "my-plan", &project)
+                .unwrap()
+                .is_some(),
+            "plan must remain when confirmation is unavailable"
+        );
     }
 
     #[test]
@@ -1408,6 +1549,7 @@ mod tests {
             Some("2"),
             None,
             true,
+            false,
             &test_out(),
         )
         .unwrap();
@@ -1418,6 +1560,70 @@ mod tests {
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].title, "First");
+    }
+
+    #[test]
+    fn test_step_remove_non_interactive_requires_force() {
+        let (conn, project) = setup();
+
+        plan_create(
+            &conn,
+            PlanCreateArgs {
+                slug: "my-plan",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
+            &test_out(),
+        )
+        .unwrap();
+        step_add(
+            &conn,
+            StepAddArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                title: "Only",
+                description: None,
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
+            &test_out(),
+        )
+        .unwrap();
+
+        let err = step_remove(
+            &conn,
+            "my-plan",
+            &project,
+            Some("1"),
+            None,
+            false,
+            true,
+            &test_out(),
+        )
+        .expect_err("non-interactive remove must require --force");
+        assert!(
+            err.to_string().contains("pass --force"),
+            "unexpected error: {err}"
+        );
+        let plan = storage::get_plan_by_slug(&conn, "my-plan", &project)
+            .unwrap()
+            .unwrap();
+        assert_eq!(storage::list_steps(&conn, &plan.id).unwrap().len(), 1);
     }
 
     #[test]
@@ -1552,6 +1758,7 @@ mod tests {
             Some("1"),
             None,
             true,
+            false,
             &test_out(),
         )
         .unwrap();
@@ -2231,6 +2438,7 @@ mod tests {
             Some("5"),
             None,
             true,
+            false,
             &test_out(),
         );
         assert!(result.is_err());

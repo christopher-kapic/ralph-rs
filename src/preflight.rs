@@ -11,6 +11,7 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use anyhow::{Result, anyhow};
+use serde::Serialize;
 
 use crate::config::{Config, HarnessConfig};
 use crate::git;
@@ -174,7 +175,8 @@ fn check_prerun_disk_space(workdir: &Path) -> CheckResult {
 // ---------------------------------------------------------------------------
 
 /// Severity of a preflight check result.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CheckSeverity {
     Pass,
     Warning,
@@ -182,7 +184,7 @@ pub enum CheckSeverity {
 }
 
 /// A single preflight check result.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CheckResult {
     pub name: String,
     pub severity: CheckSeverity,
